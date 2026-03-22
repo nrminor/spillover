@@ -6,7 +6,11 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 
+[features]
+rayon = ["dep:rayon"]
+
 [dependencies]
+rayon = { version = "1.10", optional = true }
 tempfile = "3.19.1"
 thiserror = "2.0.18"
 

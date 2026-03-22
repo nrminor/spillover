@@ -22,6 +22,9 @@
 !/spillover/src
 !/spillover/src/lib.rs
 !/spillover/src/error.rs
+!/spillover/src/key.rs
+!/spillover/src/compare.rs
+!/spillover/src/chunk.rs
 
 # === Allowed: spillover-bio ===
 !/spillover-bio

@@ -10,6 +10,9 @@
 //! their own implementations of these traits to build a complete
 //! sorting pipeline tailored to their data types and workflows.
 
+pub mod chunk;
+pub mod compare;
 mod error;
+pub mod key;
 
 pub use error::SpilloverError;
