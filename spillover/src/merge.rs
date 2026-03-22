@@ -119,25 +119,28 @@ pub struct SortedRun {
 /// Orchestrates the creation and merging of sorted runs on disk.
 ///
 /// Generic over the item type `T`, the codec `C` that serializes
-/// items, and the comparator `Cmp` that orders them. The
-/// comparator should be a zero-sized type (like [`Natural`] or
-/// [`Reverse`]) for best performance — `WithOrd` wrappers in the
-/// merge heap will then add no memory overhead.
+/// items, and the comparator `Cmp` that orders them. The codec
+/// must be `Copy` since it is duplicated into each entry reader
+/// during the merge — this is the right constraint for a stateless
+/// serialization strategy. The comparator should be a zero-sized
+/// type (like [`Natural`] or [`Reverse`]) for best performance.
 ///
 /// [`Natural`]: crate::compare::Natural
 /// [`Reverse`]: crate::compare::Reverse
-pub struct RunMerger<'c, T, C: Codec<T>, Cmp: Compare<T> + Clone> {
-    codec: &'c C,
+pub struct RunMerger<T, C: Codec<T>, Cmp: Compare<T> + Copy> {
+    codec: C,
     cmp: Cmp,
     config: MergeConfig,
     _item: std::marker::PhantomData<fn() -> T>,
 }
 
-impl<'c, T, C: Codec<T>, Cmp: Compare<T> + Clone> RunMerger<'c, T, C, Cmp> {
+impl<T: 'static, C: Codec<T> + Copy + 'static, Cmp: Compare<T> + Copy + 'static>
+    RunMerger<T, C, Cmp>
+{
     /// Create a new merger with the given codec, comparator, and
     /// configuration.
     #[must_use]
-    pub fn new(codec: &'c C, cmp: Cmp, config: MergeConfig) -> Self {
+    pub fn new(codec: C, cmp: Cmp, config: MergeConfig) -> Self {
         Self {
             codec,
             cmp,
@@ -205,11 +208,8 @@ impl<'c, T, C: Codec<T>, Cmp: Compare<T> + Clone> RunMerger<'c, T, C, Cmp> {
     ///
     /// Returns [`MergeError`] if opening or reading a temporary
     /// file fails during heap seeding or intermediate spilling.
-    pub fn merge(
-        &self,
-        runs: Vec<SortedRun>,
-    ) -> Result<MergedItems<'_, T, C>, MergeError<C::Error>> {
-        let sources: Vec<MergeSource<'_, T, C>> = runs
+    pub fn merge(&self, runs: Vec<SortedRun>) -> Result<MergedItems<T, C>, MergeError<C::Error>> {
+        let sources: Vec<MergeSource<T, C>> = runs
             .into_iter()
             .map(|run| {
                 MergeSource::File(EntryReader::new(
@@ -225,30 +225,27 @@ impl<'c, T, C: Codec<T>, Cmp: Compare<T> + Clone> RunMerger<'c, T, C, Cmp> {
     }
 
     /// Recursively merge sources, respecting the fan-in limit.
-    fn merge_sources<'s>(
-        &'s self,
-        mut sources: Vec<MergeSource<'s, T, C>>,
-    ) -> Result<MergeSource<'s, T, C>, MergeError<C::Error>> {
+    fn merge_sources(
+        &self,
+        mut sources: Vec<MergeSource<T, C>>,
+    ) -> Result<MergeSource<T, C>, MergeError<C::Error>> {
         if sources.is_empty() {
-            return Ok(MergeSource::Heap(Box::new(HeapMerge::empty(
-                self.cmp.clone(),
-            ))));
+            return Ok(MergeSource::Heap(Box::new(HeapMerge::empty(self.cmp))));
         }
 
         let fan_in = self.config.max_fan_in.get();
 
         if sources.len() <= fan_in {
             Ok(MergeSource::Heap(Box::new(HeapMerge::new(
-                sources,
-                self.cmp.clone(),
+                sources, self.cmp,
             )?)))
         } else {
             let mut intermediate = Vec::new();
 
             while !sources.is_empty() {
                 let chunk_end = sources.len().min(fan_in);
-                let group: Vec<MergeSource<'_, T, C>> = sources.drain(..chunk_end).collect();
-                let heap_merge = HeapMerge::new(group, self.cmp.clone())?;
+                let group: Vec<MergeSource<T, C>> = sources.drain(..chunk_end).collect();
+                let heap_merge = HeapMerge::new(group, self.cmp)?;
                 let file = self.spill_merge_to_disk(heap_merge)?;
                 intermediate.push(MergeSource::File(EntryReader::new(
                     self.codec,
@@ -264,7 +261,7 @@ impl<'c, T, C: Codec<T>, Cmp: Compare<T> + Clone> RunMerger<'c, T, C, Cmp> {
     /// Drain a heap merge into a temporary file.
     fn spill_merge_to_disk(
         &self,
-        mut merge: HeapMerge<'_, T, C, Cmp>,
+        mut merge: HeapMerge<T, C, Cmp>,
     ) -> Result<std::fs::File, MergeError<C::Error>> {
         let mut file = self.create_temp_file()?;
         let mut writer = BufWriter::with_capacity(self.config.write_buffer_bytes, &mut file);
@@ -295,11 +292,11 @@ impl<'c, T, C: Codec<T>, Cmp: Compare<T> + Clone> RunMerger<'c, T, C, Cmp> {
 ///
 /// Created by [`RunMerger::merge`]. Each call to `next()` may
 /// perform disk I/O.
-pub struct MergedItems<'c, T, C: Codec<T>> {
-    source: MergeSource<'c, T, C>,
+pub struct MergedItems<T, C: Codec<T>> {
+    source: MergeSource<T, C>,
 }
 
-impl<T, C: Codec<T>> Iterator for MergedItems<'_, T, C> {
+impl<T, C: Codec<T>> Iterator for MergedItems<T, C> {
     type Item = Result<T, MergeError<C::Error>>;
 
     #[inline]
@@ -313,14 +310,14 @@ impl<T, C: Codec<T>> Iterator for MergedItems<'_, T, C> {
 }
 
 /// Reads items sequentially from a sorted temporary file.
-struct EntryReader<'c, T, C: Codec<T>> {
-    codec: &'c C,
+struct EntryReader<T, C: Codec<T>> {
+    codec: C,
     reader: BufReader<std::fs::File>,
     _item: std::marker::PhantomData<fn() -> T>,
 }
 
-impl<'c, T, C: Codec<T>> EntryReader<'c, T, C> {
-    fn new(codec: &'c C, file: std::fs::File, read_buffer_bytes: usize) -> Self {
+impl<T, C: Codec<T>> EntryReader<T, C> {
+    fn new(codec: C, file: std::fs::File, read_buffer_bytes: usize) -> Self {
         Self {
             codec,
             reader: BufReader::with_capacity(read_buffer_bytes, file),
@@ -335,12 +332,12 @@ impl<'c, T, C: Codec<T>> EntryReader<'c, T, C> {
 
 /// A source of sorted items: either a file on disk or an
 /// in-progress heap merge of other sources.
-enum MergeSource<'c, T, C: Codec<T>> {
-    File(EntryReader<'c, T, C>),
-    Heap(Box<dyn MergeSourceTrait<T, C> + 'c>),
+enum MergeSource<T, C: Codec<T>> {
+    File(EntryReader<T, C>),
+    Heap(Box<dyn MergeSourceTrait<T, C>>),
 }
 
-impl<T, C: Codec<T>> MergeSource<'_, T, C> {
+impl<T, C: Codec<T>> MergeSource<T, C> {
     #[inline]
     fn next_item(&mut self) -> Result<Option<T>, MergeError<C::Error>> {
         match self {
@@ -363,20 +360,20 @@ trait MergeSourceTrait<T, C: Codec<T>> {
 ///
 /// [`Natural`]: crate::compare::Natural
 /// [`Reverse`]: crate::compare::Reverse
-struct HeapEntry<T, Cmp: Compare<T> + Clone> {
+struct HeapEntry<T, Cmp: Compare<T> + Copy> {
     item: WithOrd<T, Cmp>,
     source_idx: usize,
 }
 
-impl<T, Cmp: Compare<T> + Clone> Eq for HeapEntry<T, Cmp> {}
+impl<T, Cmp: Compare<T> + Copy> Eq for HeapEntry<T, Cmp> {}
 
-impl<T, Cmp: Compare<T> + Clone> PartialEq for HeapEntry<T, Cmp> {
+impl<T, Cmp: Compare<T> + Copy> PartialEq for HeapEntry<T, Cmp> {
     fn eq(&self, other: &Self) -> bool {
         self.item == other.item && self.source_idx == other.source_idx
     }
 }
 
-impl<T, Cmp: Compare<T> + Clone> Ord for HeapEntry<T, Cmp> {
+impl<T, Cmp: Compare<T> + Copy> Ord for HeapEntry<T, Cmp> {
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
         self.item
             .cmp(&other.item)
@@ -384,7 +381,7 @@ impl<T, Cmp: Compare<T> + Clone> Ord for HeapEntry<T, Cmp> {
     }
 }
 
-impl<T, Cmp: Compare<T> + Clone> PartialOrd for HeapEntry<T, Cmp> {
+impl<T, Cmp: Compare<T> + Copy> PartialOrd for HeapEntry<T, Cmp> {
     fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
         Some(self.cmp(other))
     }
@@ -392,13 +389,13 @@ impl<T, Cmp: Compare<T> + Clone> PartialOrd for HeapEntry<T, Cmp> {
 
 /// The k-way merge engine. Holds N sources and a min-heap that
 /// always contains at most one item per source.
-struct HeapMerge<'c, T, C: Codec<T>, Cmp: Compare<T> + Clone> {
-    sources: Vec<MergeSource<'c, T, C>>,
+struct HeapMerge<T, C: Codec<T>, Cmp: Compare<T> + Copy> {
+    sources: Vec<MergeSource<T, C>>,
     heap: BinaryHeap<Reverse<HeapEntry<T, Cmp>>>,
     cmp: Cmp,
 }
 
-impl<'c, T, C: Codec<T>, Cmp: Compare<T> + Clone> HeapMerge<'c, T, C, Cmp> {
+impl<T, C: Codec<T>, Cmp: Compare<T> + Copy> HeapMerge<T, C, Cmp> {
     /// Create an empty merge that yields no items.
     fn empty(cmp: Cmp) -> Self {
         Self {
@@ -409,16 +406,13 @@ impl<'c, T, C: Codec<T>, Cmp: Compare<T> + Clone> HeapMerge<'c, T, C, Cmp> {
     }
 
     /// Seed the heap by reading one item from each source.
-    fn new(
-        mut sources: Vec<MergeSource<'c, T, C>>,
-        cmp: Cmp,
-    ) -> Result<Self, MergeError<C::Error>> {
+    fn new(mut sources: Vec<MergeSource<T, C>>, cmp: Cmp) -> Result<Self, MergeError<C::Error>> {
         let mut heap = BinaryHeap::with_capacity(sources.len());
 
         for (idx, source) in sources.iter_mut().enumerate() {
             if let Some(item) = source.next_item()? {
                 heap.push(Reverse(HeapEntry {
-                    item: WithOrd::new(item, cmp.clone()),
+                    item: WithOrd::new(item, cmp),
                     source_idx: idx,
                 }));
             }
@@ -435,7 +429,7 @@ impl<'c, T, C: Codec<T>, Cmp: Compare<T> + Clone> HeapMerge<'c, T, C, Cmp> {
 
         if let Some(next_item) = self.sources[entry.source_idx].next_item()? {
             self.heap.push(Reverse(HeapEntry {
-                item: WithOrd::new(next_item, self.cmp.clone()),
+                item: WithOrd::new(next_item, self.cmp),
                 source_idx: entry.source_idx,
             }));
         }
@@ -444,7 +438,7 @@ impl<'c, T, C: Codec<T>, Cmp: Compare<T> + Clone> HeapMerge<'c, T, C, Cmp> {
     }
 }
 
-impl<T, C: Codec<T>, Cmp: Compare<T> + Clone> MergeSourceTrait<T, C> for HeapMerge<'_, T, C, Cmp> {
+impl<T, C: Codec<T>, Cmp: Compare<T> + Copy> MergeSourceTrait<T, C> for HeapMerge<T, C, Cmp> {
     fn next_item(&mut self) -> Result<Option<T>, MergeError<C::Error>> {
         self.next_item()
     }
@@ -457,6 +451,7 @@ mod tests {
     use super::*;
     use crate::compare::Natural;
 
+    #[derive(Clone, Copy)]
     struct U64Codec;
 
     impl Codec<u64> for U64Codec {
@@ -479,14 +474,13 @@ mod tests {
         }
     }
 
-    fn default_merger(codec: &U64Codec) -> RunMerger<'_, u64, U64Codec, Natural> {
-        RunMerger::new(codec, Natural, MergeConfig::default())
+    fn default_merger() -> RunMerger<u64, U64Codec, Natural> {
+        RunMerger::new(U64Codec, Natural, MergeConfig::default())
     }
 
     #[test]
     fn spill_and_merge_single_run() {
-        let codec = U64Codec;
-        let merger = default_merger(&codec);
+        let merger = default_merger();
         let run = merger
             .spill_sorted(vec![1u64, 3, 5, 7, 9])
             .expect("spilling should succeed");
@@ -502,13 +496,12 @@ mod tests {
 
     #[test]
     fn merge_two_interleaved_runs() {
-        let codec = U64Codec;
-        let merger = default_merger(&codec);
-        let a = merger.spill_sorted(vec![1u64, 3, 5]).expect("spill A");
-        let b = merger.spill_sorted(vec![2u64, 4, 6]).expect("spill B");
+        let merger = default_merger();
+        let run_a = merger.spill_sorted(vec![1u64, 3, 5]).expect("spill A");
+        let run_b = merger.spill_sorted(vec![2u64, 4, 6]).expect("spill B");
 
         let results: Vec<u64> = merger
-            .merge(vec![a, b])
+            .merge(vec![run_a, run_b])
             .expect("merge")
             .map(|r| r.expect("read"))
             .collect();
@@ -518,13 +511,12 @@ mod tests {
 
     #[test]
     fn merge_preserves_duplicates_across_runs() {
-        let codec = U64Codec;
-        let merger = default_merger(&codec);
-        let a = merger.spill_sorted(vec![1u64, 3, 5]).expect("spill");
-        let b = merger.spill_sorted(vec![1u64, 3, 7]).expect("spill");
+        let merger = default_merger();
+        let run_a = merger.spill_sorted(vec![1u64, 3, 5]).expect("spill");
+        let run_b = merger.spill_sorted(vec![1u64, 3, 7]).expect("spill");
 
         let results: Vec<u64> = merger
-            .merge(vec![a, b])
+            .merge(vec![run_a, run_b])
             .expect("merge")
             .map(|r| r.expect("read"))
             .collect();
@@ -534,8 +526,7 @@ mod tests {
 
     #[test]
     fn merge_empty_run_list() {
-        let codec = U64Codec;
-        let merger = default_merger(&codec);
+        let merger = default_merger();
         let results: Vec<u64> = merger
             .merge(vec![])
             .expect("merge zero runs")
@@ -547,8 +538,7 @@ mod tests {
 
     #[test]
     fn merge_single_empty_run() {
-        let codec = U64Codec;
-        let merger = default_merger(&codec);
+        let merger = default_merger();
         let run = merger
             .spill_sorted(std::iter::empty::<u64>())
             .expect("spill empty");
@@ -564,8 +554,7 @@ mod tests {
 
     #[test]
     fn merge_three_runs() {
-        let codec = U64Codec;
-        let merger = default_merger(&codec);
+        let merger = default_merger();
         let a = merger.spill_sorted(vec![1u64, 4, 7]).expect("spill");
         let b = merger.spill_sorted(vec![2u64, 5, 8]).expect("spill");
         let c = merger.spill_sorted(vec![3u64, 6, 9]).expect("spill");
@@ -581,12 +570,11 @@ mod tests {
 
     #[test]
     fn bounded_fan_in_triggers_intermediate_spill() {
-        let codec = U64Codec;
         let config = MergeConfig {
             max_fan_in: NonZeroUsize::new(2).expect("2 is not zero"),
             ..MergeConfig::default()
         };
-        let merger = RunMerger::new(&codec, Natural, config);
+        let merger = RunMerger::new(U64Codec, Natural, config);
 
         let a = merger.spill_sorted(vec![1u64, 4]).expect("spill");
         let b = merger.spill_sorted(vec![2u64, 5]).expect("spill");
@@ -603,12 +591,11 @@ mod tests {
 
     #[test]
     fn merge_many_runs_with_small_fan_in() {
-        let codec = U64Codec;
         let config = MergeConfig {
             max_fan_in: NonZeroUsize::new(3).expect("3 is not zero"),
             ..MergeConfig::default()
         };
-        let merger = RunMerger::new(&codec, Natural, config);
+        let merger = RunMerger::new(U64Codec, Natural, config);
 
         let runs: Vec<SortedRun> = (0..10)
             .map(|i: u64| {
@@ -631,8 +618,7 @@ mod tests {
 
     #[test]
     fn merge_different_sized_runs() {
-        let codec = U64Codec;
-        let merger = default_merger(&codec);
+        let merger = default_merger();
         let a = merger.spill_sorted(vec![1u64]).expect("spill");
         let b = merger.spill_sorted(vec![2u64, 3, 4, 5, 6]).expect("spill");
         let c = merger.spill_sorted(vec![7u64, 8]).expect("spill");
@@ -658,12 +644,11 @@ mod tests {
     #[test]
     fn custom_temp_dir_works() {
         let temp_dir = tempfile::tempdir().expect("create temp dir");
-        let codec = U64Codec;
         let config = MergeConfig {
             temp_dir: Some(temp_dir.path().to_path_buf()),
             ..MergeConfig::default()
         };
-        let merger = RunMerger::new(&codec, Natural, config);
+        let merger = RunMerger::new(U64Codec, Natural, config);
 
         let run = merger.spill_sorted(vec![1u64, 2, 3]).expect("spill");
         let results: Vec<u64> = merger
@@ -677,12 +662,11 @@ mod tests {
 
     #[test]
     fn nonexistent_temp_dir_returns_io_error() {
-        let codec = U64Codec;
         let config = MergeConfig {
             temp_dir: Some(PathBuf::from("/nonexistent/path/should/not/exist")),
             ..MergeConfig::default()
         };
-        let merger = RunMerger::new(&codec, Natural, config);
+        let merger = RunMerger::new(U64Codec, Natural, config);
 
         let result = merger.spill_sorted(vec![1u64, 2, 3]);
         assert!(
@@ -704,7 +688,7 @@ mod tests {
         }
 
         fn spill_runs(
-            merger: &RunMerger<'_, u64, U64Codec, Natural>,
+            merger: &RunMerger<u64, U64Codec, Natural>,
             batches: &[Vec<u64>],
         ) -> Vec<SortedRun> {
             batches
@@ -718,7 +702,7 @@ mod tests {
         }
 
         fn collect_merged(
-            merger: &RunMerger<'_, u64, U64Codec, Natural>,
+            merger: &RunMerger<u64, U64Codec, Natural>,
             runs: Vec<SortedRun>,
         ) -> Vec<u64> {
             merger
@@ -733,8 +717,7 @@ mod tests {
             fn merged_output_is_always_sorted(
                 batches in proptest::collection::vec(arb_sorted_u64_vec(), 0..6),
             ) {
-                let codec = U64Codec;
-                let merger = RunMerger::new(&codec, Natural, MergeConfig::default());
+                let merger = RunMerger::new(U64Codec, Natural, MergeConfig::default());
                 let runs = spill_runs(&merger, &batches);
                 let results = collect_merged(&merger, runs);
 
@@ -748,8 +731,7 @@ mod tests {
             fn merge_preserves_total_entry_count(
                 batches in proptest::collection::vec(arb_sorted_u64_vec(), 0..6),
             ) {
-                let codec = U64Codec;
-                let merger = RunMerger::new(&codec, Natural, MergeConfig::default());
+                let merger = RunMerger::new(U64Codec, Natural, MergeConfig::default());
                 let total_input: usize = batches.iter().map(Vec::len).sum();
                 let runs = spill_runs(&merger, &batches);
                 let output_count = collect_merged(&merger, runs).len();
@@ -761,9 +743,8 @@ mod tests {
             fn fan_in_does_not_affect_merge_output(
                 batches in proptest::collection::vec(arb_sorted_u64_vec(), 2..8),
             ) {
-                let codec = U64Codec;
-                let merger_wide = RunMerger::new(&codec, Natural, MergeConfig::default());
-                let merger_narrow = RunMerger::new(&codec, Natural, MergeConfig {
+                let merger_wide = RunMerger::new(U64Codec, Natural, MergeConfig::default());
+                let merger_narrow = RunMerger::new(U64Codec, Natural, MergeConfig {
                     max_fan_in: NonZeroUsize::new(2).expect("2 is not zero"),
                     ..MergeConfig::default()
                 });
@@ -784,8 +765,7 @@ mod tests {
             fn merge_output_matches_reference_sort(
                 batches in proptest::collection::vec(arb_sorted_u64_vec(), 0..6),
             ) {
-                let codec = U64Codec;
-                let merger = RunMerger::new(&codec, Natural, MergeConfig::default());
+                let merger = RunMerger::new(U64Codec, Natural, MergeConfig::default());
 
                 let mut reference: Vec<u64> = batches.iter().flatten().copied().collect();
                 reference.sort_unstable();

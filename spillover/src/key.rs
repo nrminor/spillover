@@ -57,6 +57,40 @@ pub trait SortKey<T> {
     }
 }
 
+/// A [`Compare<T>`](crate::compare::Compare) implementation that
+/// compares items by extracting keys via a [`SortKey`] and
+/// delegating to a key comparator. This bridges the gap between
+/// "compare keys" and "compare items" — the merge engine needs
+/// the latter, but the user provides the former.
+///
+/// Cloning a `KeyCompare` is cheap when both the sort key and
+/// comparator are zero-sized types (the common case).
+#[derive(Clone, Copy)]
+pub struct KeyCompare<SK, Cmp> {
+    sort_key: SK,
+    compare: Cmp,
+}
+
+impl<SK, Cmp> KeyCompare<SK, Cmp> {
+    /// Create a new item comparator from a sort key and a key
+    /// comparator.
+    pub fn new(sort_key: SK, compare: Cmp) -> Self {
+        Self { sort_key, compare }
+    }
+}
+
+impl<T, SK, Cmp> crate::compare::Compare<T> for KeyCompare<SK, Cmp>
+where
+    SK: SortKey<T>,
+    Cmp: for<'a> crate::compare::Compare<SK::Key<'a>>,
+{
+    fn compare(&self, a: &T, b: &T) -> Ordering {
+        let ka = self.sort_key.key(a);
+        let kb = self.sort_key.key(b);
+        self.compare.compare(&ka, &kb)
+    }
+}
+
 /// Adapter that lifts a key-extraction function into a [`SortKey`]
 /// without requiring the caller to write out the GAT. Works for
 /// any key that does not borrow from the item.
@@ -67,6 +101,7 @@ pub trait SortKey<T> {
 /// let length_key = Owned(|s: &String| s.len());
 /// assert_eq!(length_key.key(&"hello".to_string()), 5);
 /// ```
+#[derive(Clone, Copy)]
 pub struct Owned<F>(pub F);
 
 impl<T, K, F> SortKey<T> for Owned<F>

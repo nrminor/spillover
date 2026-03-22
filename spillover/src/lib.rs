@@ -17,5 +17,7 @@ pub mod dedup;
 mod error;
 pub mod key;
 pub mod merge;
+pub mod sorter;
 
 pub use error::SpilloverError;
+pub use get_size2::GetSize;
