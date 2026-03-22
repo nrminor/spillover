@@ -16,5 +16,6 @@ pub mod compare;
 pub mod dedup;
 mod error;
 pub mod key;
+pub mod merge;
 
 pub use error::SpilloverError;
