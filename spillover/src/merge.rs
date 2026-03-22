@@ -15,13 +15,13 @@
 use std::{
     cmp::Reverse,
     collections::BinaryHeap,
-    io::{BufReader, BufWriter, Seek, SeekFrom, Write},
+    io::{Seek, SeekFrom},
     num::NonZeroUsize,
     path::PathBuf,
 };
 
 use crate::{
-    codec::Codec,
+    codec::{Codec, CodecReader, CodecWriter},
     compare::{Compare, WithOrd},
 };
 
@@ -164,7 +164,7 @@ impl<T: 'static, C: Codec<T> + Copy + 'static, Cmp: Compare<T> + Copy + 'static>
         items: impl IntoIterator<Item = T>,
     ) -> Result<SortedRun, MergeError<C::Error>> {
         let mut file = self.create_temp_file()?;
-        let mut writer = BufWriter::with_capacity(self.config.write_buffer_bytes, &mut file);
+        let mut writer = self.codec.writer(&mut file);
 
         #[cfg(debug_assertions)]
         let mut prev: Option<T> = None;
@@ -178,9 +178,7 @@ impl<T: 'static, C: Codec<T> + Copy + 'static, Cmp: Compare<T> + Copy + 'static>
                 );
             }
 
-            self.codec
-                .write(&item, &mut writer)
-                .map_err(MergeError::Codec)?;
+            writer.write(&item).map_err(MergeError::Codec)?;
 
             #[cfg(debug_assertions)]
             {
@@ -188,8 +186,7 @@ impl<T: 'static, C: Codec<T> + Copy + 'static, Cmp: Compare<T> + Copy + 'static>
             }
         }
 
-        writer.flush()?;
-        drop(writer);
+        writer.finish().map_err(MergeError::Codec)?;
         file.seek(SeekFrom::Start(0))?;
 
         Ok(SortedRun { file })
@@ -264,16 +261,13 @@ impl<T: 'static, C: Codec<T> + Copy + 'static, Cmp: Compare<T> + Copy + 'static>
         mut merge: HeapMerge<T, C, Cmp>,
     ) -> Result<std::fs::File, MergeError<C::Error>> {
         let mut file = self.create_temp_file()?;
-        let mut writer = BufWriter::with_capacity(self.config.write_buffer_bytes, &mut file);
+        let mut writer = self.codec.writer(&mut file);
 
         while let Some(item) = merge.next_item()? {
-            self.codec
-                .write(&item, &mut writer)
-                .map_err(MergeError::Codec)?;
+            writer.write(&item).map_err(MergeError::Codec)?;
         }
 
-        writer.flush()?;
-        drop(writer);
+        writer.finish().map_err(MergeError::Codec)?;
         file.seek(SeekFrom::Start(0))?;
         Ok(file)
     }
@@ -309,24 +303,23 @@ impl<T, C: Codec<T>> Iterator for MergedItems<T, C> {
     }
 }
 
-/// Reads items sequentially from a sorted temporary file.
+/// Reads items sequentially from a sorted temporary file
+/// using the codec's reader.
 struct EntryReader<T, C: Codec<T>> {
-    codec: C,
-    reader: BufReader<std::fs::File>,
+    reader: C::Reader<std::fs::File>,
     _item: std::marker::PhantomData<fn() -> T>,
 }
 
 impl<T, C: Codec<T>> EntryReader<T, C> {
-    fn new(codec: C, file: std::fs::File, read_buffer_bytes: usize) -> Self {
+    fn new(codec: C, file: std::fs::File, _read_buffer_bytes: usize) -> Self {
         Self {
-            codec,
-            reader: BufReader::with_capacity(read_buffer_bytes, file),
+            reader: codec.reader(file),
             _item: std::marker::PhantomData,
         }
     }
 
     fn next_item(&mut self) -> Result<Option<T>, MergeError<C::Error>> {
-        self.codec.read(&mut self.reader).map_err(MergeError::Codec)
+        self.reader.read().map_err(MergeError::Codec)
     }
 }
 
@@ -446,7 +439,7 @@ impl<T, C: Codec<T>, Cmp: Compare<T> + Copy> MergeSourceTrait<T, C> for HeapMerg
 
 #[cfg(test)]
 mod tests {
-    use std::io::Read;
+    use std::io::{BufWriter, Read, Write};
 
     use super::*;
     use crate::compare::Natural;
@@ -454,23 +447,55 @@ mod tests {
     #[derive(Clone, Copy)]
     struct U64Codec;
 
-    impl Codec<u64> for U64Codec {
+    struct U64Writer<W: Write> {
+        inner: BufWriter<W>,
+    }
+
+    impl<W: Write> CodecWriter<u64> for U64Writer<W> {
         type Error = std::io::Error;
 
-        fn write(&self, item: &u64, writer: &mut impl Write) -> Result<(), Self::Error> {
-            writer.write_all(&item.to_le_bytes())
+        fn write(&mut self, item: &u64) -> Result<(), Self::Error> {
+            self.inner.write_all(&item.to_le_bytes())
         }
 
-        fn read(&self, reader: &mut impl Read) -> Result<Option<u64>, Self::Error> {
+        fn finish(mut self) -> Result<(), Self::Error> {
+            self.inner.flush()
+        }
+    }
+
+    struct U64Reader<R: Read> {
+        inner: R,
+    }
+
+    impl<R: Read> CodecReader<u64> for U64Reader<R> {
+        type Error = std::io::Error;
+
+        fn read(&mut self) -> Result<Option<u64>, Self::Error> {
             let mut buf = [0u8; 8];
-            match reader.read(&mut buf[..1]) {
+            match self.inner.read(&mut buf[..1]) {
                 Ok(0) => Ok(None),
                 Ok(_) => {
-                    reader.read_exact(&mut buf[1..])?;
+                    self.inner.read_exact(&mut buf[1..])?;
                     Ok(Some(u64::from_le_bytes(buf)))
                 }
                 Err(e) => Err(e),
             }
+        }
+    }
+
+    impl Codec<u64> for U64Codec {
+        type Error = std::io::Error;
+        type Writer<W: Write> = U64Writer<W>;
+        type Reader<R: Read> = U64Reader<R>;
+
+        fn writer<W: Write>(&self, dest: W) -> U64Writer<W> {
+            U64Writer {
+                inner: BufWriter::new(dest),
+            }
+        }
+
+        fn reader<R: Read>(&self, source: R) -> U64Reader<R> {
+            U64Reader { inner: source }
         }
     }
 
