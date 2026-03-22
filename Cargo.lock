@@ -66,6 +66,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "843867be96c8daad0d758b57df9392b6d8d271134fce549de6ce169ff98a92af"
 
 [[package]]
+name = "bitnuc"
+version = "0.4.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d7871516cbb4e097e220623917e1491c995ee58c8018d929d4b1e76c378002bf"
+
+[[package]]
 name = "cfg-if"
 version = "1.0.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -111,6 +117,16 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn",
+]
+
+[[package]]
+name = "dryice-bio"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ec36fcc675353172465186155b53b098c8668c1775eb79d767e7c25b4cce2e3e"
+dependencies = [
+ "bitnuc",
+ "thiserror",
 ]
 
 [[package]]
@@ -582,6 +598,9 @@ dependencies = [
 name = "spillover-bio"
 version = "0.1.0"
 dependencies = [
+ "bitnuc",
+ "dryice-bio",
+ "get-size2",
  "proptest",
  "spillover",
 ]

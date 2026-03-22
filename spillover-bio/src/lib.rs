@@ -4,3 +4,6 @@
 //! provide a ready-to-use external sorter for sequence records. It
 //! supplies bloom filter-based deduplication, genomics-specific sort
 //! keys, and uses the `dryice` format for temporary on-disk storage.
+
+pub mod key;
+pub mod record;

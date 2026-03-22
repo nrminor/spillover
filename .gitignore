@@ -35,6 +35,8 @@
 !/spillover-bio/Cargo.toml
 !/spillover-bio/src
 !/spillover-bio/src/lib.rs
+!/spillover-bio/src/record.rs
+!/spillover-bio/src/key.rs
 
 # === Allowed: GitHub workflows ===
 !/.github
