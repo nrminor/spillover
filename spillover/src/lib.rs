@@ -11,7 +11,9 @@
 //! sorting pipeline tailored to their data types and workflows.
 
 pub mod chunk;
+pub mod codec;
 pub mod compare;
+pub mod dedup;
 mod error;
 pub mod key;
 
