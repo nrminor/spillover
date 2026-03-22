@@ -1,0 +1,16 @@
+[package]
+name = "spillover-bio"
+description = "Genomics-opinionated disk-spilling sort for FASTQ/FASTA records"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+spillover = { version = "0.1.0", path = "../spillover" }
+
+[lints]
+workspace = true
+
+[dev-dependencies]
+proptest = { workspace = true }

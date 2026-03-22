@@ -1,0 +1,17 @@
+[package]
+name = "spillover"
+description = "Generic, disk-spilling external sort with pluggable deduplication"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+tempfile = "3.19.1"
+thiserror = "2.0.18"
+
+[lints]
+workspace = true
+
+[dev-dependencies]
+proptest = { workspace = true }

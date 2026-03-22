@@ -1,0 +1,34 @@
+# Deny-by-default: ignore everything, explicitly allow tracked files.
+# All file tracking is intentional. No glob patterns allowed.
+*
+
+# === Allowed: Project configuration ===
+!/.gitignore
+!/Cargo.toml
+!/Cargo.lock
+!/justfile
+!/AGENTS.md
+!/opencode.json
+!/LICENSE
+!/README.md
+
+# === Allowed: Agent configuration ===
+!/.agents
+!/.agents/PROMPT.md
+
+# === Allowed: spillover (core crate) ===
+!/spillover
+!/spillover/Cargo.toml
+!/spillover/src
+!/spillover/src/lib.rs
+
+# === Allowed: spillover-bio ===
+!/spillover-bio
+!/spillover-bio/Cargo.toml
+!/spillover-bio/src
+!/spillover-bio/src/lib.rs
+
+# === Allowed: GitHub workflows ===
+!/.github
+!/.github/workflows
+!/.github/workflows/ci.yml

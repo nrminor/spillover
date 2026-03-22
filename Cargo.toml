@@ -1,0 +1,30 @@
+[workspace]
+resolver = "3"
+members = ["spillover", "spillover-bio"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+repository = "https://github.com/nrminor/spillover"
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+perf = { level = "warn", priority = -1 }
+style = { level = "warn", priority = -1 }
+complexity = { level = "warn", priority = -1 }
+correctness = { level = "warn", priority = -1 }
+unwrap_used = "deny"
+
+[workspace.dependencies]
+proptest = "1.10.0"
+
+[profile.dev]
+incremental = true
+lto = false
+
+[profile.release]
+lto = true
+codegen-units = 1
+strip = true
