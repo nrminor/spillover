@@ -9,3 +9,7 @@
 //! Domain-specific crates (like `spillover-bio` for genomics) inject
 //! their own implementations of these traits to build a complete
 //! sorting pipeline tailored to their data types and workflows.
+
+mod error;
+
+pub use error::SpilloverError;

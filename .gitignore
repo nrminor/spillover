@@ -21,6 +21,7 @@
 !/spillover/Cargo.toml
 !/spillover/src
 !/spillover/src/lib.rs
+!/spillover/src/error.rs
 
 # === Allowed: spillover-bio ===
 !/spillover-bio
