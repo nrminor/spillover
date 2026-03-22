@@ -121,9 +121,9 @@ dependencies = [
 
 [[package]]
 name = "dryice-bio"
-version = "0.1.0"
+version = "0.1.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ec36fcc675353172465186155b53b098c8668c1775eb79d767e7c25b4cce2e3e"
+checksum = "0446782ec5c100c803eb1c60133b5e0fd7d7a591baf5ce0a6697870b3be493b0"
 dependencies = [
  "bitnuc",
  "thiserror",
