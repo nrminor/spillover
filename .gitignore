@@ -40,6 +40,8 @@
 !/spillover-bio/src/codec.rs
 !/spillover-bio/src/sort.rs
 !/spillover-bio/src/radix.rs
+!/spillover-bio/tests
+!/spillover-bio/tests/sort_pipeline.rs
 
 # === Allowed: GitHub workflows ===
 !/.github

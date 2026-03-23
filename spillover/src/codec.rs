@@ -164,6 +164,11 @@ pub trait KeyedCodec<T>: Codec<T> {
     /// independently.
     type KeyedReader<R: Read>: KeyedCodecReader<T, Self::Key, Error = Self::Error>;
 
+    /// Derive the record key for an item. Called by the sorter
+    /// during flush to compute keys before writing them to disk
+    /// alongside the records.
+    fn derive_key(&self, item: &T) -> Self::Key;
+
     /// Create a keyed writer that encodes items with their keys
     /// into `dest`.
     fn keyed_writer<W: Write>(&self, dest: W) -> Self::KeyedWriter<W>;

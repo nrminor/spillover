@@ -113,7 +113,7 @@ impl Default for MergeConfig {
 /// [`RunMerger::merge`].
 #[derive(Debug)]
 pub struct SortedRun {
-    file: std::fs::File,
+    pub(crate) file: std::fs::File,
 }
 
 /// Orchestrates the creation and merging of sorted runs on disk.

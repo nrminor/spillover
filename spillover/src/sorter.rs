@@ -14,11 +14,13 @@
 //! [`Dedup`]: crate::dedup::Dedup
 //! [`ChunkSorter`]: crate::chunk::ChunkSorter
 
+use std::io::Seek;
+
 use get_size2::GetSize;
 
 use crate::{
     chunk::{ChunkSorter, Sequential},
-    codec::{Codec, KeyedCodec},
+    codec::{Codec, KeyedCodec, KeyedCodecWriter},
     compare::{Compare, Natural},
     dedup::{Dedup, Identity},
     key::{KeyCompare, SortKey},
@@ -40,11 +42,6 @@ enum FlushStrategy<T> {
 }
 
 /// Configuration for the [`Sorter`].
-///
-/// Controls merge behavior (fan-in, buffer sizes, temp directory).
-/// Flush strategy is configured separately via the builder's
-/// [`memory_budget`](Builder::memory_budget) or
-/// [`max_buffer_items`](Builder::max_buffer_items) methods.
 #[derive(Debug, Clone, Default)]
 #[non_exhaustive]
 pub struct SorterConfig {
@@ -66,35 +63,18 @@ pub struct HasCodec<Cod>(Cod);
 /// Marker: keyed codec has been provided (keyed merge path).
 pub struct HasKeyedCodec<Cod>(Cod);
 
+/// Marker: no flush strategy provided yet.
+pub struct NeedsFlushStrategy;
+/// Marker: flush strategy has been provided.
+pub struct HasFlushStrategy<T>(FlushStrategy<T>);
+
 /// Marker: base merge path — codec implements [`Codec`] only.
 pub struct Basic;
 /// Marker: keyed merge path — codec implements [`KeyedCodec`],
 /// enabling key-only comparisons during merge.
 pub struct Keyed;
 
-/// Marker: no flush strategy provided yet.
-pub struct NeedsFlushStrategy;
-/// Marker: flush strategy has been provided.
-pub struct HasFlushStrategy<T>(FlushStrategy<T>);
-
 /// Type-state builder for [`Sorter`].
-///
-/// The builder enforces at compile time that a sort key, codec,
-/// and flush strategy must be provided before [`build`](Builder::build)
-/// can be called. Compare defaults to [`Natural`], dedup defaults
-/// to [`Identity`], and chunk sorter defaults to [`Sequential`].
-///
-/// ```ignore
-/// use spillover::sorter::Builder;
-/// use spillover::key::Owned;
-/// use spillover::compare::Natural;
-///
-/// let sorter = Builder::new()
-///     .key(Owned(|v: &i32| *v))
-///     .codec(my_codec)
-///     .max_buffer_items(10_000)
-///     .build();
-/// ```
 pub struct Builder<SK, Cod, Flush, Cmp = Natural, D = Identity, CS = Sequential> {
     sort_key: SK,
     codec: Cod,
@@ -142,9 +122,7 @@ impl<SK, Cod, Flush, Cmp, D, CS> Builder<SK, Cod, Flush, Cmp, D, CS> {
         }
     }
 
-    /// Set the codec for serializing items to temporary files.
-    /// Uses the base merge path — the merge deserializes full
-    /// records for comparison.
+    /// Set the codec (base merge path).
     #[must_use]
     pub fn codec<Cod2>(self, codec: Cod2) -> Builder<SK, HasCodec<Cod2>, Flush, Cmp, D, CS> {
         Builder {
@@ -158,9 +136,7 @@ impl<SK, Cod, Flush, Cmp, D, CS> Builder<SK, Cod, Flush, Cmp, D, CS> {
         }
     }
 
-    /// Set a keyed codec for serializing items with precomputed
-    /// sort keys. Uses the keyed merge path — the merge compares
-    /// keys without deserializing full records.
+    /// Set a keyed codec (keyed merge path).
     #[must_use]
     pub fn keyed_codec<Cod2>(
         self,
@@ -177,8 +153,7 @@ impl<SK, Cod, Flush, Cmp, D, CS> Builder<SK, Cod, Flush, Cmp, D, CS> {
         }
     }
 
-    /// Set the comparator for ordering keys. Defaults to
-    /// [`Natural`] (uses [`Ord`]).
+    /// Set the comparator. Defaults to [`Natural`].
     #[must_use]
     pub fn compare<Cmp2>(self, compare: Cmp2) -> Builder<SK, Cod, Flush, Cmp2, D, CS> {
         Builder {
@@ -192,8 +167,7 @@ impl<SK, Cod, Flush, Cmp, D, CS> Builder<SK, Cod, Flush, Cmp, D, CS> {
         }
     }
 
-    /// Set the post-merge deduplication strategy. Defaults to
-    /// [`Identity`] (no dedup).
+    /// Set the dedup strategy. Defaults to [`Identity`].
     #[must_use]
     pub fn dedup<D2>(self, dedup: D2) -> Builder<SK, Cod, Flush, Cmp, D2, CS> {
         Builder {
@@ -229,22 +203,10 @@ impl<SK, Cod, Flush, Cmp, D, CS> Builder<SK, Cod, Flush, Cmp, D, CS> {
     }
 }
 
-// Flush strategy methods — available regardless of type-state,
-// but transition the Flush parameter.
+// Flush strategy methods.
 
 impl<SK, Cod, Cmp, D, CS> Builder<SK, Cod, NeedsFlushStrategy, Cmp, D, CS> {
-    /// Set a byte-based memory budget with a custom sizing
-    /// function.
-    ///
-    /// The sorter will flush to disk when the estimated total
-    /// memory footprint of buffered items exceeds `budget` bytes.
-    /// The `item_size` closure should return the total memory
-    /// footprint (stack + heap) of each item.
-    ///
-    /// For types that implement [`GetSize`], use
-    /// [`measured_budget`](Self::measured_budget) instead.
-    /// For fixed-size types with no heap allocations, use
-    /// [`fixed_size_budget`](Self::fixed_size_budget).
+    /// Byte-based budget with a custom sizing function.
     #[must_use]
     pub fn memory_budget<T: 'static>(
         self,
@@ -265,13 +227,7 @@ impl<SK, Cod, Cmp, D, CS> Builder<SK, Cod, NeedsFlushStrategy, Cmp, D, CS> {
         }
     }
 
-    /// Set a byte-based memory budget for types that implement
-    /// [`GetSize`].
-    ///
-    /// This is the recommended approach for types with heap
-    /// allocations. The sizing function is generated automatically
-    /// from the [`GetSize`] implementation, which can be derived
-    /// with `#[derive(GetSize)]`.
+    /// Byte-based budget for types implementing [`GetSize`].
     #[must_use]
     pub fn measured_budget<T: GetSize + 'static>(
         self,
@@ -291,14 +247,7 @@ impl<SK, Cod, Cmp, D, CS> Builder<SK, Cod, NeedsFlushStrategy, Cmp, D, CS> {
         }
     }
 
-    /// Set a byte-based memory budget for fixed-size types with
-    /// no heap allocations.
-    ///
-    /// Uses [`std::mem::size_of`] for the item size, which is
-    /// accurate for types like `(u64, i32)` that store all their
-    /// data inline. Do not use this for types with `Vec`, `String`,
-    /// or other heap-allocating fields — the budget will be
-    /// drastically underestimated.
+    /// Byte-based budget using `size_of` (fixed-size types only).
     #[must_use]
     pub fn fixed_size_budget<T: 'static>(
         self,
@@ -318,13 +267,7 @@ impl<SK, Cod, Cmp, D, CS> Builder<SK, Cod, NeedsFlushStrategy, Cmp, D, CS> {
         }
     }
 
-    /// Set a count-based buffer limit.
-    ///
-    /// The sorter will flush to disk when the buffer contains
-    /// `max_items` items, regardless of their memory footprint.
-    /// Use this when you don't want to measure item sizes, or
-    /// when you know the approximate size of your items and
-    /// can pick a count that keeps memory usage reasonable.
+    /// Count-based buffer limit.
     #[must_use]
     pub fn max_buffer_items<T>(
         self,
@@ -342,8 +285,7 @@ impl<SK, Cod, Cmp, D, CS> Builder<SK, Cod, NeedsFlushStrategy, Cmp, D, CS> {
     }
 }
 
-// build() is only available when all required axes are provided.
-
+// build() for basic path.
 impl<T, SK, Cod, Cmp, D, CS> Builder<HasSortKey<SK>, HasCodec<Cod>, HasFlushStrategy<T>, Cmp, D, CS>
 where
     SK: SortKey<T> + Copy,
@@ -351,12 +293,7 @@ where
     Cmp: for<'a> Compare<SK::Key<'a>> + Copy,
     CS: ChunkSorter<T>,
 {
-    /// Build the [`Sorter`].
-    ///
-    /// This is only available after providing a sort key, codec,
-    /// and flush strategy. Compare defaults to [`Natural`], dedup
-    /// defaults to [`Identity`], and chunk sorter defaults to
-    /// [`Sequential`].
+    /// Build the [`Sorter`] (base merge path).
     #[must_use]
     pub fn build(self) -> Sorter<T, SK, Cod, Cmp, D, CS, Basic> {
         Sorter {
@@ -375,7 +312,7 @@ where
     }
 }
 
-// build() for the keyed path.
+// build() for keyed path.
 impl<T, SK, Cod, Cmp, D, CS>
     Builder<HasSortKey<SK>, HasKeyedCodec<Cod>, HasFlushStrategy<T>, Cmp, D, CS>
 where
@@ -384,12 +321,7 @@ where
     Cmp: for<'a> Compare<SK::Key<'a>> + Copy,
     CS: ChunkSorter<T>,
 {
-    /// Build the [`Sorter`] with the keyed merge path.
-    ///
-    /// This is only available after providing a sort key, keyed
-    /// codec, and flush strategy. The keyed path compares
-    /// precomputed keys during the merge instead of deserializing
-    /// full records.
+    /// Build the [`Sorter`] (keyed merge path).
     #[must_use]
     pub fn build(self) -> Sorter<T, SK, Cod, Cmp, D, CS, Keyed> {
         Sorter {
@@ -415,7 +347,6 @@ where
 /// sorted runs, apply deduplication, and produce a sorted output
 /// iterator.
 ///
-/// The sorter is generic over seven axes:
 /// - `T`: the item type being sorted
 /// - `SK`: [`SortKey`] — how to extract a sort key
 /// - `Cod`: [`Codec`] — how to serialize to/from disk
@@ -437,7 +368,9 @@ pub struct Sorter<T, SK, Cod, Cmp, D, CS, M = Basic> {
     _marker: std::marker::PhantomData<M>,
 }
 
-impl<T, SK, Cod, Cmp, D, CS, M> Sorter<T, SK, Cod, Cmp, D, CS, M>
+// ── Basic path: push + flush + finish ────────────────────
+
+impl<T, SK, Cod, Cmp, D, CS> Sorter<T, SK, Cod, Cmp, D, CS, Basic>
 where
     T: 'static,
     SK: SortKey<T> + Copy + Send + Sync + 'static,
@@ -447,33 +380,29 @@ where
 {
     /// Add an item to the sorter.
     ///
-    /// If the buffer exceeds the configured flush threshold, the
-    /// buffer is sorted and flushed to a temporary file on disk.
-    ///
     /// # Errors
     ///
-    /// Returns an error if flushing to disk fails (I/O or codec).
+    /// Returns an error if flushing to disk fails.
     pub fn push(&mut self, item: T) -> Result<(), MergeError<Cod::Error>> {
         match &self.flush {
             FlushStrategy::Bytes { budget, item_size } => {
                 self.buffer_bytes += item_size(&item);
                 self.buffer.push(item);
                 if self.buffer_bytes >= *budget {
-                    self.flush_buffer()?;
+                    self.flush_basic()?;
                 }
             }
             FlushStrategy::Items { max_items } => {
                 self.buffer.push(item);
                 if self.buffer.len() >= *max_items {
-                    self.flush_buffer()?;
+                    self.flush_basic()?;
                 }
             }
         }
         Ok(())
     }
 
-    /// Sort and flush the current buffer to a temporary file.
-    fn flush_buffer(&mut self) -> Result<(), MergeError<Cod::Error>> {
+    fn flush_basic(&mut self) -> Result<(), MergeError<Cod::Error>> {
         let item_cmp = KeyCompare::new(self.sort_key, self.compare);
         self.chunk_sort.sort(&mut self.buffer, move |a: &T, b: &T| {
             Compare::compare(&item_cmp, a, b)
@@ -486,34 +415,16 @@ where
 
         Ok(())
     }
-}
 
-// finish() for the base merge path.
-impl<T, SK, Cod, Cmp, D, CS> Sorter<T, SK, Cod, Cmp, D, CS, Basic>
-where
-    T: 'static,
-    SK: SortKey<T> + Copy + Send + Sync + 'static,
-    Cod: Codec<T> + Copy + 'static,
-    Cmp: for<'a> Compare<SK::Key<'a>> + Copy + Send + Sync + 'static,
-    CS: ChunkSorter<T>,
-{
-    /// Flush any remaining items, merge all sorted runs, apply
-    /// deduplication, and return a sorted output iterator.
-    ///
-    /// This uses the base merge path — every record is
-    /// deserialized during the merge for comparison.
+    /// Flush remaining items, merge all sorted runs, apply dedup.
     ///
     /// # Errors
     ///
-    /// Returns an error if flushing the residual buffer or
-    /// setting up the merge fails.
+    /// Returns an error if flushing or merging fails.
     ///
     /// # Panics
     ///
-    /// Panics if called more than once (the dedup strategy is
-    /// consumed on the first call).
-    // Allow: the nested Result<impl Iterator<Item = Result<...>>>
-    // is inherent to fallible streaming finalization.
+    /// Panics if called more than once.
     #[allow(clippy::type_complexity)]
     pub fn finish(
         mut self,
@@ -525,7 +436,7 @@ where
         D: Dedup<T, MergeError<Cod::Error>>,
     {
         if !self.buffer.is_empty() {
-            self.flush_buffer()?;
+            self.flush_basic()?;
         }
 
         let item_cmp = KeyCompare::new(self.sort_key, self.compare);
@@ -541,11 +452,8 @@ where
     }
 }
 
-// finish() for the keyed merge path.
-// TODO: implement the keyed merge using KeyedCodecReader.
-// For now this is a placeholder that falls back to the base path
-// so that the type structure compiles and tests pass. The real
-// keyed merge will be implemented when spillover-bio needs it.
+// ── Keyed path: push + flush + finish ────────────────────
+
 impl<T, SK, Cod, Cmp, D, CS> Sorter<T, SK, Cod, Cmp, D, CS, Keyed>
 where
     T: 'static,
@@ -554,22 +462,65 @@ where
     Cmp: for<'a> Compare<SK::Key<'a>> + Copy + Send + Sync + 'static,
     CS: ChunkSorter<T>,
 {
-    /// Flush any remaining items, merge all sorted runs, apply
-    /// deduplication, and return a sorted output iterator.
-    ///
-    /// This uses the keyed merge path — the merge heap compares
-    /// precomputed keys without deserializing full records. Only
-    /// the winning record is deserialized on each merge step.
+    /// Add an item to the sorter.
     ///
     /// # Errors
     ///
-    /// Returns an error if flushing the residual buffer or
-    /// setting up the merge fails.
+    /// Returns an error if flushing to disk fails.
+    pub fn push(&mut self, item: T) -> Result<(), MergeError<Cod::Error>> {
+        match &self.flush {
+            FlushStrategy::Bytes { budget, item_size } => {
+                self.buffer_bytes += item_size(&item);
+                self.buffer.push(item);
+                if self.buffer_bytes >= *budget {
+                    self.flush_keyed()?;
+                }
+            }
+            FlushStrategy::Items { max_items } => {
+                self.buffer.push(item);
+                if self.buffer.len() >= *max_items {
+                    self.flush_keyed()?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn flush_keyed(&mut self) -> Result<(), MergeError<Cod::Error>> {
+        let item_cmp = KeyCompare::new(self.sort_key, self.compare);
+        self.chunk_sort.sort(&mut self.buffer, move |a: &T, b: &T| {
+            Compare::compare(&item_cmp, a, b)
+        });
+
+        let mut file = match self.config.merge.temp_dir {
+            Some(ref dir) => tempfile::tempfile_in(dir).map_err(MergeError::Io)?,
+            None => tempfile::tempfile().map_err(MergeError::Io)?,
+        };
+        let mut writer = self.codec.keyed_writer(&mut file);
+        for item in &self.buffer {
+            let key = self.codec.derive_key(item);
+            writer.write_keyed(item, &key).map_err(MergeError::Codec)?;
+        }
+        writer.finish().map_err(MergeError::Codec)?;
+        file.seek(std::io::SeekFrom::Start(0))
+            .map_err(MergeError::Io)?;
+
+        self.spilled_runs.push(SortedRun { file });
+        self.buffer.clear();
+        self.buffer_bytes = 0;
+
+        Ok(())
+    }
+
+    /// Flush remaining items, merge all sorted runs, apply dedup.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if flushing or merging fails.
     ///
     /// # Panics
     ///
-    /// Panics if called more than once (the dedup strategy is
-    /// consumed on the first call).
+    /// Panics if called more than once.
     #[allow(clippy::type_complexity)]
     pub fn finish(
         mut self,
@@ -580,13 +531,13 @@ where
     where
         D: Dedup<T, MergeError<Cod::Error>>,
     {
-        // TODO: use KeyedCodecReader for the merge heap.
-        // For now, fall back to the base path via the Codec
-        // supertrait.
         if !self.buffer.is_empty() {
-            self.flush_buffer()?;
+            self.flush_keyed()?;
         }
 
+        // TODO: use KeyedCodecReader for the merge heap to avoid
+        // full deserialization during merge. For now, use the base
+        // Codec path via the KeyedCodec's Codec supertrait.
         let item_cmp = KeyCompare::new(self.sort_key, self.compare);
         let run_merger = RunMerger::new(self.codec, item_cmp, self.config.merge.clone());
         let merged = run_merger.merge(std::mem::take(&mut self.spilled_runs))?;
@@ -719,7 +670,6 @@ mod tests {
 
     #[test]
     fn sort_with_spilling() {
-        // Buffer holds 3 items, input has 10 → multiple spills.
         let mut sorter = u64_sorter(3);
         for v in [9, 7, 5, 3, 1, 2, 4, 6, 8, 10] {
             sorter.push(v).expect("push");
@@ -799,7 +749,6 @@ mod tests {
 
     #[test]
     fn sort_with_byte_budget() {
-        // 8 bytes per u64, budget of 24 bytes → flush every 3 items.
         let mut sorter = Builder::new()
             .key(Owned((|v: &u64| *v) as fn(&u64) -> u64))
             .codec(U64Codec)
@@ -819,7 +768,6 @@ mod tests {
 
     #[test]
     fn sort_all_in_memory_no_spill() {
-        // Budget larger than all data → no spill, single in-memory sort.
         let mut sorter = u64_sorter(1000);
         for v in [5, 3, 1, 4, 2] {
             sorter.push(v).expect("push");

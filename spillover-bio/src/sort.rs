@@ -98,10 +98,14 @@ pub trait SortOrder: sealed::Sealed + Copy {
 /// acceleration. Only available when `Strategy = Keyed`.
 pub trait KeyedSortOrder: SortOrder<Strategy = Keyed> {
     /// The dryice record key type.
-    type RecordKey: dryice::RecordKey + Clone;
+    type RecordKey: dryice::RecordKey + Clone + Copy;
 
     /// Derive a record key from a record.
     fn record_key(&self, record: &SeqRecord) -> Self::RecordKey;
+
+    /// A function pointer for key derivation, suitable for
+    /// embedding in the codec.
+    fn record_key_fn(&self) -> fn(&SeqRecord) -> Self::RecordKey;
 }
 
 /// Marker: base merge path (no record keys).
@@ -142,6 +146,10 @@ impl<const N: usize> KeyedSortOrder for SequenceOrder<N> {
     fn record_key(&self, record: &SeqRecord) -> PackedSequenceKey<N> {
         PackedSequenceKey::from_sequence(record.sequence())
     }
+
+    fn record_key_fn(&self) -> fn(&SeqRecord) -> PackedSequenceKey<N> {
+        |rec| PackedSequenceKey::from_sequence(rec.sequence())
+    }
 }
 
 impl<const N: usize> SequenceOrder<N> {
@@ -174,14 +182,22 @@ impl SortOrder for NameOrder {
     }
 }
 
+fn derive_name_key(record: &SeqRecord) -> dryice::Bytes16Key {
+    let mut key = [0u8; 16];
+    let len = record.name().len().min(16);
+    key[..len].copy_from_slice(&record.name()[..len]);
+    dryice::Bytes16Key(key)
+}
+
 impl KeyedSortOrder for NameOrder {
     type RecordKey = dryice::Bytes16Key;
 
     fn record_key(&self, record: &SeqRecord) -> dryice::Bytes16Key {
-        let mut key = [0u8; 16];
-        let len = record.name().len().min(16);
-        key[..len].copy_from_slice(&record.name()[..len]);
-        dryice::Bytes16Key(key)
+        derive_name_key(record)
+    }
+
+    fn record_key_fn(&self) -> fn(&SeqRecord) -> dryice::Bytes16Key {
+        derive_name_key
     }
 }
 
@@ -214,12 +230,20 @@ impl SortOrder for LengthOrder {
     }
 }
 
+#[allow(clippy::cast_possible_truncation)]
+fn derive_length_key(record: &SeqRecord) -> dryice::Bytes8Key {
+    dryice::Bytes8Key((record.sequence().len() as u64).to_be_bytes())
+}
+
 impl KeyedSortOrder for LengthOrder {
     type RecordKey = dryice::Bytes8Key;
 
-    #[allow(clippy::cast_possible_truncation)]
     fn record_key(&self, record: &SeqRecord) -> dryice::Bytes8Key {
-        dryice::Bytes8Key((record.sequence().len() as u64).to_be_bytes())
+        derive_length_key(record)
+    }
+
+    fn record_key_fn(&self) -> fn(&SeqRecord) -> dryice::Bytes8Key {
+        derive_length_key
     }
 }
 
@@ -326,6 +350,10 @@ impl<O: KeyedSortOrder> KeyedSortOrder for Reverse<O> {
 
     fn record_key(&self, record: &SeqRecord) -> Self::RecordKey {
         self.0.record_key(record)
+    }
+
+    fn record_key_fn(&self) -> fn(&SeqRecord) -> Self::RecordKey {
+        self.0.record_key_fn()
     }
 }
 
@@ -621,7 +649,7 @@ where
         spillover::sorter::Keyed,
     > {
         let order = self.order.0;
-        let keyed_codec = self.codec.0.with_record_key::<O::RecordKey>();
+        let keyed_codec = self.codec.0.with_record_key(order.record_key_fn());
 
         let builder = spillover::sorter::Builder::new()
             .key(order.sort_key())

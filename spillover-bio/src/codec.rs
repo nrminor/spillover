@@ -158,11 +158,16 @@ impl<S, Q, N> DryIceCodec<S, Q, N> {
         self.name_codec::<dryice::OmittedNameCodec>()
     }
 
-    /// Transition to a keyed codec with the given record key type.
+    /// Transition to a keyed codec with the given record key type
+    /// and a function to derive keys from records.
     #[must_use]
-    pub fn with_record_key<K: RecordKey>(self) -> KeyedDryIceCodec<S, Q, N, K> {
+    pub fn with_record_key<K: RecordKey>(
+        self,
+        derive_key: fn(&SeqRecord) -> K,
+    ) -> KeyedDryIceCodec<S, Q, N, K> {
         KeyedDryIceCodec {
             target_block_records: self.target_block_records,
+            derive_key,
             _codecs: PhantomData,
         }
     }
@@ -171,21 +176,27 @@ impl<S, Q, N> DryIceCodec<S, Q, N> {
     /// key covering 152 bases (full Illumina 150bp reads).
     #[must_use]
     pub fn with_illumina_key(self) -> KeyedDryIceCodec<S, Q, N, crate::key::IlluminaKey> {
-        self.with_record_key::<crate::key::IlluminaKey>()
+        self.with_record_key(|rec: &SeqRecord| {
+            crate::key::PackedSequenceKey::from_sequence(rec.sequence())
+        })
     }
 
     /// Transition to a keyed codec with a 64-byte packed sequence
     /// key covering 256 bases (full 250bp paired-end reads).
     #[must_use]
     pub fn with_paired_end_key(self) -> KeyedDryIceCodec<S, Q, N, crate::key::PairedEndKey> {
-        self.with_record_key::<crate::key::PairedEndKey>()
+        self.with_record_key(|rec: &SeqRecord| {
+            crate::key::PackedSequenceKey::from_sequence(rec.sequence())
+        })
     }
 
     /// Transition to a keyed codec with a 128-byte packed sequence
     /// key covering 512 bases (prefix for long reads).
     #[must_use]
     pub fn with_long_read_key(self) -> KeyedDryIceCodec<S, Q, N, crate::key::LongReadPrefixKey> {
-        self.with_record_key::<crate::key::LongReadPrefixKey>()
+        self.with_record_key(|rec: &SeqRecord| {
+            crate::key::PackedSequenceKey::from_sequence(rec.sequence())
+        })
     }
 }
 
@@ -199,6 +210,7 @@ impl<S, Q, N> DryIceCodec<S, Q, N> {
 /// builder.
 pub struct KeyedDryIceCodec<S = RawAsciiCodec, Q = RawQualityCodec, N = RawNameCodec, K = ()> {
     target_block_records: usize,
+    derive_key: fn(&SeqRecord) -> K,
     _codecs: KeyedCodecMarker<S, Q, N, K>,
 }
 
@@ -414,6 +426,10 @@ impl<S: SequenceCodec, Q: QualityCodec, N: NameCodec, K: RecordKey + Clone> Keye
     type KeyedWriter<W: Write> = KeyedWriterAdapter<W, S, Q, N, K>;
     type KeyedReader<R: Read> = KeyedReaderAdapter<R, S, Q, N, K>;
 
+    fn derive_key(&self, item: &SeqRecord) -> K {
+        (self.derive_key)(item)
+    }
+
     fn keyed_writer<W: Write>(&self, dest: W) -> Self::KeyedWriter<W> {
         KeyedWriterAdapter(
             DryIceWriter::builder()
@@ -471,7 +487,9 @@ mod tests {
     fn keyed_path_round_trips_records_and_keys() {
         use crate::key::PackedSequenceKey;
 
-        let codec = DryIceCodec::new().with_record_key::<PackedSequenceKey<2>>();
+        let codec = DryIceCodec::new().with_record_key(|rec: &SeqRecord| {
+            PackedSequenceKey::<2>::from_sequence(rec.sequence())
+        });
         let records = test_records();
         let keys: Vec<_> = records
             .iter()
