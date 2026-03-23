@@ -38,6 +38,8 @@
 !/spillover-bio/src/record.rs
 !/spillover-bio/src/key.rs
 !/spillover-bio/src/codec.rs
+!/spillover-bio/src/sort.rs
+!/spillover-bio/src/radix.rs
 
 # === Allowed: GitHub workflows ===
 !/.github
