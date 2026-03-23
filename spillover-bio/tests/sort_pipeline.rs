@@ -348,3 +348,434 @@ fn spilling_with_many_flushes_preserves_all_records() {
         );
     }
 }
+
+#[test]
+fn compact_codecs_round_trip_correctly() {
+    let mut sorter = Builder::new()
+        .sort_by_illumina()
+        .codec(
+            DryIceCodec::new()
+                .two_bit_exact()
+                .binned_quality()
+                .split_names(),
+        )
+        .max_buffer_items(100)
+        .build();
+
+    let records = vec![
+        make_record(
+            b"instrument:run:flowcell 1:N:0:ATCACG",
+            b"TTTTTTTTTTTTTTTT",
+            b"IIIIIIIIIIIIIIII",
+        ),
+        make_record(
+            b"instrument:run:flowcell 2:N:0:ATCACG",
+            b"AAAAAAAAAAAAAAAA",
+            b"!!!!!!!!!!!!!!!!",
+        ),
+        make_record(
+            b"instrument:run:flowcell 3:N:0:ATCACG",
+            b"CCCCCCCCCCCCCCCC",
+            b"################",
+        ),
+    ];
+
+    for rec in records {
+        sorter.push(rec).expect("push");
+    }
+
+    let results: Vec<SeqRecord> = sorter
+        .finish()
+        .expect("finish")
+        .map(|r| r.expect("decode"))
+        .collect();
+
+    assert_eq!(results.len(), 3);
+    assert_eq!(results[0].sequence(), b"AAAAAAAAAAAAAAAA");
+    assert_eq!(results[1].sequence(), b"CCCCCCCCCCCCCCCC");
+    assert_eq!(results[2].sequence(), b"TTTTTTTTTTTTTTTT");
+}
+
+#[test]
+fn realistic_150bp_reads_sort_correctly() {
+    let bases = [b'A', b'C', b'G', b'T'];
+    let mut input: Vec<SeqRecord> = (0..100)
+        .map(|i| {
+            let seq: Vec<u8> = (0..150)
+                .map(|j| bases[(i * 7 + j * 13 + j / 10) % 4])
+                .collect();
+            let qual: Vec<u8> = (0..150)
+                .map(|j| b'!' + u8::try_from((i + j * 3) % 40).expect("fits"))
+                .collect();
+            make_record(format!("read_{i:04}").as_bytes(), &seq, &qual)
+        })
+        .collect();
+
+    let mut sorter = Builder::new()
+        .sort_by_illumina()
+        .codec(DryIceCodec::new())
+        .max_buffer_items(20)
+        .build();
+
+    for rec in &input {
+        sorter.push(rec.clone()).expect("push");
+    }
+
+    let results: Vec<SeqRecord> = sorter
+        .finish()
+        .expect("finish")
+        .map(|r| r.expect("decode"))
+        .collect();
+
+    input.sort_by(|a, b| {
+        a.sequence()
+            .cmp(b.sequence())
+            .then_with(|| a.quality().cmp(b.quality()))
+    });
+
+    assert_eq!(results.len(), input.len());
+    for (i, (got, expected)) in results.iter().zip(input.iter()).enumerate() {
+        assert_eq!(
+            got.sequence(),
+            expected.sequence(),
+            "sequence mismatch at position {i}"
+        );
+        assert_eq!(
+            got.quality(),
+            expected.quality(),
+            "quality mismatch at position {i}"
+        );
+    }
+}
+
+#[test]
+fn radix_sort_through_pipeline() {
+    use spillover_bio::radix::RadixThenRefine;
+
+    let bases = [b'A', b'C', b'G', b'T'];
+    let mut input: Vec<SeqRecord> = (0..200)
+        .map(|i| {
+            let seq: Vec<u8> = (0..16).map(|j| bases[(i * 7 + j * 13) % 4]).collect();
+            let qual: Vec<u8> = (0..16)
+                .map(|j| b'!' + u8::try_from((i + j) % 40).expect("fits"))
+                .collect();
+            make_record(format!("r{i:03}").as_bytes(), &seq, &qual)
+        })
+        .collect();
+
+    let mut sorter = Builder::new()
+        .sort_by_illumina()
+        .codec(DryIceCodec::new())
+        .chunk_sort(RadixThenRefine::<4>)
+        .max_buffer_items(50)
+        .build();
+
+    for rec in &input {
+        sorter.push(rec.clone()).expect("push");
+    }
+
+    let results: Vec<SeqRecord> = sorter
+        .finish()
+        .expect("finish")
+        .map(|r| r.expect("decode"))
+        .collect();
+
+    input.sort_by(|a, b| {
+        a.sequence()
+            .cmp(b.sequence())
+            .then_with(|| a.quality().cmp(b.quality()))
+    });
+
+    assert_eq!(results.len(), input.len());
+    for (i, (got, expected)) in results.iter().zip(input.iter()).enumerate() {
+        assert_eq!(
+            got.sequence(),
+            expected.sequence(),
+            "sequence mismatch at position {i} with radix sort"
+        );
+        assert_eq!(
+            got.quality(),
+            expected.quality(),
+            "quality mismatch at position {i} with radix sort"
+        );
+    }
+}
+
+#[test]
+fn sequences_with_ambiguous_bases_sort_correctly() {
+    let mut sorter = Builder::new()
+        .sort_by_illumina()
+        .codec(DryIceCodec::new())
+        .max_buffer_items(100)
+        .build();
+
+    // N maps to A in packed keys, so NNNNNNNN and AAAAAAAA
+    // have the same packed key. Quality tiebreaker should
+    // differentiate them.
+    sorter
+        .push(make_record(b"r1", b"NNNNNNNN", b"IIIIIIII"))
+        .expect("push");
+    sorter
+        .push(make_record(b"r2", b"AAAAAAAA", b"!!!!!!!!"))
+        .expect("push");
+    sorter
+        .push(make_record(b"r3", b"TTTTTTTT", b"!!!!!!!!"))
+        .expect("push");
+
+    let results: Vec<SeqRecord> = sorter
+        .finish()
+        .expect("finish")
+        .map(|r| r.expect("decode"))
+        .collect();
+
+    assert_eq!(results.len(), 3);
+    // AAAAAAAA and NNNNNNNN both sort before TTTTTTTT.
+    // Between them, quality tiebreaker: ! < I
+    assert_eq!(results[0].quality(), b"!!!!!!!!");
+    assert_eq!(results[1].quality(), b"IIIIIIII");
+    assert_eq!(results[2].sequence(), b"TTTTTTTT");
+}
+
+#[test]
+fn single_record_round_trips() {
+    let mut sorter = Builder::new()
+        .sort_by_illumina()
+        .codec(DryIceCodec::new())
+        .max_buffer_items(100)
+        .build();
+
+    sorter
+        .push(make_record(b"only_record", b"ACGTACGT", b"IIIIIIII"))
+        .expect("push");
+
+    let results: Vec<SeqRecord> = sorter
+        .finish()
+        .expect("finish")
+        .map(|r| r.expect("decode"))
+        .collect();
+
+    assert_eq!(results.len(), 1);
+    assert_eq!(results[0].name(), b"only_record");
+    assert_eq!(results[0].sequence(), b"ACGTACGT");
+    assert_eq!(results[0].quality(), b"IIIIIIII");
+}
+
+#[test]
+fn all_identical_records_sort_and_preserve_count() {
+    let mut sorter = Builder::new()
+        .sort_by_illumina()
+        .codec(DryIceCodec::new())
+        .max_buffer_items(3)
+        .build();
+
+    for i in 0..10 {
+        sorter
+            .push(make_record(
+                format!("r{i}").as_bytes(),
+                b"ACGTACGT",
+                b"!!!!!!!!",
+            ))
+            .expect("push");
+    }
+
+    let results: Vec<SeqRecord> = sorter
+        .finish()
+        .expect("finish")
+        .map(|r| r.expect("decode"))
+        .collect();
+
+    assert_eq!(
+        results.len(),
+        10,
+        "identical records should all be preserved without dedup"
+    );
+}
+
+#[test]
+fn dedup_with_spilling_removes_cross_chunk_duplicates() {
+    use spillover::dedup::AdjacentDedup;
+
+    // Buffer holds 3 records. Duplicates span chunk boundaries.
+    let mut sorter = Builder::new()
+        .sort_by_illumina()
+        .codec(DryIceCodec::new())
+        .dedup(AdjacentDedup::new(|a: &SeqRecord, b: &SeqRecord| {
+            a.sequence() == b.sequence()
+        }))
+        .max_buffer_items(3)
+        .build();
+
+    // Push records with duplicates that will end up in different chunks
+    for seq in [
+        b"AAAAAAAA",
+        b"AAAAAAAA",
+        b"CCCCCCCC",
+        b"CCCCCCCC",
+        b"CCCCCCCC",
+        b"GGGGGGGG",
+        b"TTTTTTTT",
+        b"TTTTTTTT",
+    ] {
+        sorter
+            .push(make_record(b"r", seq.as_slice(), &[b'!'; 8]))
+            .expect("push");
+    }
+
+    let results: Vec<SeqRecord> = sorter
+        .finish()
+        .expect("finish")
+        .map(|r| r.expect("decode"))
+        .collect();
+
+    assert_eq!(
+        results.len(),
+        4,
+        "dedup should collapse duplicates even across chunk boundaries"
+    );
+    assert_eq!(results[0].sequence(), b"AAAAAAAA");
+    assert_eq!(results[1].sequence(), b"CCCCCCCC");
+    assert_eq!(results[2].sequence(), b"GGGGGGGG");
+    assert_eq!(results[3].sequence(), b"TTTTTTTT");
+}
+
+mod proptests {
+    use proptest::prelude::*;
+
+    use super::*;
+
+    fn arb_sequence(max_len: usize) -> impl Strategy<Value = Vec<u8>> {
+        proptest::collection::vec(
+            proptest::sample::select(vec![b'A', b'C', b'G', b'T']),
+            1..=max_len,
+        )
+    }
+
+    fn arb_quality(len: usize) -> impl Strategy<Value = Vec<u8>> {
+        proptest::collection::vec(b'!'..=b'I', len..=len)
+    }
+
+    fn arb_record(max_seq_len: usize) -> impl Strategy<Value = SeqRecord> {
+        arb_sequence(max_seq_len).prop_flat_map(|seq| {
+            let len = seq.len();
+            (Just(seq), arb_quality(len))
+                .prop_map(|(seq, qual)| SeqRecord::new(b"r".to_vec(), seq, qual))
+        })
+    }
+
+    proptest! {
+        #[test]
+        fn output_is_sorted_for_any_input(
+            records in proptest::collection::vec(arb_record(32), 1..100),
+            buffer_size in 2usize..20,
+        ) {
+            let mut sorter = Builder::new()
+                .sort_by_illumina()
+                .codec(DryIceCodec::new())
+                .max_buffer_items(buffer_size)
+                .build();
+
+            for rec in &records {
+                sorter.push(rec.clone()).expect("push");
+            }
+
+            let results: Vec<SeqRecord> = sorter
+                .finish()
+                .expect("finish")
+                .map(|r| r.expect("decode"))
+                .collect();
+
+            prop_assert_eq!(results.len(), records.len());
+
+            for window in results.windows(2) {
+                prop_assert!(
+                    (window[0].sequence(), window[0].quality())
+                        <= (window[1].sequence(), window[1].quality()),
+                    "output must be sorted by (sequence, quality)"
+                );
+            }
+        }
+
+        #[test]
+        fn output_preserves_all_records(
+            records in proptest::collection::vec(arb_record(32), 1..100),
+            buffer_size in 2usize..20,
+        ) {
+            let mut sorter = Builder::new()
+                .sort_by_illumina()
+                .codec(DryIceCodec::new())
+                .max_buffer_items(buffer_size)
+                .build();
+
+            for rec in &records {
+                sorter.push(rec.clone()).expect("push");
+            }
+
+            let mut results: Vec<SeqRecord> = sorter
+                .finish()
+                .expect("finish")
+                .map(|r| r.expect("decode"))
+                .collect();
+
+            let mut expected = records;
+            expected.sort_by(|a, b| {
+                a.sequence()
+                    .cmp(b.sequence())
+                    .then_with(|| a.quality().cmp(b.quality()))
+            });
+
+            prop_assert_eq!(results.len(), expected.len());
+
+            // Sort both by (seq, qual, name) for comparison since
+            // records with equal (seq, qual) may be in any relative order.
+            let key = |r: &SeqRecord| {
+                (r.sequence().to_vec(), r.quality().to_vec(), r.name().to_vec())
+            };
+            results.sort_by_key(|r| key(r));
+            expected.sort_by_key(|r| key(r));
+
+            for (got, exp) in results.iter().zip(expected.iter()) {
+                prop_assert_eq!(got.sequence(), exp.sequence());
+                prop_assert_eq!(got.quality(), exp.quality());
+            }
+        }
+
+        #[test]
+        fn name_sort_output_is_sorted(
+            records in proptest::collection::vec(
+                (proptest::collection::vec(b'a'..=b'z', 1..20), arb_sequence(16))
+                    .prop_flat_map(|(name, seq)| {
+                        let len = seq.len();
+                        (Just(name), Just(seq), arb_quality(len))
+                    })
+                    .prop_map(|(name, seq, qual)| SeqRecord::new(name, seq, qual)),
+                1..50,
+            ),
+            buffer_size in 2usize..10,
+        ) {
+            let mut sorter = Builder::new()
+                .sort_by_name()
+                .codec(DryIceCodec::new())
+                .max_buffer_items(buffer_size)
+                .build();
+
+            for rec in &records {
+                sorter.push(rec.clone()).expect("push");
+            }
+
+            let results: Vec<SeqRecord> = sorter
+                .finish()
+                .expect("finish")
+                .map(|r| r.expect("decode"))
+                .collect();
+
+            prop_assert_eq!(results.len(), records.len());
+
+            for window in results.windows(2) {
+                prop_assert!(
+                    window[0].name() <= window[1].name(),
+                    "output must be sorted by name"
+                );
+            }
+        }
+    }
+}
