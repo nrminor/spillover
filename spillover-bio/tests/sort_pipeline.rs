@@ -104,6 +104,43 @@ fn quality_tiebreaker_orders_identical_sequences() {
 }
 
 #[test]
+fn keyed_merge_preserves_quality_tiebreak_across_run_boundaries() {
+    // Buffer holds 2 records, so this input spills into multiple runs.
+    // All sequences are identical; merge must use full-record fallback
+    // when packed keys tie to preserve quality ordering.
+    let mut sorter = Builder::new()
+        .sort_by_illumina()
+        .codec(DryIceCodec::new())
+        .max_buffer_items(2)
+        .build();
+
+    sorter
+        .push(make_record(b"r1", b"ACGTACGT", b"IIIIIIII"))
+        .expect("push");
+    sorter
+        .push(make_record(b"r2", b"ACGTACGT", b"!!!!!!!!"))
+        .expect("push");
+    sorter
+        .push(make_record(b"r3", b"ACGTACGT", b"########"))
+        .expect("push");
+    sorter
+        .push(make_record(b"r4", b"ACGTACGT", b"JJJJJJJJ"))
+        .expect("push");
+
+    let results: Vec<SeqRecord> = sorter
+        .finish()
+        .expect("finish")
+        .map(|r| r.expect("decode"))
+        .collect();
+
+    assert_eq!(results.len(), 4);
+    assert_eq!(results[0].quality(), b"!!!!!!!!");
+    assert_eq!(results[1].quality(), b"########");
+    assert_eq!(results[2].quality(), b"IIIIIIII");
+    assert_eq!(results[3].quality(), b"JJJJJJJJ");
+}
+
+#[test]
 fn sort_by_name_orders_lexicographically() {
     let mut sorter = Builder::new()
         .sort_by_name()
@@ -288,9 +325,12 @@ fn large_dataset_matches_reference_sort() {
         .map(|r| r.expect("decode"))
         .collect();
 
-    // Build reference: sort by sequence only. The keyed merge
-    // does not guarantee quality ordering across run boundaries.
-    input.sort_by(|a, b| a.sequence().cmp(b.sequence()));
+    // Build reference using the full sort order.
+    input.sort_by(|a, b| {
+        a.sequence()
+            .cmp(b.sequence())
+            .then_with(|| a.quality().cmp(b.quality()))
+    });
 
     assert_eq!(results.len(), input.len());
     for (i, (got, expected)) in results.iter().zip(input.iter()).enumerate() {
@@ -298,6 +338,11 @@ fn large_dataset_matches_reference_sort() {
             got.sequence(),
             expected.sequence(),
             "sequence mismatch at position {i}"
+        );
+        assert_eq!(
+            got.quality(),
+            expected.quality(),
+            "quality mismatch at position {i}"
         );
     }
 }
@@ -419,7 +464,11 @@ fn realistic_150bp_reads_sort_correctly() {
         .map(|r| r.expect("decode"))
         .collect();
 
-    input.sort_by(|a, b| a.sequence().cmp(b.sequence()));
+    input.sort_by(|a, b| {
+        a.sequence()
+            .cmp(b.sequence())
+            .then_with(|| a.quality().cmp(b.quality()))
+    });
 
     assert_eq!(results.len(), input.len());
     for (i, (got, expected)) in results.iter().zip(input.iter()).enumerate() {
@@ -428,12 +477,12 @@ fn realistic_150bp_reads_sort_correctly() {
             expected.sequence(),
             "sequence mismatch at position {i}"
         );
+        assert_eq!(
+            got.quality(),
+            expected.quality(),
+            "quality mismatch at position {i}"
+        );
     }
-    // Quality ordering within equal sequences is guaranteed within
-    // each sorted chunk but not across the merge, since the keyed
-    // merge compares only packed keys, not full (sequence, quality)
-    // tuples. Cross-run quality ordering requires the fallback
-    // comparison path (not yet implemented).
 }
 
 #[test]
@@ -622,8 +671,8 @@ fn unkeyed_sort_preserves_exact_sequence_and_quality_ordering() {
     use spillover_bio::sort::ILLUMINA_ORDER;
 
     // The unkeyed path uses full (sequence, quality) comparison
-    // during merge, so quality tiebreaking is preserved across
-    // run boundaries — unlike the keyed path.
+    // during merge, so sequence+quality ordering is exact across
+    // run boundaries.
     let mut sorter = Builder::new()
         .sort_by_unkeyed(ILLUMINA_ORDER.unkeyed())
         .codec(DryIceCodec::new())
@@ -762,12 +811,13 @@ mod proptests {
 
             prop_assert_eq!(results.len(), records.len());
 
-            // Keyed merge guarantees sequence ordering but not
-            // quality ordering across run boundaries.
+            // Keyed merge preserves full sequence+quality ordering,
+            // using fallback full-record comparison when keys tie.
             for window in results.windows(2) {
                 prop_assert!(
-                    window[0].sequence() <= window[1].sequence(),
-                    "output must be sorted by sequence"
+                    (window[0].sequence(), window[0].quality())
+                        <= (window[1].sequence(), window[1].quality()),
+                    "output must be sorted by sequence then quality"
                 );
             }
         }

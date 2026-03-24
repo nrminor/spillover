@@ -6,10 +6,12 @@
 //! a configurable fan-in limit, intermediate merge passes spill
 //! to temporary files automatically.
 //!
-//! The merge engine is generic over `MergeReader`, which
-//! abstracts whether the heap holds full records (basic path)
-//! or compact keys (keyed path). Both paths share the same
-//! heap logic, fan-in recursion, and intermediate spilling.
+//! The merge engine supports two paths:
+//! - base path: heap holds full records
+//! - keyed path: heap holds compact keys and falls back to
+//!   full-record comparison when keys tie
+//!
+//! Both paths share fan-in recursion and intermediate spilling.
 
 use std::{cmp::Reverse, collections::BinaryHeap, num::NonZeroUsize, path::PathBuf};
 
@@ -184,6 +186,10 @@ impl<T, C: KeyedCodec<T>> KeyedMergeReader<T, C> {
             reader: codec.keyed_reader(file),
             _item: std::marker::PhantomData,
         }
+    }
+
+    fn current_record(&mut self) -> Result<T, C::Error> {
+        self.reader.current_record()
     }
 }
 
@@ -367,7 +373,7 @@ impl<T: 'static, C: KeyedCodec<T> + Copy + 'static, Cmp: Compare<T> + Copy + 'st
                 let group: Vec<SortedRun> = runs.drain(..chunk_end).collect();
 
                 let readers = open_keyed_readers(group, codec)?;
-                let mut heap = HeapMerge::new(readers, key_cmp)?;
+                let mut heap = KeyedHeapMerge::new(readers, key_cmp, self.cmp)?;
                 let run = self.spill_keyed_heap_to_disk(&mut heap, codec)?;
                 intermediate.push(run);
             }
@@ -376,15 +382,15 @@ impl<T: 'static, C: KeyedCodec<T> + Copy + 'static, Cmp: Compare<T> + Copy + 'st
 
         let readers = open_keyed_readers(runs, codec)?;
 
-        let heap = HeapMerge::new(readers, key_cmp)?;
-        Ok(MergedItems { heap })
+        let heap = KeyedHeapMerge::new(readers, key_cmp, self.cmp)?;
+        Ok(MergedKeyedItems { heap })
     }
 
     /// Drain a keyed heap merge into a temp file, re-deriving
     /// record keys so the next merge level can use keyed comparison.
     fn spill_keyed_heap_to_disk<KeyCmp: Compare<C::Key> + Copy>(
         &self,
-        heap: &mut HeapMerge<KeyedMergeReader<T, C>, KeyCmp>,
+        heap: &mut KeyedHeapMerge<T, C, KeyCmp, Cmp>,
         codec: C,
     ) -> MergeResult<SortedRun, C::Error> {
         let named = self.create_temp_file()?;
@@ -506,6 +512,129 @@ impl<MR: MergeReader, Cmp: Compare<MR::HeapItem> + Copy> HeapMerge<MR, Cmp> {
     }
 }
 
+/// Keyed k-way merge engine. Heap compares record keys, and when
+/// keys tie across runs it falls back to full-record comparison.
+struct KeyedHeapMerge<
+    T,
+    C: KeyedCodec<T>,
+    KeyCmp: Compare<C::Key> + Copy,
+    ItemCmp: Compare<T> + Copy,
+> {
+    readers: Vec<KeyedMergeReader<T, C>>,
+    heap: BinaryHeap<Reverse<HeapEntry<KeyedMergeReader<T, C>, KeyCmp>>>,
+    key_cmp: KeyCmp,
+    item_cmp: ItemCmp,
+}
+
+impl<T, C, KeyCmp, ItemCmp> KeyedHeapMerge<T, C, KeyCmp, ItemCmp>
+where
+    C: KeyedCodec<T>,
+    KeyCmp: Compare<C::Key> + Copy,
+    ItemCmp: Compare<T> + Copy,
+{
+    fn new(
+        mut readers: Vec<KeyedMergeReader<T, C>>,
+        key_cmp: KeyCmp,
+        item_cmp: ItemCmp,
+    ) -> Result<Self, MergeError<C::Error>> {
+        let mut heap = BinaryHeap::with_capacity(readers.len());
+
+        for (idx, reader) in readers.iter_mut().enumerate() {
+            if let Some(key) = reader.next().map_err(MergeError::Codec)? {
+                heap.push(Reverse(HeapEntry {
+                    item: WithOrd::new(key, key_cmp),
+                    source_idx: idx,
+                }));
+            }
+        }
+
+        Ok(Self {
+            readers,
+            heap,
+            key_cmp,
+            item_cmp,
+        })
+    }
+
+    fn next_output(&mut self) -> Result<Option<T>, MergeError<C::Error>> {
+        let Some(Reverse(first)) = self.heap.pop() else {
+            return Ok(None);
+        };
+
+        let has_tie = self
+            .heap
+            .peek()
+            .is_some_and(|Reverse(next)| self.key_cmp.eq(next.item.as_ref(), first.item.as_ref()));
+
+        if !has_tie {
+            let source_idx = first.source_idx;
+            let output = self.readers[source_idx]
+                .output(first.item.into_inner())
+                .map_err(MergeError::Codec)?;
+
+            if let Some(next_key) = self.readers[source_idx].next().map_err(MergeError::Codec)? {
+                self.heap.push(Reverse(HeapEntry {
+                    item: WithOrd::new(next_key, self.key_cmp),
+                    source_idx,
+                }));
+            }
+
+            return Ok(Some(output));
+        }
+
+        let mut tied = vec![first];
+        while let Some(Reverse(peek)) = self.heap.peek() {
+            if self.key_cmp.eq(peek.item.as_ref(), tied[0].item.as_ref()) {
+                let Reverse(entry) = self
+                    .heap
+                    .pop()
+                    .expect("heap.peek returned Some but pop failed");
+                tied.push(entry);
+            } else {
+                break;
+            }
+        }
+
+        let mut winner = 0usize;
+        let mut winner_record = self.readers[tied[0].source_idx]
+            .current_record()
+            .map_err(MergeError::Codec)?;
+
+        for (idx, entry) in tied.iter().enumerate().skip(1) {
+            let candidate = self.readers[entry.source_idx]
+                .current_record()
+                .map_err(MergeError::Codec)?;
+            let ordering = self.item_cmp.compare(&candidate, &winner_record);
+
+            if ordering.is_lt() || (ordering.is_eq() && entry.source_idx < tied[winner].source_idx)
+            {
+                winner = idx;
+                winner_record = candidate;
+            }
+        }
+
+        let winner_source = tied[winner].source_idx;
+
+        for (idx, entry) in tied.into_iter().enumerate() {
+            if idx != winner {
+                self.heap.push(Reverse(entry));
+            }
+        }
+
+        if let Some(next_key) = self.readers[winner_source]
+            .next()
+            .map_err(MergeError::Codec)?
+        {
+            self.heap.push(Reverse(HeapEntry {
+                item: WithOrd::new(next_key, self.key_cmp),
+                source_idx: winner_source,
+            }));
+        }
+
+        Ok(Some(winner_record))
+    }
+}
+
 /// Iterator over merged sorted items from multiple runs.
 struct MergedItems<MR: MergeReader, Cmp: Compare<MR::HeapItem> + Copy> {
     heap: HeapMerge<MR, Cmp>,
@@ -513,6 +642,34 @@ struct MergedItems<MR: MergeReader, Cmp: Compare<MR::HeapItem> + Copy> {
 
 impl<MR: MergeReader, Cmp: Compare<MR::HeapItem> + Copy> Iterator for MergedItems<MR, Cmp> {
     type Item = Result<MR::Output, MergeError<MR::Error>>;
+
+    #[inline]
+    fn next(&mut self) -> Option<Self::Item> {
+        match self.heap.next_output() {
+            Ok(Some(item)) => Some(Ok(item)),
+            Ok(None) => None,
+            Err(e) => Some(Err(e)),
+        }
+    }
+}
+
+/// Iterator over merged sorted items for the keyed merge path.
+struct MergedKeyedItems<
+    T,
+    C: KeyedCodec<T>,
+    KeyCmp: Compare<C::Key> + Copy,
+    ItemCmp: Compare<T> + Copy,
+> {
+    heap: KeyedHeapMerge<T, C, KeyCmp, ItemCmp>,
+}
+
+impl<T, C, KeyCmp, ItemCmp> Iterator for MergedKeyedItems<T, C, KeyCmp, ItemCmp>
+where
+    C: KeyedCodec<T>,
+    KeyCmp: Compare<C::Key> + Copy,
+    ItemCmp: Compare<T> + Copy,
+{
+    type Item = Result<T, MergeError<C::Error>>;
 
     #[inline]
     fn next(&mut self) -> Option<Self::Item> {
@@ -533,6 +690,9 @@ mod tests {
 
     #[derive(Clone, Copy)]
     struct U64Codec;
+
+    #[derive(Clone, Copy)]
+    struct U64KeyedCodec;
 
     struct U64Writer<W: Write> {
         inner: BufWriter<W>,
@@ -583,6 +743,130 @@ mod tests {
 
         fn reader<R: Read>(&self, source: R) -> U64Reader<R> {
             U64Reader { inner: source }
+        }
+    }
+
+    struct U64KeyedWriter<W: Write> {
+        inner: BufWriter<W>,
+    }
+
+    impl<W: Write> CodecWriter<u64> for U64KeyedWriter<W> {
+        type Error = std::io::Error;
+
+        fn write(&mut self, item: &u64) -> Result<(), Self::Error> {
+            self.inner.write_all(&item.to_le_bytes())
+        }
+
+        fn finish(mut self) -> Result<(), Self::Error> {
+            self.inner.flush()
+        }
+    }
+
+    struct U64KeyedReader<R: Read> {
+        inner: R,
+    }
+
+    impl<R: Read> CodecReader<u64> for U64KeyedReader<R> {
+        type Error = std::io::Error;
+
+        fn read(&mut self) -> Result<Option<u64>, Self::Error> {
+            let mut buf = [0u8; 8];
+            match self.inner.read(&mut buf[..1]) {
+                Ok(0) => Ok(None),
+                Ok(_) => {
+                    self.inner.read_exact(&mut buf[1..])?;
+                    Ok(Some(u64::from_le_bytes(buf)))
+                }
+                Err(e) => Err(e),
+            }
+        }
+    }
+
+    impl Codec<u64> for U64KeyedCodec {
+        type Error = std::io::Error;
+        type Writer<W: Write> = U64KeyedWriter<W>;
+        type Reader<R: Read> = U64KeyedReader<R>;
+
+        fn writer<W: Write>(&self, dest: W) -> U64KeyedWriter<W> {
+            U64KeyedWriter {
+                inner: BufWriter::new(dest),
+            }
+        }
+
+        fn reader<R: Read>(&self, source: R) -> U64KeyedReader<R> {
+            U64KeyedReader { inner: source }
+        }
+    }
+
+    struct U64OnlyKeyedWriter<W: Write> {
+        inner: BufWriter<W>,
+    }
+
+    impl<W: Write> KeyedCodecWriter<u64, u8> for U64OnlyKeyedWriter<W> {
+        type Error = std::io::Error;
+
+        fn write_keyed(&mut self, item: &u64, key: &u8) -> Result<(), Self::Error> {
+            self.inner.write_all(&[*key])?;
+            self.inner.write_all(&item.to_le_bytes())
+        }
+
+        fn finish(mut self) -> Result<(), Self::Error> {
+            self.inner.flush()
+        }
+    }
+
+    struct U64OnlyKeyedReader<R: Read> {
+        inner: R,
+        current: Option<u64>,
+    }
+
+    impl<R: Read> KeyedCodecReader<u64, u8> for U64OnlyKeyedReader<R> {
+        type Error = std::io::Error;
+
+        fn next_key(&mut self) -> Result<Option<u8>, Self::Error> {
+            let mut key = [0u8; 1];
+            match self.inner.read(&mut key) {
+                Ok(0) => {
+                    self.current = None;
+                    Ok(None)
+                }
+                Ok(_) => {
+                    let mut item = [0u8; 8];
+                    self.inner.read_exact(&mut item)?;
+                    self.current = Some(u64::from_le_bytes(item));
+                    Ok(Some(key[0]))
+                }
+                Err(e) => Err(e),
+            }
+        }
+
+        fn current_record(&mut self) -> Result<u64, Self::Error> {
+            self.current
+                .ok_or_else(|| std::io::Error::other("current_record called without key"))
+        }
+    }
+
+    impl KeyedCodec<u64> for U64KeyedCodec {
+        type Key = u8;
+        type KeyedWriter<W: Write> = U64OnlyKeyedWriter<W>;
+        type KeyedReader<R: Read> = U64OnlyKeyedReader<R>;
+
+        fn derive_key(&self, item: &u64) -> u8 {
+            // coarse key: values in the same decade tie
+            u8::try_from(*item / 10).expect("test values should fit in u8")
+        }
+
+        fn keyed_writer<W: Write>(&self, dest: W) -> Self::KeyedWriter<W> {
+            U64OnlyKeyedWriter {
+                inner: BufWriter::new(dest),
+            }
+        }
+
+        fn keyed_reader<R: Read>(&self, source: R) -> Self::KeyedReader<R> {
+            U64OnlyKeyedReader {
+                inner: source,
+                current: None,
+            }
         }
     }
 
@@ -770,6 +1054,40 @@ mod tests {
             .collect();
 
         assert_eq!(results, vec![1, 2, 3]);
+    }
+
+    fn spill_sorted_keyed(codec: U64KeyedCodec, items: impl IntoIterator<Item = u64>) -> SortedRun {
+        let named = tempfile::NamedTempFile::new().expect("create temp file");
+        let mut file = named.reopen().expect("reopen temp file");
+        let mut writer = codec.keyed_writer(&mut file);
+        for item in items {
+            let key = codec.derive_key(&item);
+            writer.write_keyed(&item, &key).expect("write keyed record");
+        }
+        writer.finish().expect("finish keyed writer");
+        drop(file);
+
+        SortedRun {
+            path: named.into_temp_path(),
+        }
+    }
+
+    #[test]
+    fn keyed_merge_falls_back_to_full_record_order_when_keys_tie() {
+        let merger = RunMerger::new(U64KeyedCodec, Natural, MergeConfig::default());
+
+        // Keys are item/10, so 11/12/18/19 all tie on key=1 across runs.
+        // Correct output requires fallback comparison on the full record.
+        let run_a = spill_sorted_keyed(U64KeyedCodec, vec![11u64, 19, 25]);
+        let run_b = spill_sorted_keyed(U64KeyedCodec, vec![12u64, 18, 26]);
+
+        let results: Vec<u64> = merger
+            .merge_keyed(vec![run_a, run_b], Natural)
+            .expect("keyed merge")
+            .map(|r| r.expect("read"))
+            .collect();
+
+        assert_eq!(results, vec![11, 12, 18, 19, 25, 26]);
     }
 
     #[test]
