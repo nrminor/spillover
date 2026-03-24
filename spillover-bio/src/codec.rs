@@ -7,7 +7,8 @@
 //!   (no record keys, full record deserialization during merge).
 //! - [`KeyedDryIceCodec`] implements both [`Codec`] and
 //!   [`KeyedCodec`] for the keyed merge path (precomputed keys
-//!   stored alongside records, key-only comparison during merge).
+//!   stored alongside records, key-first merge comparison with
+//!   full-record fallback when keys tie).
 //!
 //! Both are `Copy` configuration markers — stateful writers and
 //! readers are created by the merge engine as needed. Thin newtype

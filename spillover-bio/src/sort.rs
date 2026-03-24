@@ -496,9 +496,10 @@ impl sealed::ResolveFlush for HasFlush {
 ///     .build();
 /// ```
 ///
-/// For high-duplicate datasets, consider a bloom filter to skip
-/// likely-duplicate records before they enter the sort pipeline.
-/// This reduces memory usage, disk I/O, and merge work:
+/// For high-duplicate datasets, consider using an external bloom
+/// filter in your ingest path to skip likely-duplicate records
+/// before they enter the sort pipeline. This can reduce memory
+/// usage, disk I/O, and merge work:
 ///
 /// ```ignore
 /// let mut bloom = fastbloom::BloomFilter::with_false_pos(0.001)

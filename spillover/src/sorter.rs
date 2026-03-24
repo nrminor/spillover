@@ -69,7 +69,8 @@ pub struct HasFlushStrategy<T>(FlushStrategy<T>);
 /// Marker: base merge path — codec implements [`Codec`] only.
 pub struct Basic;
 /// Marker: keyed merge path — codec implements [`KeyedCodec`],
-/// enabling key-only comparisons during merge.
+/// enabling key-first comparisons during merge with fallback
+/// full-record comparison when keys tie.
 pub struct Keyed;
 
 /// Type-state builder for [`Sorter`].
