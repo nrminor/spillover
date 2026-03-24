@@ -11,13 +11,7 @@
 //! or compact keys (keyed path). Both paths share the same
 //! heap logic, fan-in recursion, and intermediate spilling.
 
-use std::{
-    cmp::Reverse,
-    collections::BinaryHeap,
-    io::{Seek, SeekFrom},
-    num::NonZeroUsize,
-    path::PathBuf,
-};
+use std::{cmp::Reverse, collections::BinaryHeap, num::NonZeroUsize, path::PathBuf};
 
 use crate::{
     codec::{Codec, CodecReader, CodecWriter, KeyedCodec, KeyedCodecReader, KeyedCodecWriter},
@@ -86,7 +80,7 @@ pub struct MergeConfig {
 impl Default for MergeConfig {
     fn default() -> Self {
         Self {
-            max_fan_in: NonZeroUsize::new(256).expect("256 is not zero"),
+            max_fan_in: NonZeroUsize::new(128).expect("128 is not zero"),
             read_buffer_bytes: 64 * 1024,
             write_buffer_bytes: 64 * 1024,
             temp_dir: None,
@@ -95,9 +89,19 @@ impl Default for MergeConfig {
 }
 
 /// A sorted run that has been written to a temporary file on disk.
+/// The file handle is closed after writing; the path is retained
+/// for reopening during the merge. The temp file is automatically
+/// deleted when the `SortedRun` is dropped.
 #[derive(Debug)]
 pub struct SortedRun {
-    pub(crate) file: std::fs::File,
+    pub(crate) path: tempfile::TempPath,
+}
+
+impl SortedRun {
+    /// Reopen the temp file for reading.
+    fn reopen(&self) -> std::io::Result<std::fs::File> {
+        std::fs::File::open(&self.path)
+    }
 }
 
 // ── MergeReader trait ────────────────────────────────────
@@ -230,7 +234,8 @@ impl<T: 'static, C: Codec<T> + Copy + 'static, Cmp: Compare<T> + Copy + 'static>
         &self,
         items: impl IntoIterator<Item = T>,
     ) -> Result<SortedRun, MergeError<C::Error>> {
-        let mut file = self.create_temp_file()?;
+        let named = self.create_temp_file()?;
+        let mut file = named.reopen().map_err(MergeError::Io)?;
         let mut writer = self.codec.writer(&mut file);
 
         #[cfg(debug_assertions)]
@@ -254,9 +259,11 @@ impl<T: 'static, C: Codec<T> + Copy + 'static, Cmp: Compare<T> + Copy + 'static>
         }
 
         writer.finish().map_err(MergeError::Codec)?;
-        file.seek(SeekFrom::Start(0))?;
+        drop(file); // close the write handle
 
-        Ok(SortedRun { file })
+        Ok(SortedRun {
+            path: named.into_temp_path(),
+        })
     }
 
     /// Merge sorted runs using the basic path (full record
@@ -282,23 +289,15 @@ impl<T: 'static, C: Codec<T> + Copy + 'static, Cmp: Compare<T> + Copy + 'static>
             while !runs.is_empty() {
                 let chunk_end = runs.len().min(fan_in);
                 let group: Vec<SortedRun> = runs.drain(..chunk_end).collect();
-
-                let readers: Vec<BasicMergeReader<T, C>> = group
-                    .into_iter()
-                    .map(|run| BasicMergeReader::new(codec, run.file))
-                    .collect();
-
+                let readers = open_basic_readers(group, codec)?;
                 let mut heap = HeapMerge::new(readers, cmp)?;
-                let file = self.spill_heap_to_disk(&mut heap, codec)?;
-                intermediate.push(SortedRun { file });
+                let run = self.spill_heap_to_disk(&mut heap, codec)?;
+                intermediate.push(run);
             }
             runs = intermediate;
         }
 
-        let readers: Vec<BasicMergeReader<T, C>> = runs
-            .into_iter()
-            .map(|run| BasicMergeReader::new(codec, run.file))
-            .collect();
+        let readers = open_basic_readers(runs, codec)?;
 
         let heap = HeapMerge::new(readers, cmp)?;
         Ok(MergedItems { heap })
@@ -312,21 +311,24 @@ impl<T: 'static, C: Codec<T> + Copy + 'static, Cmp: Compare<T> + Copy + 'static>
         &self,
         heap: &mut HeapMerge<MR, HCmp>,
         codec: C,
-    ) -> MergeResult<std::fs::File, C::Error> {
-        let mut file = self.create_temp_file()?;
+    ) -> MergeResult<SortedRun, C::Error> {
+        let named = self.create_temp_file()?;
+        let mut file = named.reopen().map_err(MergeError::Io)?;
         let mut writer = codec.writer(&mut file);
         while let Some(item) = heap.next_output()? {
             writer.write(&item).map_err(MergeError::Codec)?;
         }
         writer.finish().map_err(MergeError::Codec)?;
-        file.seek(SeekFrom::Start(0))?;
-        Ok(file)
+        drop(file);
+        Ok(SortedRun {
+            path: named.into_temp_path(),
+        })
     }
 
-    fn create_temp_file(&self) -> MergeResult<std::fs::File, C::Error> {
+    fn create_temp_file(&self) -> MergeResult<tempfile::NamedTempFile, C::Error> {
         let file = match self.config.temp_dir {
-            Some(ref dir) => tempfile::tempfile_in(dir)?,
-            None => tempfile::tempfile()?,
+            Some(ref dir) => tempfile::NamedTempFile::new_in(dir)?,
+            None => tempfile::NamedTempFile::new()?,
         };
         Ok(file)
     }
@@ -364,22 +366,15 @@ impl<T: 'static, C: KeyedCodec<T> + Copy + 'static, Cmp: Compare<T> + Copy + 'st
                 let chunk_end = runs.len().min(fan_in);
                 let group: Vec<SortedRun> = runs.drain(..chunk_end).collect();
 
-                let readers: Vec<KeyedMergeReader<T, C>> = group
-                    .into_iter()
-                    .map(|run| KeyedMergeReader::new(codec, run.file))
-                    .collect();
-
+                let readers = open_keyed_readers(group, codec)?;
                 let mut heap = HeapMerge::new(readers, key_cmp)?;
-                let file = self.spill_keyed_heap_to_disk(&mut heap, codec)?;
-                intermediate.push(SortedRun { file });
+                let run = self.spill_keyed_heap_to_disk(&mut heap, codec)?;
+                intermediate.push(run);
             }
             runs = intermediate;
         }
 
-        let readers: Vec<KeyedMergeReader<T, C>> = runs
-            .into_iter()
-            .map(|run| KeyedMergeReader::new(codec, run.file))
-            .collect();
+        let readers = open_keyed_readers(runs, codec)?;
 
         let heap = HeapMerge::new(readers, key_cmp)?;
         Ok(MergedItems { heap })
@@ -391,17 +386,46 @@ impl<T: 'static, C: KeyedCodec<T> + Copy + 'static, Cmp: Compare<T> + Copy + 'st
         &self,
         heap: &mut HeapMerge<KeyedMergeReader<T, C>, KeyCmp>,
         codec: C,
-    ) -> MergeResult<std::fs::File, C::Error> {
-        let mut file = self.create_temp_file()?;
+    ) -> MergeResult<SortedRun, C::Error> {
+        let named = self.create_temp_file()?;
+        let mut file = named.reopen().map_err(MergeError::Io)?;
         let mut writer = codec.keyed_writer(&mut file);
         while let Some(item) = heap.next_output()? {
             let key = codec.derive_key(&item);
             writer.write_keyed(&item, &key).map_err(MergeError::Codec)?;
         }
         writer.finish().map_err(MergeError::Codec)?;
-        file.seek(SeekFrom::Start(0))?;
-        Ok(file)
+        drop(file);
+        Ok(SortedRun {
+            path: named.into_temp_path(),
+        })
     }
+}
+
+// ── Reader construction helpers ──────────────────────────
+
+fn open_basic_readers<T, C: Codec<T> + Copy>(
+    runs: Vec<SortedRun>,
+    codec: C,
+) -> MergeResult<Vec<BasicMergeReader<T, C>>, C::Error> {
+    runs.into_iter()
+        .map(|run| {
+            let file = run.reopen().map_err(MergeError::Io)?;
+            Ok(BasicMergeReader::new(codec, file))
+        })
+        .collect()
+}
+
+fn open_keyed_readers<T, C: KeyedCodec<T> + Copy>(
+    runs: Vec<SortedRun>,
+    codec: C,
+) -> MergeResult<Vec<KeyedMergeReader<T, C>>, C::Error> {
+    runs.into_iter()
+        .map(|run| {
+            let file = run.reopen().map_err(MergeError::Io)?;
+            Ok(KeyedMergeReader::new(codec, file))
+        })
+        .collect()
 }
 
 // ── Heap merge engine ────────────────────────────────────
@@ -723,7 +747,7 @@ mod tests {
     #[test]
     fn merge_config_default_has_sensible_values() {
         let config = MergeConfig::default();
-        assert_eq!(config.max_fan_in.get(), 256);
+        assert_eq!(config.max_fan_in.get(), 128);
         assert_eq!(config.read_buffer_bytes, 64 * 1024);
         assert_eq!(config.write_buffer_bytes, 64 * 1024);
         assert!(config.temp_dir.is_none());

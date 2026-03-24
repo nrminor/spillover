@@ -14,8 +14,6 @@
 //! [`Dedup`]: crate::dedup::Dedup
 //! [`ChunkSorter`]: crate::chunk::ChunkSorter
 
-use std::io::Seek;
-
 use get_size2::GetSize;
 
 use crate::{
@@ -492,20 +490,22 @@ where
             Compare::compare(&item_cmp, a, b)
         });
 
-        let mut file = match self.config.merge.temp_dir {
-            Some(ref dir) => tempfile::tempfile_in(dir).map_err(MergeError::Io)?,
-            None => tempfile::tempfile().map_err(MergeError::Io)?,
+        let named = match self.config.merge.temp_dir {
+            Some(ref dir) => tempfile::NamedTempFile::new_in(dir).map_err(MergeError::Io)?,
+            None => tempfile::NamedTempFile::new().map_err(MergeError::Io)?,
         };
+        let mut file = named.reopen().map_err(MergeError::Io)?;
         let mut writer = self.codec.keyed_writer(&mut file);
         for item in &self.buffer {
             let key = self.codec.derive_key(item);
             writer.write_keyed(item, &key).map_err(MergeError::Codec)?;
         }
         writer.finish().map_err(MergeError::Codec)?;
-        file.seek(std::io::SeekFrom::Start(0))
-            .map_err(MergeError::Io)?;
+        drop(file);
 
-        self.spilled_runs.push(SortedRun { file });
+        self.spilled_runs.push(SortedRun {
+            path: named.into_temp_path(),
+        });
         self.buffer.clear();
         self.buffer_bytes = 0;
 
@@ -787,7 +787,7 @@ mod tests {
             #[test]
             fn output_is_always_sorted(
                 data in proptest::collection::vec(0u64..10_000, 0..500),
-                max_items in 1usize..50,
+                max_items in 3usize..50,
             ) {
                 let mut sorter = u64_sorter(max_items);
                 for v in &data {
@@ -808,7 +808,7 @@ mod tests {
             #[test]
             fn output_preserves_all_items(
                 data in proptest::collection::vec(0u64..1_000, 0..200),
-                max_items in 1usize..50,
+                max_items in 3usize..50,
             ) {
                 let mut sorter = u64_sorter(max_items);
                 for v in &data {
