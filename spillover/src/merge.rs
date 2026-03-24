@@ -20,7 +20,7 @@ use std::{
 };
 
 use crate::{
-    codec::{Codec, CodecReader, CodecWriter, KeyedCodec, KeyedCodecReader},
+    codec::{Codec, CodecReader, CodecWriter, KeyedCodec, KeyedCodecReader, KeyedCodecWriter},
     compare::{Compare, WithOrd},
 };
 
@@ -262,22 +262,39 @@ impl<T: 'static, C: Codec<T> + Copy + 'static, Cmp: Compare<T> + Copy + 'static>
     /// Merge sorted runs using the basic path (full record
     /// deserialization for comparison).
     ///
-    /// # Errors
-    ///
-    /// Returns an error if reading or merging fails.
-    /// Merge sorted runs using the basic path (full record
-    /// deserialization for comparison).
+    /// When there are more runs than [`MergeConfig::max_fan_in`],
+    /// intermediate merge passes spill to temp files automatically.
     ///
     /// # Errors
     ///
     /// Returns an error if reading or merging fails.
     pub fn merge(
         &self,
-        runs: Vec<SortedRun>,
+        mut runs: Vec<SortedRun>,
     ) -> MergeResult<impl Iterator<Item = MergeResult<T, C::Error>> + use<T, C, Cmp>, C::Error>
     {
         let codec = self.codec;
         let cmp = self.cmp;
+        let fan_in = self.config.max_fan_in.get();
+
+        while runs.len() > fan_in {
+            let mut intermediate = Vec::new();
+            while !runs.is_empty() {
+                let chunk_end = runs.len().min(fan_in);
+                let group: Vec<SortedRun> = runs.drain(..chunk_end).collect();
+
+                let readers: Vec<BasicMergeReader<T, C>> = group
+                    .into_iter()
+                    .map(|run| BasicMergeReader::new(codec, run.file))
+                    .collect();
+
+                let mut heap = HeapMerge::new(readers, cmp)?;
+                let file = self.spill_heap_to_disk(&mut heap, codec)?;
+                intermediate.push(SortedRun { file });
+            }
+            runs = intermediate;
+        }
+
         let readers: Vec<BasicMergeReader<T, C>> = runs
             .into_iter()
             .map(|run| BasicMergeReader::new(codec, run.file))
@@ -287,7 +304,26 @@ impl<T: 'static, C: Codec<T> + Copy + 'static, Cmp: Compare<T> + Copy + 'static>
         Ok(MergedItems { heap })
     }
 
-    fn create_temp_file(&self) -> Result<std::fs::File, MergeError<C::Error>> {
+    /// Drain a heap merge into a temp file via the base codec writer.
+    fn spill_heap_to_disk<
+        MR: MergeReader<Output = T, Error = C::Error>,
+        HCmp: Compare<MR::HeapItem> + Copy,
+    >(
+        &self,
+        heap: &mut HeapMerge<MR, HCmp>,
+        codec: C,
+    ) -> MergeResult<std::fs::File, C::Error> {
+        let mut file = self.create_temp_file()?;
+        let mut writer = codec.writer(&mut file);
+        while let Some(item) = heap.next_output()? {
+            writer.write(&item).map_err(MergeError::Codec)?;
+        }
+        writer.finish().map_err(MergeError::Codec)?;
+        file.seek(SeekFrom::Start(0))?;
+        Ok(file)
+    }
+
+    fn create_temp_file(&self) -> MergeResult<std::fs::File, C::Error> {
         let file = match self.config.temp_dir {
             Some(ref dir) => tempfile::tempfile_in(dir)?,
             None => tempfile::tempfile()?,
@@ -296,29 +332,50 @@ impl<T: 'static, C: Codec<T> + Copy + 'static, Cmp: Compare<T> + Copy + 'static>
     }
 }
 
-// Keyed merge method — only available when the codec supports keys.
+// Keyed merge — only available when the codec supports keys.
 impl<T: 'static, C: KeyedCodec<T> + Copy + 'static, Cmp: Compare<T> + Copy + 'static>
     RunMerger<T, C, Cmp>
 {
     /// Merge sorted runs using the keyed path (key-only
     /// comparison, full deserialization only for the winner).
     ///
-    /// The comparator for the heap operates on `C::Key`, not `T`.
-    /// Since record keys implement `Ord`, [`Natural`](crate::compare::Natural)
-    /// is typically used.
+    /// When there are more runs than [`MergeConfig::max_fan_in`],
+    /// intermediate merge passes spill to temp files automatically.
+    /// Intermediate files are written with record keys so the next
+    /// merge level can use keyed comparison.
     ///
     /// # Errors
     ///
     /// Returns an error if reading or merging fails.
     pub fn merge_keyed<KeyCmp: Compare<C::Key> + Copy>(
         &self,
-        runs: Vec<SortedRun>,
+        mut runs: Vec<SortedRun>,
         key_cmp: KeyCmp,
     ) -> MergeResult<
         impl Iterator<Item = MergeResult<T, C::Error>> + use<KeyCmp, T, C, Cmp>,
         C::Error,
     > {
         let codec = self.codec;
+        let fan_in = self.config.max_fan_in.get();
+
+        while runs.len() > fan_in {
+            let mut intermediate = Vec::new();
+            while !runs.is_empty() {
+                let chunk_end = runs.len().min(fan_in);
+                let group: Vec<SortedRun> = runs.drain(..chunk_end).collect();
+
+                let readers: Vec<KeyedMergeReader<T, C>> = group
+                    .into_iter()
+                    .map(|run| KeyedMergeReader::new(codec, run.file))
+                    .collect();
+
+                let mut heap = HeapMerge::new(readers, key_cmp)?;
+                let file = self.spill_keyed_heap_to_disk(&mut heap, codec)?;
+                intermediate.push(SortedRun { file });
+            }
+            runs = intermediate;
+        }
+
         let readers: Vec<KeyedMergeReader<T, C>> = runs
             .into_iter()
             .map(|run| KeyedMergeReader::new(codec, run.file))
@@ -326,6 +383,24 @@ impl<T: 'static, C: KeyedCodec<T> + Copy + 'static, Cmp: Compare<T> + Copy + 'st
 
         let heap = HeapMerge::new(readers, key_cmp)?;
         Ok(MergedItems { heap })
+    }
+
+    /// Drain a keyed heap merge into a temp file, re-deriving
+    /// record keys so the next merge level can use keyed comparison.
+    fn spill_keyed_heap_to_disk<KeyCmp: Compare<C::Key> + Copy>(
+        &self,
+        heap: &mut HeapMerge<KeyedMergeReader<T, C>, KeyCmp>,
+        codec: C,
+    ) -> MergeResult<std::fs::File, C::Error> {
+        let mut file = self.create_temp_file()?;
+        let mut writer = codec.keyed_writer(&mut file);
+        while let Some(item) = heap.next_output()? {
+            let key = codec.derive_key(&item);
+            writer.write_keyed(&item, &key).map_err(MergeError::Codec)?;
+        }
+        writer.finish().map_err(MergeError::Codec)?;
+        file.seek(SeekFrom::Start(0))?;
+        Ok(file)
     }
 }
 
@@ -595,6 +670,54 @@ mod tests {
             .collect();
 
         assert_eq!(results, vec![1, 2, 3, 4, 5, 6, 7, 8]);
+    }
+
+    #[test]
+    fn bounded_fan_in_triggers_intermediate_spill() {
+        let config = MergeConfig {
+            max_fan_in: NonZeroUsize::new(2).expect("2 is not zero"),
+            ..MergeConfig::default()
+        };
+        let merger = RunMerger::new(U64Codec, Natural, config);
+
+        let a = merger.spill_sorted(vec![1u64, 4]).expect("spill");
+        let b = merger.spill_sorted(vec![2u64, 5]).expect("spill");
+        let c = merger.spill_sorted(vec![3u64, 6]).expect("spill");
+
+        let results: Vec<u64> = merger
+            .merge(vec![a, b, c])
+            .expect("merge with fan-in=2")
+            .map(|r| r.expect("read"))
+            .collect();
+
+        assert_eq!(results, vec![1, 2, 3, 4, 5, 6]);
+    }
+
+    #[test]
+    fn merge_many_runs_with_small_fan_in() {
+        let config = MergeConfig {
+            max_fan_in: NonZeroUsize::new(3).expect("3 is not zero"),
+            ..MergeConfig::default()
+        };
+        let merger = RunMerger::new(U64Codec, Natural, config);
+
+        let runs: Vec<SortedRun> = (0..10)
+            .map(|i: u64| {
+                let start = i * 3;
+                merger
+                    .spill_sorted(vec![start, start + 1, start + 2])
+                    .expect("spill")
+            })
+            .collect();
+
+        let results: Vec<u64> = merger
+            .merge(runs)
+            .expect("merge 10 runs")
+            .map(|r| r.expect("read"))
+            .collect();
+
+        let expected: Vec<u64> = (0..30).collect();
+        assert_eq!(results, expected);
     }
 
     #[test]

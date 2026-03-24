@@ -617,6 +617,90 @@ fn dedup_with_spilling_removes_cross_chunk_duplicates() {
     assert_eq!(results[3].sequence(), b"TTTTTTTT");
 }
 
+#[test]
+fn unkeyed_sort_preserves_exact_sequence_and_quality_ordering() {
+    use spillover_bio::sort::ILLUMINA_ORDER;
+
+    // The unkeyed path uses full (sequence, quality) comparison
+    // during merge, so quality tiebreaking is preserved across
+    // run boundaries — unlike the keyed path.
+    let mut sorter = Builder::new()
+        .sort_by_unkeyed(ILLUMINA_ORDER.unkeyed())
+        .codec(DryIceCodec::new())
+        .max_buffer_items(3)
+        .build();
+
+    sorter
+        .push(make_record(b"r1", b"ACGTACGT", b"!!!!!!!!"))
+        .expect("push");
+    sorter
+        .push(make_record(b"r2", b"ACGTACGT", b"IIIIIIII"))
+        .expect("push");
+    sorter
+        .push(make_record(b"r3", b"ACGTACGT", b"########"))
+        .expect("push");
+    sorter
+        .push(make_record(b"r4", b"AAAAAAAA", b"!!!!!!!!"))
+        .expect("push");
+    sorter
+        .push(make_record(b"r5", b"TTTTTTTT", b"!!!!!!!!"))
+        .expect("push");
+
+    let results: Vec<SeqRecord> = sorter
+        .finish()
+        .expect("finish")
+        .map(|r| r.expect("decode"))
+        .collect();
+
+    assert_eq!(results.len(), 5);
+    assert_eq!(results[0].sequence(), b"AAAAAAAA");
+    // ACGT group: quality ordering preserved across runs
+    assert_eq!(results[1].sequence(), b"ACGTACGT");
+    assert_eq!(results[1].quality(), b"!!!!!!!!");
+    assert_eq!(results[2].sequence(), b"ACGTACGT");
+    assert_eq!(results[2].quality(), b"########");
+    assert_eq!(results[3].sequence(), b"ACGTACGT");
+    assert_eq!(results[3].quality(), b"IIIIIIII");
+    assert_eq!(results[4].sequence(), b"TTTTTTTT");
+}
+
+#[test]
+fn unkeyed_sort_with_variable_length_sequences() {
+    use spillover_bio::sort::ILLUMINA_ORDER;
+
+    // The unkeyed path doesn't have the packed key padding
+    // ambiguity, so variable-length sequences sort correctly.
+    let mut sorter = Builder::new()
+        .sort_by_unkeyed(ILLUMINA_ORDER.unkeyed())
+        .codec(DryIceCodec::new())
+        .max_buffer_items(3)
+        .build();
+
+    sorter.push(make_record(b"r1", b"TA", b"!!")).expect("push");
+    sorter.push(make_record(b"r2", b"T", b"!")).expect("push");
+    sorter
+        .push(make_record(b"r3", b"TAA", b"!!!"))
+        .expect("push");
+    sorter.push(make_record(b"r4", b"A", b"!")).expect("push");
+    sorter
+        .push(make_record(b"r5", b"AAAA", b"!!!!"))
+        .expect("push");
+
+    let results: Vec<SeqRecord> = sorter
+        .finish()
+        .expect("finish")
+        .map(|r| r.expect("decode"))
+        .collect();
+
+    assert_eq!(results.len(), 5);
+    // Lexicographic: A < AAAA < T < TA < TAA
+    assert_eq!(results[0].sequence(), b"A");
+    assert_eq!(results[1].sequence(), b"AAAA");
+    assert_eq!(results[2].sequence(), b"T");
+    assert_eq!(results[3].sequence(), b"TA");
+    assert_eq!(results[4].sequence(), b"TAA");
+}
+
 mod proptests {
     use proptest::prelude::*;
 
