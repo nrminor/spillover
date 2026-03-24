@@ -1,10 +1,11 @@
 [package]
 name = "spillover"
-description = "Generic, disk-spilling external sort with pluggable deduplication"
+description = "Generic, disk-spilling external sort pipelines with pluggable keys, codecs, and deduplication"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
+readme = "README.md"
 
 [features]
 rayon = ["dep:rayon"]

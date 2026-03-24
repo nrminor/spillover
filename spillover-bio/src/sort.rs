@@ -75,7 +75,7 @@ impl SortKey<SeqRecord> for LengthKey {
 mod sealed {
     pub trait Sealed {}
 
-    /// Resolves codec type-state to a concrete [`DryIceCodec`].
+    /// Resolves codec type-state to a concrete [`crate::codec::DryIceCodec`].
     /// `NeedsCodec` yields the raw (no-encoding) default;
     /// `HasCodec` passes through the user's choice.
     pub trait ResolveCodec {
@@ -86,7 +86,7 @@ mod sealed {
         fn resolve(self) -> crate::codec::DryIceCodec<Self::S, Self::Q, Self::N>;
     }
 
-    /// Resolves flush type-state to a concrete [`FlushConfig`].
+    /// Resolves flush type-state to a concrete [`super::FlushConfig`].
     /// `NeedsFlush` yields a 1 GiB measured budget;
     /// `HasFlush` passes through the user's choice.
     pub trait ResolveFlush {

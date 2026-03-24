@@ -1,10 +1,11 @@
 [package]
 name = "spillover-bio"
-description = "Genomics-opinionated disk-spilling sort for FASTQ/FASTA records"
+description = "Genomics-focused disk-spilling sort pipeline for FASTQ/FASTA sequence records"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
+readme = "README.md"
 
 [features]
 rayon = ["spillover/rayon"]
@@ -13,7 +14,7 @@ rayon = ["spillover/rayon"]
 bitnuc = "0.4.1"
 dryice-bio = "0.1.2"
 get-size2 = { version = "0.7.4", features = ["derive"] }
-spillover = { version = "0.1.0", path = "../spillover" }
+spillover = { version = "0.1.1", path = "../spillover" }
 
 [lints]
 workspace = true

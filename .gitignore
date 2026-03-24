@@ -19,6 +19,7 @@
 # === Allowed: spillover (core crate) ===
 !/spillover
 !/spillover/Cargo.toml
+!/spillover/README.md
 !/spillover/src
 !/spillover/src/lib.rs
 !/spillover/src/error.rs
@@ -41,6 +42,7 @@
 # === Allowed: spillover-bio ===
 !/spillover-bio
 !/spillover-bio/Cargo.toml
+!/spillover-bio/README.md
 !/spillover-bio/src
 !/spillover-bio/src/lib.rs
 !/spillover-bio/src/record.rs
