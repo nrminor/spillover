@@ -34,7 +34,7 @@ enum FlushStrategy<T> {
     /// The closure returns the memory footprint of each item.
     Bytes {
         budget: usize,
-        item_size: Box<dyn Fn(&T) -> usize>,
+        item_size: Box<dyn Fn(&T) -> usize + Send + Sync>,
     },
 
     /// Flush when the item count exceeds a limit.
@@ -211,7 +211,7 @@ impl<SK, Cod, Cmp, D, CS> Builder<SK, Cod, NeedsFlushStrategy, Cmp, D, CS> {
     pub fn memory_budget<T: 'static>(
         self,
         budget: usize,
-        item_size: impl Fn(&T) -> usize + 'static,
+        item_size: impl Fn(&T) -> usize + Send + Sync + 'static,
     ) -> Builder<SK, Cod, HasFlushStrategy<T>, Cmp, D, CS> {
         Builder {
             sort_key: self.sort_key,

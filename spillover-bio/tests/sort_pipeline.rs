@@ -701,6 +701,19 @@ fn unkeyed_sort_with_variable_length_sequences() {
     assert_eq!(results[4].sequence(), b"TAA");
 }
 
+#[test]
+fn sorter_is_send() {
+    fn assert_send<T: Send>(_: &T) {}
+
+    let sorter = Builder::new()
+        .sort_by_illumina()
+        .codec(DryIceCodec::new())
+        .max_buffer_items(100)
+        .build();
+
+    assert_send(&sorter);
+}
+
 mod proptests {
     use proptest::prelude::*;
 
