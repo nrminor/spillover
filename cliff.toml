@@ -1,0 +1,27 @@
+# git-cliff configuration
+# Generate changelog for tagged releases
+# Docs: https://git-cliff.org
+
+[changelog]
+header = """
+# Changelog\n
+"""
+body = """
+{% if version %}\
+    ## {{ version | trim_start_matches(pat="v") }}
+    _Released: {{ timestamp | date(format="%Y-%m-%d") }}_\n
+{% else %}\
+    ## Unreleased\n
+{% endif %}\
+{% for commit in commits %}
+    - {{ commit.message | split(pat="\n") | first | trim }}\
+{% endfor %}
+"""
+trim = true
+
+[git]
+conventional_commits = false
+filter_unconventional = false
+split_commits = false
+tag_pattern = "v[0-9].*"
+sort_commits = "newest"
