@@ -11,11 +11,13 @@
 //!
 //! The [`Builder`] is the main entry point for creating a sorter.
 
-use dryice::{NameCodec, QualityCodec, RecordKey, SequenceCodec};
+use dryice::{
+    NameCodec, QualityCodec, RawAsciiCodec, RawNameCodec, RawQualityCodec, RecordKey, SequenceCodec,
+};
 use spillover::{
     chunk::{ChunkSorter, Sequential},
     compare::{Compare, Natural},
-    dedup::{Dedup, Identity},
+    dedup::{AdjacentDedup, Dedup, Identity},
     key::SortKey,
     merge::MergeConfig,
 };
@@ -23,6 +25,7 @@ use spillover::{
 use crate::{
     codec::{DryIceCodec, KeyedDryIceCodec},
     key::PackedSequenceKey,
+    radix::RadixThenRefine,
     record::SeqRecord,
 };
 
@@ -71,6 +74,24 @@ impl SortKey<SeqRecord> for LengthKey {
 
 mod sealed {
     pub trait Sealed {}
+
+    /// Resolves codec type-state to a concrete [`DryIceCodec`].
+    /// `NeedsCodec` yields the raw (no-encoding) default;
+    /// `HasCodec` passes through the user's choice.
+    pub trait ResolveCodec {
+        type S: dryice::SequenceCodec + Copy + 'static;
+        type Q: dryice::QualityCodec + Copy + 'static;
+        type N: dryice::NameCodec + Copy + 'static;
+
+        fn resolve(self) -> crate::codec::DryIceCodec<Self::S, Self::Q, Self::N>;
+    }
+
+    /// Resolves flush type-state to a concrete [`FlushConfig`].
+    /// `NeedsFlush` yields a 1 GiB measured budget;
+    /// `HasFlush` passes through the user's choice.
+    pub trait ResolveFlush {
+        fn resolve(self) -> super::FlushConfig;
+    }
 }
 
 /// Defines a complete sort order: what to sort by, how to
@@ -376,6 +397,10 @@ pub const LENGTH_ORDER: LengthOrder = LengthOrder;
 
 // ── Builder ──────────────────────────────────────────────
 
+/// Dedup strategy that compares adjacent [`SeqRecord`]s by a
+/// function pointer. Used by the convenience dedup methods.
+type RecordDedup = AdjacentDedup<fn(&SeqRecord, &SeqRecord) -> bool>;
+
 /// Builder marker: no sort order chosen yet.
 pub struct NeedsOrder;
 /// Builder marker: keyed sort order has been chosen.
@@ -393,30 +418,82 @@ pub struct NeedsFlush;
 /// Builder marker: flush strategy has been chosen.
 pub struct HasFlush(FlushConfig);
 
-enum FlushConfig {
+// pub visibility required because `sealed::ResolveFlush`
+// returns it. The sealed module prevents external impls.
+#[doc(hidden)]
+pub enum FlushConfig {
     MeasuredBudget(usize),
     MaxItems(usize),
 }
 
+/// Default memory budget when `.measured_budget()` is not called:
+/// 1 GiB.
+const DEFAULT_BUDGET: usize = 1 << 30;
+
+// ── Sealed trait impls for default resolution ────────────
+
+impl sealed::ResolveCodec for NeedsCodec {
+    type S = RawAsciiCodec;
+    type Q = RawQualityCodec;
+    type N = RawNameCodec;
+
+    fn resolve(self) -> DryIceCodec {
+        DryIceCodec::new()
+    }
+}
+
+impl<S, Q, N> sealed::ResolveCodec for HasCodec<S, Q, N>
+where
+    S: SequenceCodec + Copy + 'static,
+    Q: QualityCodec + Copy + 'static,
+    N: NameCodec + Copy + 'static,
+{
+    type S = S;
+    type Q = Q;
+    type N = N;
+
+    fn resolve(self) -> DryIceCodec<S, Q, N> {
+        self.0
+    }
+}
+
+impl sealed::ResolveFlush for NeedsFlush {
+    fn resolve(self) -> FlushConfig {
+        FlushConfig::MeasuredBudget(DEFAULT_BUDGET)
+    }
+}
+
+impl sealed::ResolveFlush for HasFlush {
+    fn resolve(self) -> FlushConfig {
+        self.0
+    }
+}
+
 /// Builder for configuring a genomics-oriented external sorter.
 ///
-/// Pick a sort order, a codec, and a flush strategy, then call
-/// `.build()` to get a configured spillover `Sorter`.
+/// Only a sort order is required — everything else has sensible
+/// defaults:
 ///
 /// ```ignore
-/// use spillover_bio::sort::Builder;
-/// use spillover_bio::codec::DryIceCodec;
-///
 /// let mut sorter = Builder::new()
 ///     .sort_by_illumina()
-///     .codec(DryIceCodec::new().two_bit_exact())
-///     .measured_budget(1 << 30)
 ///     .build();
+/// ```
 ///
-/// for record in records {
-///     sorter.push(record)?;
-/// }
-/// let sorted = sorter.finish()?;
+/// Defaults: raw (uncompressed) dryice codec, 1 GiB memory budget,
+/// radix sort for sequence orders, sequential comparison sort for
+/// name/length orders.
+///
+/// Override any default with the corresponding builder method:
+///
+/// ```ignore
+/// let mut sorter = Builder::new()
+///     .sort_by_paired_end()
+///     .codec(DryIceCodec::new().two_bit_exact().binned_quality())
+///     .measured_budget(4 * 1024 * 1024 * 1024)
+///     .sort_with_sequential()
+///     .dedup_by_sequence()
+///     .build();
 /// ```
 ///
 /// For high-duplicate datasets, consider a bloom filter to skip
@@ -497,21 +574,33 @@ impl<C, F, D, CS> Builder<NeedsOrder, C, F, D, CS> {
     }
 
     /// Sort by sequence (Illumina 150bp, 38-byte packed key).
+    /// Defaults to radix sort for the chunk sorting engine.
     #[must_use]
-    pub fn sort_by_illumina(self) -> Builder<HasKeyedOrder<SequenceOrder<38>>, C, F, D, CS> {
+    pub fn sort_by_illumina(
+        self,
+    ) -> Builder<HasKeyedOrder<SequenceOrder<38>>, C, F, D, RadixThenRefine<38>> {
         self.sort_by(ILLUMINA_ORDER)
+            .chunk_sort(RadixThenRefine::<38>)
     }
 
     /// Sort by sequence (250bp paired-end, 64-byte packed key).
+    /// Defaults to radix sort for the chunk sorting engine.
     #[must_use]
-    pub fn sort_by_paired_end(self) -> Builder<HasKeyedOrder<SequenceOrder<64>>, C, F, D, CS> {
+    pub fn sort_by_paired_end(
+        self,
+    ) -> Builder<HasKeyedOrder<SequenceOrder<64>>, C, F, D, RadixThenRefine<64>> {
         self.sort_by(PAIRED_END_ORDER)
+            .chunk_sort(RadixThenRefine::<64>)
     }
 
     /// Sort by sequence (long reads, 128-byte prefix key).
+    /// Defaults to radix sort for the chunk sorting engine.
     #[must_use]
-    pub fn sort_by_long_read(self) -> Builder<HasKeyedOrder<SequenceOrder<128>>, C, F, D, CS> {
+    pub fn sort_by_long_read(
+        self,
+    ) -> Builder<HasKeyedOrder<SequenceOrder<128>>, C, F, D, RadixThenRefine<128>> {
         self.sort_by(LONG_READ_ORDER)
+            .chunk_sort(RadixThenRefine::<128>)
     }
 
     /// Sort by record name.
@@ -615,26 +704,88 @@ impl<O, C, F, D, CS> Builder<O, C, F, D, CS> {
         self.merge_config = config;
         self
     }
+
+    /// Deduplicate adjacent records with identical names.
+    #[must_use]
+    pub fn dedup_by_name(self) -> Builder<O, C, F, RecordDedup, CS> {
+        self.dedup(AdjacentDedup::new(
+            (|a: &SeqRecord, b: &SeqRecord| a.name() == b.name())
+                as fn(&SeqRecord, &SeqRecord) -> bool,
+        ))
+    }
+
+    /// Deduplicate adjacent records with identical sequences.
+    #[must_use]
+    pub fn dedup_by_sequence(self) -> Builder<O, C, F, RecordDedup, CS> {
+        self.dedup(AdjacentDedup::new(
+            (|a: &SeqRecord, b: &SeqRecord| a.sequence() == b.sequence())
+                as fn(&SeqRecord, &SeqRecord) -> bool,
+        ))
+    }
+
+    /// Deduplicate adjacent records with identical quality scores.
+    #[must_use]
+    pub fn dedup_by_quality(self) -> Builder<O, C, F, RecordDedup, CS> {
+        self.dedup(AdjacentDedup::new(
+            (|a: &SeqRecord, b: &SeqRecord| a.quality() == b.quality())
+                as fn(&SeqRecord, &SeqRecord) -> bool,
+        ))
+    }
+
+    /// Deduplicate adjacent records with identical sequence and
+    /// quality.
+    #[must_use]
+    pub fn dedup_by_sequence_and_quality(self) -> Builder<O, C, F, RecordDedup, CS> {
+        self.dedup(AdjacentDedup::new(
+            (|a: &SeqRecord, b: &SeqRecord| {
+                a.sequence() == b.sequence() && a.quality() == b.quality()
+            }) as fn(&SeqRecord, &SeqRecord) -> bool,
+        ))
+    }
+
+    /// Use single-threaded comparison sort for in-memory chunks.
+    ///
+    /// This overrides the default sort engine (which is radix sort
+    /// for sequence orders, and sequential for everything else).
+    #[must_use]
+    pub fn sort_with_sequential(self) -> Builder<O, C, F, D, Sequential> {
+        self.chunk_sort(Sequential)
+    }
+
+    /// Use rayon parallel sort for in-memory chunks.
+    ///
+    /// This overrides the default sort engine. Requires the `rayon`
+    /// feature to be enabled on spillover.
+    #[cfg(feature = "rayon")]
+    #[must_use]
+    pub fn sort_with_parallel(self) -> Builder<O, C, F, D, spillover::chunk::Parallel> {
+        self.chunk_sort(spillover::chunk::Parallel)
+    }
 }
 
 // build() for keyed sort orders.
+//
+// The `ResolveCodec` and `ResolveFlush` traits handle defaults:
+// `NeedsCodec` → raw DryIceCodec, `NeedsFlush` → 1 GiB budget.
+// This single impl covers all four combinations of has/needs.
 
-impl<O, S, Q, N, D, CS> Builder<HasKeyedOrder<O>, HasCodec<S, Q, N>, HasFlush, D, CS>
+impl<O, C, F, D, CS> Builder<HasKeyedOrder<O>, C, F, D, CS>
 where
     O: KeyedSortOrder,
     O::SortKey: Send + Sync + 'static,
     O::Compare:
         for<'a> Compare<<O::SortKey as SortKey<SeqRecord>>::Key<'a>> + Send + Sync + 'static,
     O::RecordKey: RecordKey + Clone + 'static,
-    S: SequenceCodec + Copy + 'static,
-    Q: QualityCodec + Copy + 'static,
-    N: NameCodec + Copy + 'static,
+    C: sealed::ResolveCodec,
+    F: sealed::ResolveFlush,
     D: Dedup<SeqRecord, spillover::merge::MergeError<dryice::DryIceError>>,
     CS: ChunkSorter<SeqRecord>,
 {
     /// Build the sorter (keyed merge path).
-    // Allow: the return type is complex because it carries
-    // all the generic parameters from the sort order and codec.
+    ///
+    /// If `.codec()` was not called, defaults to raw (uncompressed)
+    /// dryice encoding. If `.measured_budget()` / `.max_buffer_items()`
+    /// was not called, defaults to a 1 GiB measured memory budget.
     #[allow(clippy::type_complexity)]
     #[must_use]
     pub fn build(
@@ -642,14 +793,16 @@ where
     ) -> spillover::sorter::Sorter<
         SeqRecord,
         O::SortKey,
-        KeyedDryIceCodec<S, Q, N, O::RecordKey>,
+        KeyedDryIceCodec<C::S, C::Q, C::N, O::RecordKey>,
         O::Compare,
         D,
         CS,
         spillover::sorter::Keyed,
     > {
         let order = self.order.0;
-        let keyed_codec = self.codec.0.with_record_key(order.record_key_fn());
+        let codec = self.codec.resolve();
+        let keyed_codec = codec.with_record_key(order.record_key_fn());
+        let flush = self.flush.resolve();
 
         let builder = spillover::sorter::Builder::new()
             .key(order.sort_key())
@@ -659,7 +812,7 @@ where
             .chunk_sort(self.chunk_sort)
             .merge_config(self.merge_config);
 
-        match self.flush.0 {
+        match flush {
             FlushConfig::MeasuredBudget(budget) => {
                 builder.measured_budget::<SeqRecord>(budget).build()
             }
@@ -672,21 +825,22 @@ where
 
 // build() for unkeyed sort orders.
 
-impl<O, S, Q, N, D, CS> Builder<HasUnkeyedOrder<O>, HasCodec<S, Q, N>, HasFlush, D, CS>
+impl<O, C, F, D, CS> Builder<HasUnkeyedOrder<O>, C, F, D, CS>
 where
     O: SortOrder<Strategy = Basic>,
     O::SortKey: Send + Sync + 'static,
     O::Compare:
         for<'a> Compare<<O::SortKey as SortKey<SeqRecord>>::Key<'a>> + Send + Sync + 'static,
-    S: SequenceCodec + Copy + 'static,
-    Q: QualityCodec + Copy + 'static,
-    N: NameCodec + Copy + 'static,
+    C: sealed::ResolveCodec,
+    F: sealed::ResolveFlush,
     D: Dedup<SeqRecord, spillover::merge::MergeError<dryice::DryIceError>>,
     CS: ChunkSorter<SeqRecord>,
 {
     /// Build the sorter (basic merge path, no record keys).
-    // Allow: the return type is complex because it carries
-    // all the generic parameters from the sort order and codec.
+    ///
+    /// If `.codec()` was not called, defaults to raw (uncompressed)
+    /// dryice encoding. If `.measured_budget()` / `.max_buffer_items()`
+    /// was not called, defaults to a 1 GiB measured memory budget.
     #[allow(clippy::type_complexity)]
     #[must_use]
     pub fn build(
@@ -694,14 +848,15 @@ where
     ) -> spillover::sorter::Sorter<
         SeqRecord,
         O::SortKey,
-        DryIceCodec<S, Q, N>,
+        DryIceCodec<C::S, C::Q, C::N>,
         O::Compare,
         D,
         CS,
         spillover::sorter::Basic,
     > {
         let order = self.order.0;
-        let codec = self.codec.0;
+        let codec = self.codec.resolve();
+        let flush = self.flush.resolve();
 
         let builder = spillover::sorter::Builder::new()
             .key(order.sort_key())
@@ -711,7 +866,7 @@ where
             .chunk_sort(self.chunk_sort)
             .merge_config(self.merge_config);
 
-        match self.flush.0 {
+        match flush {
             FlushConfig::MeasuredBudget(budget) => {
                 builder.measured_budget::<SeqRecord>(budget).build()
             }

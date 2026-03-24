@@ -856,3 +856,109 @@ mod proptests {
         }
     }
 }
+
+// ── Minimal builder (defaults) ──────────────────────────────
+
+#[test]
+fn minimal_builder_sorts_with_all_defaults() {
+    let mut sorter = Builder::new().sort_by_illumina().build();
+
+    let records = vec![
+        make_record(b"r3", b"TTTTTTTT", b"!!!!!!!!"),
+        make_record(b"r1", b"AAAAAAAA", b"!!!!!!!!"),
+        make_record(b"r2", b"CCCCCCCC", b"!!!!!!!!"),
+    ];
+
+    for rec in records {
+        sorter.push(rec).expect("push should succeed");
+    }
+
+    let results: Vec<SeqRecord> = sorter
+        .finish()
+        .expect("finish should succeed")
+        .map(|r| r.expect("each record should decode"))
+        .collect();
+
+    assert_eq!(results.len(), 3);
+    assert_eq!(results[0].sequence(), b"AAAAAAAA");
+    assert_eq!(results[1].sequence(), b"CCCCCCCC");
+    assert_eq!(results[2].sequence(), b"TTTTTTTT");
+}
+
+#[test]
+fn minimal_builder_with_explicit_codec_and_default_budget() {
+    let mut sorter = Builder::new()
+        .sort_by_illumina()
+        .codec(DryIceCodec::new().two_bit_exact())
+        .build();
+
+    sorter
+        .push(make_record(b"r1", b"CCCCCCCC", b"!!!!!!!!"))
+        .expect("push");
+    sorter
+        .push(make_record(b"r2", b"AAAAAAAA", b"!!!!!!!!"))
+        .expect("push");
+
+    let results: Vec<SeqRecord> = sorter
+        .finish()
+        .expect("finish")
+        .map(|r| r.expect("decode"))
+        .collect();
+
+    assert_eq!(results[0].sequence(), b"AAAAAAAA");
+    assert_eq!(results[1].sequence(), b"CCCCCCCC");
+}
+
+#[test]
+fn minimal_builder_with_dedup_convenience() {
+    let mut sorter = Builder::new()
+        .sort_by_illumina()
+        .dedup_by_sequence()
+        .max_buffer_items(100)
+        .build();
+
+    sorter
+        .push(make_record(b"r1", b"AAAAAAAA", b"IIIIIIII"))
+        .expect("push");
+    sorter
+        .push(make_record(b"r2", b"AAAAAAAA", b"!!!!!!!!"))
+        .expect("push");
+    sorter
+        .push(make_record(b"r3", b"CCCCCCCC", b"!!!!!!!!"))
+        .expect("push");
+
+    let results: Vec<SeqRecord> = sorter
+        .finish()
+        .expect("finish")
+        .map(|r| r.expect("decode"))
+        .collect();
+
+    assert_eq!(results.len(), 2, "duplicate sequence should be removed");
+    assert_eq!(results[0].sequence(), b"AAAAAAAA");
+    assert_eq!(results[1].sequence(), b"CCCCCCCC");
+}
+
+#[test]
+fn sort_with_sequential_override() {
+    let mut sorter = Builder::new()
+        .sort_by_illumina()
+        .sort_with_sequential()
+        .max_buffer_items(100)
+        .build();
+
+    sorter
+        .push(make_record(b"r1", b"TTTTTTTT", b"!!!!!!!!"))
+        .expect("push");
+    sorter
+        .push(make_record(b"r2", b"AAAAAAAA", b"!!!!!!!!"))
+        .expect("push");
+
+    let results: Vec<SeqRecord> = sorter
+        .finish()
+        .expect("finish")
+        .map(|r| r.expect("decode"))
+        .collect();
+
+    assert_eq!(results[0].sequence(), b"AAAAAAAA");
+    assert_eq!(results[1].sequence(), b"TTTTTTTT");
+}
