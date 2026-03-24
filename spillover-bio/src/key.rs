@@ -42,8 +42,13 @@ const fn make_tag(n: usize) -> [u8; 16] {
 /// (A=00 < C=01 < G=10 < T=11).
 ///
 /// For reads shorter than `N * 4` bases, the remaining bytes
-/// are zero-padded, which sorts short reads before longer ones
-/// that share the same prefix.
+/// are zero-padded. Because A encodes as `0b00` (the same as
+/// padding), sequences that differ only by trailing A's versus
+/// truncation will receive identical packed keys. This means
+/// packed key ordering is exact when all sequences are at least
+/// `N * 4` bases long. For mixed-length inputs where some
+/// sequences are shorter than the key capacity, use the unkeyed
+/// sort path (`SequenceOrder.unkeyed()`) for exact ordering.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct PackedSequenceKey<const N: usize>(pub [u8; N]);
 

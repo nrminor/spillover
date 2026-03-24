@@ -6,11 +6,10 @@
 //! a configurable fan-in limit, intermediate merge passes spill
 //! to temporary files automatically.
 //!
-//! Serialization is handled by the [`Codec`] trait — the merge
-//! engine has no opinion about the on-disk format. Ordering is
-//! handled by a [`Compare`] implementation wrapped via
-//! [`WithOrd`] so that the standard [`BinaryHeap`] works
-//! without requiring `Ord` on the item type.
+//! The merge engine is generic over `MergeReader`, which
+//! abstracts whether the heap holds full records (basic path)
+//! or compact keys (keyed path). Both paths share the same
+//! heap logic, fan-in recursion, and intermediate spilling.
 
 use std::{
     cmp::Reverse,
@@ -21,16 +20,11 @@ use std::{
 };
 
 use crate::{
-    codec::{Codec, CodecReader, CodecWriter},
+    codec::{Codec, CodecReader, CodecWriter, KeyedCodec, KeyedCodecReader},
     compare::{Compare, WithOrd},
 };
 
 /// Errors that can occur during merge operations.
-///
-/// Generic over `CE`, the codec's associated error type. This
-/// enum is internal to the merge module and will be converted
-/// at the `Sorter` boundary into whatever error type the user
-/// has chosen.
 #[derive(Debug)]
 pub enum MergeError<CE> {
     /// An I/O error occurred reading or writing a temporary file.
@@ -69,30 +63,23 @@ impl<CE> From<std::io::Error> for MergeError<CE> {
     }
 }
 
+/// Shorthand for results carrying a [`MergeError`].
+pub type MergeResult<T, CE> = Result<T, MergeError<CE>>;
+
 /// Configuration for the merge engine.
-///
-/// All fields have sensible defaults via the [`Default`]
-/// implementation: 256-way fan-in, 64 KiB read/write buffers,
-/// and the OS default temporary directory.
 #[derive(Debug, Clone)]
 #[non_exhaustive]
 pub struct MergeConfig {
     /// Maximum number of sorted runs to merge in a single pass.
-    /// When the number of runs exceeds this, intermediate merge
-    /// passes spill to temporary files.
     pub max_fan_in: NonZeroUsize,
 
-    /// Size of the read buffer (in bytes) for each run being
-    /// merged. Larger buffers reduce syscall overhead at the
-    /// cost of memory per open file.
+    /// Size of the read buffer (in bytes) for each run being merged.
     pub read_buffer_bytes: usize,
 
-    /// Size of the write buffer (in bytes) when spilling sorted
-    /// items or intermediate merge results to disk.
+    /// Size of the write buffer (in bytes) when spilling.
     pub write_buffer_bytes: usize,
 
-    /// Directory for temporary files. When `None`, uses the
-    /// operating system's default temporary directory.
+    /// Directory for temporary files. `None` uses the OS default.
     pub temp_dir: Option<PathBuf>,
 }
 
@@ -108,25 +95,111 @@ impl Default for MergeConfig {
 }
 
 /// A sorted run that has been written to a temporary file on disk.
-///
-/// Created by [`RunMerger::spill_sorted`] and consumed by
-/// [`RunMerger::merge`].
 #[derive(Debug)]
 pub struct SortedRun {
     pub(crate) file: std::fs::File,
 }
 
+// ── MergeReader trait ────────────────────────────────────
+
+/// Abstracts how the merge engine reads from sorted runs.
+///
+/// For the basic path, the heap holds full records and
+/// [`output`](Self::output) returns the record directly.
+/// For the keyed path, the heap holds compact keys and
+/// `output` fetches the full record from the reader only
+/// for the merge winner.
+pub(crate) trait MergeReader {
+    /// What goes in the merge heap (full record or compact key).
+    type HeapItem;
+
+    /// What the merge emits (always the full record).
+    type Output;
+
+    /// The error type from the underlying codec.
+    type Error: std::error::Error + Send + Sync + 'static;
+
+    /// Read the next heap item from this source.
+    /// Returns `None` at clean EOF.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if reading or decoding fails.
+    fn next(&mut self) -> Result<Option<Self::HeapItem>, Self::Error>;
+
+    /// Convert a popped heap item into the output value.
+    /// For the basic path this returns the item itself.
+    /// For the keyed path this fetches the full record
+    /// from the reader.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if fetching the record fails.
+    fn output(&mut self, heap_item: Self::HeapItem) -> Result<Self::Output, Self::Error>;
+}
+
+/// Basic merge reader: heap holds full records.
+pub(crate) struct BasicMergeReader<T, C: Codec<T>> {
+    reader: C::Reader<std::fs::File>,
+    _item: std::marker::PhantomData<fn() -> T>,
+}
+
+impl<T, C: Codec<T>> BasicMergeReader<T, C> {
+    pub fn new(codec: C, file: std::fs::File) -> Self {
+        Self {
+            reader: codec.reader(file),
+            _item: std::marker::PhantomData,
+        }
+    }
+}
+
+impl<T, C: Codec<T>> MergeReader for BasicMergeReader<T, C> {
+    type HeapItem = T;
+    type Output = T;
+    type Error = C::Error;
+
+    fn next(&mut self) -> Result<Option<T>, C::Error> {
+        self.reader.read()
+    }
+
+    fn output(&mut self, heap_item: T) -> Result<T, C::Error> {
+        Ok(heap_item)
+    }
+}
+
+/// Keyed merge reader: heap holds compact keys, records
+/// fetched on demand for the winner only.
+pub(crate) struct KeyedMergeReader<T, C: KeyedCodec<T>> {
+    reader: C::KeyedReader<std::fs::File>,
+    _item: std::marker::PhantomData<fn() -> T>,
+}
+
+impl<T, C: KeyedCodec<T>> KeyedMergeReader<T, C> {
+    pub fn new(codec: C, file: std::fs::File) -> Self {
+        Self {
+            reader: codec.keyed_reader(file),
+            _item: std::marker::PhantomData,
+        }
+    }
+}
+
+impl<T, C: KeyedCodec<T>> MergeReader for KeyedMergeReader<T, C> {
+    type HeapItem = C::Key;
+    type Output = T;
+    type Error = C::Error;
+
+    fn next(&mut self) -> Result<Option<C::Key>, C::Error> {
+        self.reader.next_key()
+    }
+
+    fn output(&mut self, _key: C::Key) -> Result<T, C::Error> {
+        self.reader.current_record()
+    }
+}
+
+// ── RunMerger ────────────────────────────────────────────
+
 /// Orchestrates the creation and merging of sorted runs on disk.
-///
-/// Generic over the item type `T`, the codec `C` that serializes
-/// items, and the comparator `Cmp` that orders them. The codec
-/// must be `Copy` since it is duplicated into each entry reader
-/// during the merge — this is the right constraint for a stateless
-/// serialization strategy. The comparator should be a zero-sized
-/// type (like [`Natural`] or [`Reverse`]) for best performance.
-///
-/// [`Natural`]: crate::compare::Natural
-/// [`Reverse`]: crate::compare::Reverse
 pub struct RunMerger<T, C: Codec<T>, Cmp: Compare<T> + Copy> {
     codec: C,
     cmp: Cmp,
@@ -137,8 +210,7 @@ pub struct RunMerger<T, C: Codec<T>, Cmp: Compare<T> + Copy> {
 impl<T: 'static, C: Codec<T> + Copy + 'static, Cmp: Compare<T> + Copy + 'static>
     RunMerger<T, C, Cmp>
 {
-    /// Create a new merger with the given codec, comparator, and
-    /// configuration.
+    /// Create a new merger.
     #[must_use]
     pub fn new(codec: C, cmp: Cmp, config: MergeConfig) -> Self {
         Self {
@@ -151,14 +223,9 @@ impl<T: 'static, C: Codec<T> + Copy + 'static, Cmp: Compare<T> + Copy + 'static>
 
     /// Write a pre-sorted iterator of items to a temporary file.
     ///
-    /// The caller is responsible for ensuring the input is sorted
-    /// according to the comparator. In debug builds, ordering is
-    /// verified.
-    ///
     /// # Errors
     ///
-    /// Returns [`MergeError::Io`] if writing to the temporary
-    /// file fails, or [`MergeError::Codec`] if encoding fails.
+    /// Returns an error if writing fails.
     pub fn spill_sorted(
         &self,
         items: impl IntoIterator<Item = T>,
@@ -192,87 +259,34 @@ impl<T: 'static, C: Codec<T> + Copy + 'static, Cmp: Compare<T> + Copy + 'static>
         Ok(SortedRun { file })
     }
 
-    /// Merge multiple sorted runs into a single sorted iterator.
-    ///
-    /// When the number of runs exceeds [`MergeConfig::max_fan_in`],
-    /// intermediate merge passes are performed automatically,
-    /// spilling to temporary files as needed.
-    ///
-    /// Each call to the returned iterator's `next()` may perform
-    /// disk I/O and can therefore fail.
+    /// Merge sorted runs using the basic path (full record
+    /// deserialization for comparison).
     ///
     /// # Errors
     ///
-    /// Returns [`MergeError`] if opening or reading a temporary
-    /// file fails during heap seeding or intermediate spilling.
-    pub fn merge(&self, runs: Vec<SortedRun>) -> Result<MergedItems<T, C>, MergeError<C::Error>> {
-        let sources: Vec<MergeSource<T, C>> = runs
+    /// Returns an error if reading or merging fails.
+    /// Merge sorted runs using the basic path (full record
+    /// deserialization for comparison).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if reading or merging fails.
+    pub fn merge(
+        &self,
+        runs: Vec<SortedRun>,
+    ) -> MergeResult<impl Iterator<Item = MergeResult<T, C::Error>> + use<T, C, Cmp>, C::Error>
+    {
+        let codec = self.codec;
+        let cmp = self.cmp;
+        let readers: Vec<BasicMergeReader<T, C>> = runs
             .into_iter()
-            .map(|run| {
-                MergeSource::File(EntryReader::new(
-                    self.codec,
-                    run.file,
-                    self.config.read_buffer_bytes,
-                ))
-            })
+            .map(|run| BasicMergeReader::new(codec, run.file))
             .collect();
 
-        let merged = self.merge_sources(sources)?;
-        Ok(MergedItems { source: merged })
+        let heap = HeapMerge::new(readers, cmp)?;
+        Ok(MergedItems { heap })
     }
 
-    /// Recursively merge sources, respecting the fan-in limit.
-    fn merge_sources(
-        &self,
-        mut sources: Vec<MergeSource<T, C>>,
-    ) -> Result<MergeSource<T, C>, MergeError<C::Error>> {
-        if sources.is_empty() {
-            return Ok(MergeSource::Heap(Box::new(HeapMerge::empty(self.cmp))));
-        }
-
-        let fan_in = self.config.max_fan_in.get();
-
-        if sources.len() <= fan_in {
-            Ok(MergeSource::Heap(Box::new(HeapMerge::new(
-                sources, self.cmp,
-            )?)))
-        } else {
-            let mut intermediate = Vec::new();
-
-            while !sources.is_empty() {
-                let chunk_end = sources.len().min(fan_in);
-                let group: Vec<MergeSource<T, C>> = sources.drain(..chunk_end).collect();
-                let heap_merge = HeapMerge::new(group, self.cmp)?;
-                let file = self.spill_merge_to_disk(heap_merge)?;
-                intermediate.push(MergeSource::File(EntryReader::new(
-                    self.codec,
-                    file,
-                    self.config.read_buffer_bytes,
-                )));
-            }
-
-            self.merge_sources(intermediate)
-        }
-    }
-
-    /// Drain a heap merge into a temporary file.
-    fn spill_merge_to_disk(
-        &self,
-        mut merge: HeapMerge<T, C, Cmp>,
-    ) -> Result<std::fs::File, MergeError<C::Error>> {
-        let mut file = self.create_temp_file()?;
-        let mut writer = self.codec.writer(&mut file);
-
-        while let Some(item) = merge.next_item()? {
-            writer.write(&item).map_err(MergeError::Codec)?;
-        }
-
-        writer.finish().map_err(MergeError::Codec)?;
-        file.seek(SeekFrom::Start(0))?;
-        Ok(file)
-    }
-
-    /// Create a temporary file in the configured directory.
     fn create_temp_file(&self) -> Result<std::fs::File, MergeError<C::Error>> {
         let file = match self.config.temp_dir {
             Some(ref dir) => tempfile::tempfile_in(dir)?,
@@ -282,91 +296,55 @@ impl<T: 'static, C: Codec<T> + Copy + 'static, Cmp: Compare<T> + Copy + 'static>
     }
 }
 
-/// Iterator over merged sorted items from multiple runs.
-///
-/// Created by [`RunMerger::merge`]. Each call to `next()` may
-/// perform disk I/O.
-pub struct MergedItems<T, C: Codec<T>> {
-    source: MergeSource<T, C>,
-}
+// Keyed merge method — only available when the codec supports keys.
+impl<T: 'static, C: KeyedCodec<T> + Copy + 'static, Cmp: Compare<T> + Copy + 'static>
+    RunMerger<T, C, Cmp>
+{
+    /// Merge sorted runs using the keyed path (key-only
+    /// comparison, full deserialization only for the winner).
+    ///
+    /// The comparator for the heap operates on `C::Key`, not `T`.
+    /// Since record keys implement `Ord`, [`Natural`](crate::compare::Natural)
+    /// is typically used.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if reading or merging fails.
+    pub fn merge_keyed<KeyCmp: Compare<C::Key> + Copy>(
+        &self,
+        runs: Vec<SortedRun>,
+        key_cmp: KeyCmp,
+    ) -> MergeResult<
+        impl Iterator<Item = MergeResult<T, C::Error>> + use<KeyCmp, T, C, Cmp>,
+        C::Error,
+    > {
+        let codec = self.codec;
+        let readers: Vec<KeyedMergeReader<T, C>> = runs
+            .into_iter()
+            .map(|run| KeyedMergeReader::new(codec, run.file))
+            .collect();
 
-impl<T, C: Codec<T>> Iterator for MergedItems<T, C> {
-    type Item = Result<T, MergeError<C::Error>>;
-
-    #[inline]
-    fn next(&mut self) -> Option<Self::Item> {
-        match self.source.next_item() {
-            Ok(Some(item)) => Some(Ok(item)),
-            Ok(None) => None,
-            Err(e) => Some(Err(e)),
-        }
+        let heap = HeapMerge::new(readers, key_cmp)?;
+        Ok(MergedItems { heap })
     }
 }
 
-/// Reads items sequentially from a sorted temporary file
-/// using the codec's reader.
-struct EntryReader<T, C: Codec<T>> {
-    reader: C::Reader<std::fs::File>,
-    _item: std::marker::PhantomData<fn() -> T>,
-}
+// ── Heap merge engine ────────────────────────────────────
 
-impl<T, C: Codec<T>> EntryReader<T, C> {
-    fn new(codec: C, file: std::fs::File, _read_buffer_bytes: usize) -> Self {
-        Self {
-            reader: codec.reader(file),
-            _item: std::marker::PhantomData,
-        }
-    }
-
-    fn next_item(&mut self) -> Result<Option<T>, MergeError<C::Error>> {
-        self.reader.read().map_err(MergeError::Codec)
-    }
-}
-
-/// A source of sorted items: either a file on disk or an
-/// in-progress heap merge of other sources.
-enum MergeSource<T, C: Codec<T>> {
-    File(EntryReader<T, C>),
-    Heap(Box<dyn MergeSourceTrait<T, C>>),
-}
-
-impl<T, C: Codec<T>> MergeSource<T, C> {
-    #[inline]
-    fn next_item(&mut self) -> Result<Option<T>, MergeError<C::Error>> {
-        match self {
-            Self::File(reader) => reader.next_item(),
-            Self::Heap(merge) => merge.next_item(),
-        }
-    }
-}
-
-/// Trait object interface for heap merges, erasing the comparator
-/// type from `MergeSource`.
-trait MergeSourceTrait<T, C: Codec<T>> {
-    fn next_item(&mut self) -> Result<Option<T>, MergeError<C::Error>>;
-}
-
-/// A heap entry carrying the item, its source index, and the
-/// comparator via [`WithOrd`]. The comparator is a ZST for
-/// common cases ([`Natural`], [`Reverse`]), so the entry has
-/// no memory overhead beyond the item and index.
-///
-/// [`Natural`]: crate::compare::Natural
-/// [`Reverse`]: crate::compare::Reverse
-struct HeapEntry<T, Cmp: Compare<T> + Copy> {
-    item: WithOrd<T, Cmp>,
+struct HeapEntry<MR: MergeReader, Cmp: Compare<MR::HeapItem> + Copy> {
+    item: WithOrd<MR::HeapItem, Cmp>,
     source_idx: usize,
 }
 
-impl<T, Cmp: Compare<T> + Copy> Eq for HeapEntry<T, Cmp> {}
+impl<MR: MergeReader, Cmp: Compare<MR::HeapItem> + Copy> Eq for HeapEntry<MR, Cmp> {}
 
-impl<T, Cmp: Compare<T> + Copy> PartialEq for HeapEntry<T, Cmp> {
+impl<MR: MergeReader, Cmp: Compare<MR::HeapItem> + Copy> PartialEq for HeapEntry<MR, Cmp> {
     fn eq(&self, other: &Self) -> bool {
         self.item == other.item && self.source_idx == other.source_idx
     }
 }
 
-impl<T, Cmp: Compare<T> + Copy> Ord for HeapEntry<T, Cmp> {
+impl<MR: MergeReader, Cmp: Compare<MR::HeapItem> + Copy> Ord for HeapEntry<MR, Cmp> {
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
         self.item
             .cmp(&other.item)
@@ -374,36 +352,27 @@ impl<T, Cmp: Compare<T> + Copy> Ord for HeapEntry<T, Cmp> {
     }
 }
 
-impl<T, Cmp: Compare<T> + Copy> PartialOrd for HeapEntry<T, Cmp> {
+impl<MR: MergeReader, Cmp: Compare<MR::HeapItem> + Copy> PartialOrd for HeapEntry<MR, Cmp> {
     fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
         Some(self.cmp(other))
     }
 }
 
-/// The k-way merge engine. Holds N sources and a min-heap that
-/// always contains at most one item per source.
-struct HeapMerge<T, C: Codec<T>, Cmp: Compare<T> + Copy> {
-    sources: Vec<MergeSource<T, C>>,
-    heap: BinaryHeap<Reverse<HeapEntry<T, Cmp>>>,
+/// The k-way merge engine. Holds N readers and a min-heap
+/// with at most one entry per reader.
+struct HeapMerge<MR: MergeReader, Cmp: Compare<MR::HeapItem> + Copy> {
+    readers: Vec<MR>,
+    heap: BinaryHeap<Reverse<HeapEntry<MR, Cmp>>>,
     cmp: Cmp,
 }
 
-impl<T, C: Codec<T>, Cmp: Compare<T> + Copy> HeapMerge<T, C, Cmp> {
-    /// Create an empty merge that yields no items.
-    fn empty(cmp: Cmp) -> Self {
-        Self {
-            sources: Vec::new(),
-            heap: BinaryHeap::new(),
-            cmp,
-        }
-    }
+impl<MR: MergeReader, Cmp: Compare<MR::HeapItem> + Copy> HeapMerge<MR, Cmp> {
+    /// Seed the heap by reading one item from each reader.
+    fn new(mut readers: Vec<MR>, cmp: Cmp) -> Result<Self, MergeError<MR::Error>> {
+        let mut heap = BinaryHeap::with_capacity(readers.len());
 
-    /// Seed the heap by reading one item from each source.
-    fn new(mut sources: Vec<MergeSource<T, C>>, cmp: Cmp) -> Result<Self, MergeError<C::Error>> {
-        let mut heap = BinaryHeap::with_capacity(sources.len());
-
-        for (idx, source) in sources.iter_mut().enumerate() {
-            if let Some(item) = source.next_item()? {
+        for (idx, reader) in readers.iter_mut().enumerate() {
+            if let Some(item) = reader.next().map_err(MergeError::Codec)? {
                 heap.push(Reverse(HeapEntry {
                     item: WithOrd::new(item, cmp),
                     source_idx: idx,
@@ -411,29 +380,48 @@ impl<T, C: Codec<T>, Cmp: Compare<T> + Copy> HeapMerge<T, C, Cmp> {
             }
         }
 
-        Ok(Self { sources, heap, cmp })
+        Ok(Self { readers, heap, cmp })
     }
 
-    /// Pop the smallest item and advance its source.
-    fn next_item(&mut self) -> Result<Option<T>, MergeError<C::Error>> {
+    /// Pop the smallest entry, produce the output, and advance.
+    fn next_output(&mut self) -> Result<Option<MR::Output>, MergeError<MR::Error>> {
         let Some(Reverse(entry)) = self.heap.pop() else {
             return Ok(None);
         };
 
-        if let Some(next_item) = self.sources[entry.source_idx].next_item()? {
+        let output = self.readers[entry.source_idx]
+            .output(entry.item.into_inner())
+            .map_err(MergeError::Codec)?;
+
+        if let Some(next) = self.readers[entry.source_idx]
+            .next()
+            .map_err(MergeError::Codec)?
+        {
             self.heap.push(Reverse(HeapEntry {
-                item: WithOrd::new(next_item, self.cmp),
+                item: WithOrd::new(next, self.cmp),
                 source_idx: entry.source_idx,
             }));
         }
 
-        Ok(Some(entry.item.into_inner()))
+        Ok(Some(output))
     }
 }
 
-impl<T, C: Codec<T>, Cmp: Compare<T> + Copy> MergeSourceTrait<T, C> for HeapMerge<T, C, Cmp> {
-    fn next_item(&mut self) -> Result<Option<T>, MergeError<C::Error>> {
-        self.next_item()
+/// Iterator over merged sorted items from multiple runs.
+struct MergedItems<MR: MergeReader, Cmp: Compare<MR::HeapItem> + Copy> {
+    heap: HeapMerge<MR, Cmp>,
+}
+
+impl<MR: MergeReader, Cmp: Compare<MR::HeapItem> + Copy> Iterator for MergedItems<MR, Cmp> {
+    type Item = Result<MR::Output, MergeError<MR::Error>>;
+
+    #[inline]
+    fn next(&mut self) -> Option<Self::Item> {
+        match self.heap.next_output() {
+            Ok(Some(item)) => Some(Ok(item)),
+            Ok(None) => None,
+            Err(e) => Some(Err(e)),
+        }
     }
 }
 
@@ -594,54 +582,6 @@ mod tests {
     }
 
     #[test]
-    fn bounded_fan_in_triggers_intermediate_spill() {
-        let config = MergeConfig {
-            max_fan_in: NonZeroUsize::new(2).expect("2 is not zero"),
-            ..MergeConfig::default()
-        };
-        let merger = RunMerger::new(U64Codec, Natural, config);
-
-        let a = merger.spill_sorted(vec![1u64, 4]).expect("spill");
-        let b = merger.spill_sorted(vec![2u64, 5]).expect("spill");
-        let c = merger.spill_sorted(vec![3u64, 6]).expect("spill");
-
-        let results: Vec<u64> = merger
-            .merge(vec![a, b, c])
-            .expect("merge fan-in=2")
-            .map(|r| r.expect("read"))
-            .collect();
-
-        assert_eq!(results, vec![1, 2, 3, 4, 5, 6]);
-    }
-
-    #[test]
-    fn merge_many_runs_with_small_fan_in() {
-        let config = MergeConfig {
-            max_fan_in: NonZeroUsize::new(3).expect("3 is not zero"),
-            ..MergeConfig::default()
-        };
-        let merger = RunMerger::new(U64Codec, Natural, config);
-
-        let runs: Vec<SortedRun> = (0..10)
-            .map(|i: u64| {
-                let start = i * 3;
-                merger
-                    .spill_sorted(vec![start, start + 1, start + 2])
-                    .expect("spill")
-            })
-            .collect();
-
-        let results: Vec<u64> = merger
-            .merge(runs)
-            .expect("merge 10 runs")
-            .map(|r| r.expect("read"))
-            .collect();
-
-        let expected: Vec<u64> = (0..30).collect();
-        assert_eq!(results, expected);
-    }
-
-    #[test]
     fn merge_different_sized_runs() {
         let merger = default_merger();
         let a = merger.spill_sorted(vec![1u64]).expect("spill");
@@ -762,28 +702,6 @@ mod tests {
                 let output_count = collect_merged(&merger, runs).len();
 
                 prop_assert_eq!(total_input, output_count);
-            }
-
-            #[test]
-            fn fan_in_does_not_affect_merge_output(
-                batches in proptest::collection::vec(arb_sorted_u64_vec(), 2..8),
-            ) {
-                let merger_wide = RunMerger::new(U64Codec, Natural, MergeConfig::default());
-                let merger_narrow = RunMerger::new(U64Codec, Natural, MergeConfig {
-                    max_fan_in: NonZeroUsize::new(2).expect("2 is not zero"),
-                    ..MergeConfig::default()
-                });
-
-                let results_wide = collect_merged(
-                    &merger_wide,
-                    spill_runs(&merger_wide, &batches),
-                );
-                let results_narrow = collect_merged(
-                    &merger_narrow,
-                    spill_runs(&merger_narrow, &batches),
-                );
-
-                prop_assert_eq!(results_wide, results_narrow);
             }
 
             #[test]

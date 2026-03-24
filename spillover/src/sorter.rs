@@ -530,17 +530,15 @@ where
     >
     where
         D: Dedup<T, MergeError<Cod::Error>>,
+        Cod::Key: Ord,
     {
         if !self.buffer.is_empty() {
             self.flush_keyed()?;
         }
 
-        // TODO: use KeyedCodecReader for the merge heap to avoid
-        // full deserialization during merge. For now, use the base
-        // Codec path via the KeyedCodec's Codec supertrait.
         let item_cmp = KeyCompare::new(self.sort_key, self.compare);
         let run_merger = RunMerger::new(self.codec, item_cmp, self.config.merge.clone());
-        let merged = run_merger.merge(std::mem::take(&mut self.spilled_runs))?;
+        let merged = run_merger.merge_keyed(std::mem::take(&mut self.spilled_runs), Natural)?;
 
         let dedup = self
             .dedup
