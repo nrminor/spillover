@@ -29,6 +29,14 @@
 !/spillover/src/dedup.rs
 !/spillover/src/merge.rs
 !/spillover/src/sorter.rs
+!/spillover/examples
+!/spillover/examples/README.md
+!/spillover/examples/01_basic_u64_sort.rs
+!/spillover/examples/02_custom_record_and_sort_key.rs
+!/spillover/examples/03_reverse_and_custom_compare.rs
+!/spillover/examples/04_adjacent_dedup.rs
+!/spillover/examples/05_keyed_codec_merge.rs
+!/spillover/examples/06_spill_controls.rs
 
 # === Allowed: spillover-bio ===
 !/spillover-bio
@@ -42,6 +50,14 @@
 !/spillover-bio/src/radix.rs
 !/spillover-bio/tests
 !/spillover-bio/tests/sort_pipeline.rs
+!/spillover-bio/examples
+!/spillover-bio/examples/README.md
+!/spillover-bio/examples/01_illumina_quickstart.rs
+!/spillover-bio/examples/02_keyed_vs_unkeyed_tradeoff.rs
+!/spillover-bio/examples/03_quality_tiebreak_across_spills.rs
+!/spillover-bio/examples/04_dedup_sequence.rs
+!/spillover-bio/examples/05_codec_compaction.rs
+!/spillover-bio/examples/06_alternate_orders.rs
 
 # === Allowed: GitHub workflows ===
 !/.github
