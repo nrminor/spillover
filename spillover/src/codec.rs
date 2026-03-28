@@ -139,22 +139,33 @@ pub trait KeyedCodecReader<T, K> {
     fn current_record(&mut self) -> Result<T, Self::Error>;
 }
 
-/// Extension trait for codecs that store precomputed sort keys
-/// alongside records.
+/// Extension trait for codecs that store a compact *record key*
+/// alongside each record on disk.
 ///
-/// During the k-way merge, this allows the heap to compare small
-/// fixed-width keys without deserializing full records — only
-/// the winning record is deserialized on each merge step. Any
-/// temp format that stores keys alongside records can implement
-/// this; it is not coupled to any particular format.
+/// The record key is a compact, owned representation derived from
+/// the same data as the [`SortKey`](crate::key::SortKey), but
+/// potentially in a different encoding (e.g., 2-bit packed
+/// nucleotides vs. raw ASCII bytes). During the k-way merge, the
+/// heap compares these small fixed-width record keys without
+/// deserializing full records — only the winning record is
+/// deserialized on each merge step.
+///
+/// Because the record key and the sort key may use different
+/// representations of the same underlying data, the user's
+/// [`Compare`](crate::compare::Compare) implementation must
+/// handle both types — sorting behaviour cannot be assumed to
+/// transfer between encodings.
 ///
 /// The merge engine selects between the base [`Codec`] path and
 /// the `KeyedCodec` fast path at compile time based on whether
 /// the user calls `.codec()` or `.keyed_codec()` on the builder.
 pub trait KeyedCodec<T>: Codec<T> {
-    /// The precomputed key stored alongside each record. `Clone`
-    /// is required because the merge heap holds keys independently
-    /// of reader state.
+    /// The compact record key stored alongside each record on
+    /// disk for merge acceleration. This is distinct from the
+    /// [`SortKey`](crate::key::SortKey), which is a transient,
+    /// potentially borrowed value used during in-memory chunk
+    /// sort. `Clone` is required because the merge heap holds
+    /// keys independently of reader state.
     type Key: Clone;
 
     /// A stateful writer that encodes items with their keys.

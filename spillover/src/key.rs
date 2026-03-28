@@ -1,14 +1,35 @@
 //! Sort key extraction from items.
 //!
-//! [`SortKey`] defines how a sort key is derived from an item. The
-//! key may borrow from the item via a GAT lifetime (e.g., `&'a [u8]`
-//! for a sequence slice) or may be fully owned (e.g., `f64` for a
-//! quality score). For owned keys, the [`Owned`] adapter eliminates
-//! GAT boilerplate by lifting a closure into a `SortKey` impl.
+//! A [`SortKey`] extracts the value to sort by from each item —
+//! it answers "what do we compare?" rather than "how do we
+//! compare?" (which is [`Compare`](crate::compare::Compare)'s
+//! job) or "what algorithm do we use?" (which is
+//! [`ChunkSorter`](crate::chunk::ChunkSorter)'s job).
+//!
+//! Sort keys are transient, potentially borrowed values used
+//! during in-memory comparison. They are distinct from the
+//! *record key* stored by a
+//! [`KeyedCodec`](crate::codec::KeyedCodec), which is a compact,
+//! owned encoding written to disk for merge acceleration. Both
+//! are derived from the same underlying data, but they may use
+//! different representations — so the
+//! [`Compare`](crate::compare::Compare) trait must be implemented
+//! for both types independently.
+//!
+//! The key may borrow from the item via a GAT lifetime (e.g.,
+//! `&'a [u8]` for a sequence slice) or may be fully owned (e.g.,
+//! `f64` for a quality score). For owned keys, the [`Owned`]
+//! adapter eliminates GAT boilerplate by lifting a closure into a
+//! `SortKey` impl.
 
 use std::cmp::Ordering;
 
 /// Extract a sort key from an item.
+///
+/// A sort key is the transient value that determines ordering
+/// during in-memory chunk sort. It is distinct from the *record
+/// key* on [`KeyedCodec`](crate::codec::KeyedCodec), which is a
+/// compact on-disk proxy used for merge acceleration.
 ///
 /// The GAT `Key<'a>` allows the key to borrow from the item. For
 /// example, a sort key that returns `&'a [u8]` borrows the
@@ -17,9 +38,10 @@ use std::cmp::Ordering;
 /// simply unused — or use the [`Owned`] adapter to avoid writing
 /// the GAT at all.
 ///
-/// `SortKey` is deliberately separated from [`Compare`](crate::compare::Compare)
-/// so that the same comparator can serve any key extractor that
-/// produces the same key type, and vice versa.
+/// `SortKey` is deliberately separated from
+/// [`Compare`](crate::compare::Compare) so that the two vary
+/// independently: any `SortKey` that produces a given key type
+/// can pair with any `Compare` that orders that key type.
 ///
 /// ```
 /// use spillover::key::{SortKey, Owned};

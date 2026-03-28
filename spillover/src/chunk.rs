@@ -1,18 +1,36 @@
 //! In-memory chunk sorting strategies.
 //!
-//! [`ChunkSorter`] abstracts the algorithm used to sort each
-//! in-memory chunk before it is flushed to disk. The core crate
-//! provides [`Sequential`] (single-threaded, always available) and
-//! `Parallel` (rayon-based, behind `feature = "rayon"`). Users
-//! with exotic needs can implement the trait themselves.
+//! [`ChunkSorter`] controls the *mechanics* of sorting each
+//! in-memory chunk before it is flushed to disk — the algorithm,
+//! threading model, and memory strategy. It does **not** define
+//! *what ordering* to use; that is the job of
+//! [`Compare`](crate::compare::Compare), which the
+//! [`Sorter`](crate::sorter::Sorter) composes with the
+//! [`SortKey`](crate::key::SortKey) into a comparison closure
+//! and passes to `ChunkSorter::sort`.
+//!
+//! The core crate provides [`Sequential`] (single-threaded, always
+//! available) and `Parallel` (rayon-based, behind
+//! `feature = "rayon"`). Domain crates can implement the trait for
+//! specialized algorithms like radix sort that accelerate specific
+//! data shapes while still falling back to the provided comparator
+//! for tiebreaking.
 
 use std::cmp::Ordering;
 
-/// Sort a mutable slice using a provided comparison function.
+/// Sort a mutable slice in place.
 ///
-/// Implementations choose the sort algorithm and threading model.
-/// The comparison function is provided by the sorter engine, which
-/// composes `SortKey` and `Compare` into a single closure.
+/// Implementations choose the sort algorithm and threading model
+/// but must respect the ordering defined by `cmp`. The comparator
+/// is constructed by the [`Sorter`](crate::sorter::Sorter) from
+/// the user's [`SortKey`](crate::key::SortKey) and
+/// [`Compare`](crate::compare::Compare) — a `ChunkSorter` should
+/// never impose its own ordering.
+///
+/// Implementations *may* use domain knowledge to sort faster (e.g.
+/// radix sort on known key structure) as long as the final order
+/// is consistent with `cmp`. When a fast path leaves items in
+/// equal-key groups, `cmp` must be used to refine those groups.
 ///
 /// ```
 /// use spillover::chunk::{ChunkSorter, Sequential};

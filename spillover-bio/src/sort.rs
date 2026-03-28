@@ -774,8 +774,11 @@ impl<O, C, F, D, CS> Builder<HasKeyedOrder<O>, C, F, D, CS>
 where
     O: KeyedSortOrder,
     O::SortKey: Send + Sync + 'static,
-    O::Compare:
-        for<'a> Compare<<O::SortKey as SortKey<SeqRecord>>::Key<'a>> + Send + Sync + 'static,
+    O::Compare: for<'a> Compare<<O::SortKey as SortKey<SeqRecord>>::Key<'a>>
+        + Compare<O::RecordKey>
+        + Send
+        + Sync
+        + 'static,
     O::RecordKey: RecordKey + Clone + 'static,
     C: sealed::ResolveCodec,
     F: sealed::ResolveFlush,

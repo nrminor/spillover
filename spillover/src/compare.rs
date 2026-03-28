@@ -1,13 +1,19 @@
 //! Key comparison traits and built-in comparators.
 //!
-//! [`Compare`] defines how two sort keys are ordered. It is
-//! deliberately separated from [`SortKey`](crate::key::SortKey) so that
-//! one comparator serves any key extractor producing the same key
-//! type, and vice versa. Three built-in implementations cover the
-//! common cases: [`Natural`] delegates to [`Ord`], [`Reverse`]
-//! flips any comparator, and [`CompareVia`] compares through
-//! [`AsRef`] so that e.g. `Vec<u8>` and `&[u8]` keys compare as
-//! the underlying `[u8]`.
+//! [`Compare`] defines the *ordering relation* used by the sort
+//! and merge engines. It determines *what order* items end up in,
+//! not *how* the sorting is performed — that is the job of
+//! [`ChunkSorter`](crate::chunk::ChunkSorter).
+//!
+//! `Compare` is deliberately separated from
+//! [`SortKey`](crate::key::SortKey) so that the two vary
+//! independently: any `SortKey` that produces a given key type
+//! can pair with any `Compare` that orders that key type.
+//! Three built-in implementations cover the common cases:
+//! [`Natural`] delegates to [`Ord`], [`Reverse`] flips any
+//! comparator, and [`CompareVia`] compares through [`AsRef`] so
+//! that e.g. `Vec<u8>` and `&[u8]` keys compare as the underlying
+//! `[u8]`.
 
 use std::{cmp::Ordering, marker::PhantomData};
 

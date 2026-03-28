@@ -317,7 +317,7 @@ impl<T, SK, Cod, Cmp, D, CS>
 where
     SK: SortKey<T> + Copy,
     Cod: KeyedCodec<T> + Copy,
-    Cmp: for<'a> Compare<SK::Key<'a>> + Copy,
+    Cmp: for<'a> Compare<SK::Key<'a>> + Compare<Cod::Key> + Copy,
     CS: ChunkSorter<T>,
 {
     /// Build the [`Sorter`] (keyed merge path).
@@ -347,11 +347,19 @@ where
 /// iterator.
 ///
 /// - `T`: the item type being sorted
-/// - `SK`: [`SortKey`] — how to extract a sort key
-/// - `Cod`: [`Codec`] — how to serialize to/from disk
-/// - `Cmp`: [`Compare`] — how to order keys
+/// - `SK`: [`SortKey`] — extracts the value to sort by from each
+///   item (e.g. sequence bytes, a name, a length)
+/// - `Cod`: [`Codec`] — serializes items to/from temporary files
+///   on disk. On the keyed path ([`KeyedCodec`]), the codec also
+///   stores a compact *record key* alongside each item for merge
+///   acceleration
+/// - `Cmp`: [`Compare`] — the ordering relation, applied to both
+///   sort keys (during chunk sort) and record keys (during merge).
+///   These are different representations of the same underlying
+///   data, so the comparator must handle both types
 /// - `D`: [`Dedup`] — post-merge deduplication
-/// - `CS`: [`ChunkSorter`] — in-memory sort algorithm
+/// - `CS`: [`ChunkSorter`] — in-memory sort algorithm and
+///   threading model
 /// - `M`: merge strategy marker ([`Basic`] or [`Keyed`])
 pub struct Sorter<T, SK, Cod, Cmp, D, CS, M = Basic> {
     sort_key: SK,
@@ -458,7 +466,7 @@ where
     T: 'static,
     SK: SortKey<T> + Copy + Send + Sync + 'static,
     Cod: KeyedCodec<T> + Copy + 'static,
-    Cmp: for<'a> Compare<SK::Key<'a>> + Copy + Send + Sync + 'static,
+    Cmp: for<'a> Compare<SK::Key<'a>> + Compare<Cod::Key> + Copy + Send + Sync + 'static,
     CS: ChunkSorter<T>,
 {
     /// Add an item to the sorter.
@@ -531,7 +539,6 @@ where
     >
     where
         D: Dedup<T, MergeError<Cod::Error>>,
-        Cod::Key: Ord,
     {
         if !self.buffer.is_empty() {
             self.flush_keyed()?;
@@ -539,7 +546,8 @@ where
 
         let item_cmp = KeyCompare::new(self.sort_key, self.compare);
         let run_merger = RunMerger::new(self.codec, item_cmp, self.config.merge.clone());
-        let merged = run_merger.merge_keyed(std::mem::take(&mut self.spilled_runs), Natural)?;
+        let merged =
+            run_merger.merge_keyed(std::mem::take(&mut self.spilled_runs), self.compare)?;
 
         let dedup = self
             .dedup
