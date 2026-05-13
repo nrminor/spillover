@@ -19,7 +19,7 @@ use spillover::{
     chunk::{ChunkSorter, Sequential},
     codec::{Codec, CodecWriter, KeyedCodec, KeyedCodecWriter},
     compare::{Compare, Natural},
-    dedup::{AdjacentDedup, Dedup, Identity},
+    dedup::Identity,
     key::SortKey,
     merge::{MergeConfig, MergeError},
 };
@@ -400,9 +400,11 @@ pub const LENGTH_ORDER: LengthOrder = LengthOrder;
 
 // ── Builder ──────────────────────────────────────────────
 
-/// Dedup strategy that compares adjacent [`SeqRecord`]s by a
-/// function pointer. Used by the convenience dedup methods.
-type RecordDedup = AdjacentDedup<fn(&SeqRecord, &SeqRecord) -> bool>;
+#[derive(Debug, Clone, Copy)]
+enum RecordDedup {
+    None,
+    Adjacent(fn(&SeqRecord, &SeqRecord) -> bool),
+}
 
 /// Builder marker: no sort order chosen yet.
 pub struct NeedsOrder;
@@ -515,11 +517,11 @@ impl sealed::ResolveFlush for HasFlush {
 ///     }
 /// }
 /// ```
-pub struct Builder<O = NeedsOrder, C = NeedsCodec, F = NeedsFlush, D = Identity, CS = Sequential> {
+pub struct Builder<O = NeedsOrder, C = NeedsCodec, F = NeedsFlush, CS = Sequential> {
     order: O,
     codec: C,
     flush: F,
-    dedup: D,
+    dedup: RecordDedup,
     chunk_sort: CS,
     merge_config: MergeConfig,
 }
@@ -528,8 +530,9 @@ pub struct Builder<O = NeedsOrder, C = NeedsCodec, F = NeedsFlush, D = Identity,
 ///
 /// Construct a sorter with [`Builder`], push unsorted records into it, then call
 /// [`finish`](Self::finish) to produce a [`SortedRecordStream`].
-pub struct Sorter<SK, Cod, Cmp, D, CS, M> {
-    inner: spillover::sorter::Sorter<SeqRecord, SK, Cod, Cmp, D, CS, M>,
+pub struct Sorter<SK, Cod, Cmp, CS, M> {
+    inner: spillover::sorter::Sorter<SeqRecord, SK, Cod, Cmp, Identity, CS, M>,
+    dedup: RecordDedup,
 }
 
 /// Finalized stream of sorted sequence records.
@@ -539,6 +542,9 @@ pub struct Sorter<SK, Cod, Cmp, D, CS, M> {
 /// ordinary `.collect()` callsites continue to work.
 pub struct SortedRecordStream<I> {
     inner: spillover::Sorted<I>,
+    dedup: RecordDedup,
+    last_emitted: Option<SeqRecord>,
+    fused: bool,
 }
 
 /// Destination for sequence records produced by a sorted stream.
@@ -585,20 +591,49 @@ where
     }
 }
 
-impl<I> Iterator for SortedRecordStream<I>
+impl<I, E> Iterator for SortedRecordStream<I>
 where
-    spillover::Sorted<I>: Iterator,
+    spillover::Sorted<I>: Iterator<Item = Result<SeqRecord, E>>,
 {
-    type Item = <spillover::Sorted<I> as Iterator>::Item;
+    type Item = Result<SeqRecord, E>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        self.inner.next()
+        let RecordDedup::Adjacent(eq_fn) = self.dedup else {
+            return self.inner.next();
+        };
+
+        if self.fused {
+            return None;
+        }
+
+        loop {
+            match self.inner.next() {
+                Some(Ok(record)) => {
+                    let is_duplicate = self
+                        .last_emitted
+                        .as_ref()
+                        .is_some_and(|previous| eq_fn(previous, &record));
+
+                    if is_duplicate {
+                        continue;
+                    }
+
+                    self.last_emitted = Some(record.clone());
+                    return Some(Ok(record));
+                }
+                Some(Err(err)) => {
+                    self.fused = true;
+                    return Some(Err(err));
+                }
+                None => return None,
+            }
+        }
     }
 }
 
 impl<I, RE> SortedRecordStream<I>
 where
-    spillover::Sorted<I>: Iterator<Item = Result<SeqRecord, RE>>,
+    Self: Iterator<Item = Result<SeqRecord, RE>>,
     RE: std::error::Error + Send + Sync + 'static,
 {
     /// Write all sorted records to a destination sink.
@@ -635,7 +670,7 @@ impl Builder {
             order: NeedsOrder,
             codec: NeedsCodec,
             flush: NeedsFlush,
-            dedup: Identity,
+            dedup: RecordDedup::None,
             chunk_sort: Sequential,
             merge_config: MergeConfig::default(),
         }
@@ -652,7 +687,7 @@ impl Default for Builder {
 // push/finish implementations. The bio wrapper owns the public lifecycle
 // vocabulary; core owns the sorting mechanics.
 
-impl<SK, Cod, Cmp, D, CS> Sorter<SK, Cod, Cmp, D, CS, spillover::sorter::Basic>
+impl<SK, Cod, Cmp, CS> Sorter<SK, Cod, Cmp, CS, spillover::sorter::Basic>
 where
     SK: SortKey<SeqRecord> + Copy + Send + Sync + 'static,
     Cod: Codec<Item = SeqRecord> + Copy + 'static,
@@ -678,19 +713,19 @@ where
     pub fn finish(
         self,
     ) -> Result<
-        SortedRecordStream<impl Iterator<Item = Result<D::Output, MergeError<Cod::Error>>>>,
+        SortedRecordStream<impl Iterator<Item = Result<SeqRecord, MergeError<Cod::Error>>>>,
         MergeError<Cod::Error>,
-    >
-    where
-        D: Dedup<SeqRecord, MergeError<Cod::Error>>,
-    {
+    > {
         Ok(SortedRecordStream {
             inner: self.inner.finish()?,
+            dedup: self.dedup,
+            last_emitted: None,
+            fused: false,
         })
     }
 }
 
-impl<SK, Cod, Cmp, D, CS> Sorter<SK, Cod, Cmp, D, CS, spillover::sorter::Keyed>
+impl<SK, Cod, Cmp, CS> Sorter<SK, Cod, Cmp, CS, spillover::sorter::Keyed>
 where
     SK: SortKey<SeqRecord> + Copy + Send + Sync + 'static,
     Cod: KeyedCodec<Item = SeqRecord> + Copy + 'static,
@@ -718,24 +753,24 @@ where
     pub fn finish(
         self,
     ) -> Result<
-        SortedRecordStream<impl Iterator<Item = Result<D::Output, MergeError<Cod::Error>>>>,
+        SortedRecordStream<impl Iterator<Item = Result<SeqRecord, MergeError<Cod::Error>>>>,
         MergeError<Cod::Error>,
-    >
-    where
-        D: Dedup<SeqRecord, MergeError<Cod::Error>>,
-    {
+    > {
         Ok(SortedRecordStream {
             inner: self.inner.finish()?,
+            dedup: self.dedup,
+            last_emitted: None,
+            fused: false,
         })
     }
 }
 
 // Sort order selection.
 
-impl<C, F, D, CS> Builder<NeedsOrder, C, F, D, CS> {
+impl<C, F, CS> Builder<NeedsOrder, C, F, CS> {
     /// Set a keyed sort order (merge compares record keys).
     #[must_use]
-    pub fn sort_by<O: KeyedSortOrder>(self, order: O) -> Builder<HasKeyedOrder<O>, C, F, D, CS> {
+    pub fn sort_by<O: KeyedSortOrder>(self, order: O) -> Builder<HasKeyedOrder<O>, C, F, CS> {
         Builder {
             order: HasKeyedOrder(order),
             codec: self.codec,
@@ -751,7 +786,7 @@ impl<C, F, D, CS> Builder<NeedsOrder, C, F, D, CS> {
     pub fn sort_by_unkeyed<O: SortOrder<Strategy = Basic>>(
         self,
         order: O,
-    ) -> Builder<HasUnkeyedOrder<O>, C, F, D, CS> {
+    ) -> Builder<HasUnkeyedOrder<O>, C, F, CS> {
         Builder {
             order: HasUnkeyedOrder(order),
             codec: self.codec,
@@ -767,7 +802,7 @@ impl<C, F, D, CS> Builder<NeedsOrder, C, F, D, CS> {
     #[must_use]
     pub fn sort_by_illumina(
         self,
-    ) -> Builder<HasKeyedOrder<SequenceOrder<38>>, C, F, D, RadixThenRefine<38>> {
+    ) -> Builder<HasKeyedOrder<SequenceOrder<38>>, C, F, RadixThenRefine<38>> {
         self.sort_by(ILLUMINA_ORDER)
             .chunk_sort(RadixThenRefine::<38>)
     }
@@ -777,7 +812,7 @@ impl<C, F, D, CS> Builder<NeedsOrder, C, F, D, CS> {
     #[must_use]
     pub fn sort_by_paired_end(
         self,
-    ) -> Builder<HasKeyedOrder<SequenceOrder<64>>, C, F, D, RadixThenRefine<64>> {
+    ) -> Builder<HasKeyedOrder<SequenceOrder<64>>, C, F, RadixThenRefine<64>> {
         self.sort_by(PAIRED_END_ORDER)
             .chunk_sort(RadixThenRefine::<64>)
     }
@@ -787,33 +822,33 @@ impl<C, F, D, CS> Builder<NeedsOrder, C, F, D, CS> {
     #[must_use]
     pub fn sort_by_long_read(
         self,
-    ) -> Builder<HasKeyedOrder<SequenceOrder<128>>, C, F, D, RadixThenRefine<128>> {
+    ) -> Builder<HasKeyedOrder<SequenceOrder<128>>, C, F, RadixThenRefine<128>> {
         self.sort_by(LONG_READ_ORDER)
             .chunk_sort(RadixThenRefine::<128>)
     }
 
     /// Sort by record name.
     #[must_use]
-    pub fn sort_by_name(self) -> Builder<HasKeyedOrder<NameOrder>, C, F, D, CS> {
+    pub fn sort_by_name(self) -> Builder<HasKeyedOrder<NameOrder>, C, F, CS> {
         self.sort_by(NAME_ORDER)
     }
 
     /// Sort by sequence length.
     #[must_use]
-    pub fn sort_by_length(self) -> Builder<HasKeyedOrder<LengthOrder>, C, F, D, CS> {
+    pub fn sort_by_length(self) -> Builder<HasKeyedOrder<LengthOrder>, C, F, CS> {
         self.sort_by(LENGTH_ORDER)
     }
 }
 
 // Codec selection.
 
-impl<O, F, D, CS> Builder<O, NeedsCodec, F, D, CS> {
+impl<O, F, CS> Builder<O, NeedsCodec, F, CS> {
     /// Set the dryice codec for temporary file encoding.
     #[must_use]
     pub fn codec<S, Q, N>(
         self,
         codec: DryIceCodec<S, Q, N>,
-    ) -> Builder<O, HasCodec<S, Q, N>, F, D, CS> {
+    ) -> Builder<O, HasCodec<S, Q, N>, F, CS> {
         Builder {
             order: self.order,
             codec: HasCodec(codec),
@@ -827,11 +862,11 @@ impl<O, F, D, CS> Builder<O, NeedsCodec, F, D, CS> {
 
 // Flush strategy selection.
 
-impl<O, C, D, CS> Builder<O, C, NeedsFlush, D, CS> {
+impl<O, C, CS> Builder<O, C, NeedsFlush, CS> {
     /// Flush when estimated memory usage exceeds `budget` bytes.
     /// Requires [`SeqRecord`] to implement `GetSize`.
     #[must_use]
-    pub fn measured_budget(self, budget: usize) -> Builder<O, C, HasFlush, D, CS> {
+    pub fn measured_budget(self, budget: usize) -> Builder<O, C, HasFlush, CS> {
         Builder {
             order: self.order,
             codec: self.codec,
@@ -844,7 +879,7 @@ impl<O, C, D, CS> Builder<O, C, NeedsFlush, D, CS> {
 
     /// Flush when the buffer reaches `max_items` records.
     #[must_use]
-    pub fn max_buffer_items(self, max_items: usize) -> Builder<O, C, HasFlush, D, CS> {
+    pub fn max_buffer_items(self, max_items: usize) -> Builder<O, C, HasFlush, CS> {
         Builder {
             order: self.order,
             codec: self.codec,
@@ -858,16 +893,19 @@ impl<O, C, D, CS> Builder<O, C, NeedsFlush, D, CS> {
 
 // Optional configuration.
 
-impl<O, C, F, D, CS> Builder<O, C, F, D, CS> {
-    /// Set a custom deduplication strategy. Defaults to
-    /// [`Identity`] (no dedup).
+impl<O, C, F, CS> Builder<O, C, F, CS> {
+    /// Deduplicate adjacent sorted records with a custom predicate.
+    ///
+    /// The predicate receives the previous emitted record and the current
+    /// candidate record. Return `true` when the current record should be treated
+    /// as a duplicate and skipped.
     #[must_use]
-    pub fn dedup<D2>(self, dedup: D2) -> Builder<O, C, F, D2, CS> {
+    pub fn dedup_by(self, eq_fn: fn(&SeqRecord, &SeqRecord) -> bool) -> Builder<O, C, F, CS> {
         Builder {
             order: self.order,
             codec: self.codec,
             flush: self.flush,
-            dedup,
+            dedup: RecordDedup::Adjacent(eq_fn),
             chunk_sort: self.chunk_sort,
             merge_config: self.merge_config,
         }
@@ -876,7 +914,7 @@ impl<O, C, F, D, CS> Builder<O, C, F, D, CS> {
     /// Set a custom chunk sorting strategy. Defaults to
     /// [`Sequential`].
     #[must_use]
-    pub fn chunk_sort<CS2>(self, chunk_sort: CS2) -> Builder<O, C, F, D, CS2> {
+    pub fn chunk_sort<CS2>(self, chunk_sort: CS2) -> Builder<O, C, F, CS2> {
         Builder {
             order: self.order,
             codec: self.codec,
@@ -896,40 +934,31 @@ impl<O, C, F, D, CS> Builder<O, C, F, D, CS> {
 
     /// Deduplicate adjacent records with identical names.
     #[must_use]
-    pub fn dedup_by_name(self) -> Builder<O, C, F, RecordDedup, CS> {
-        self.dedup(AdjacentDedup::new(
+    pub fn dedup_by_name(self) -> Builder<O, C, F, CS> {
+        self.dedup_by(
             (|a: &SeqRecord, b: &SeqRecord| a.name() == b.name())
                 as fn(&SeqRecord, &SeqRecord) -> bool,
-        ))
+        )
     }
 
     /// Deduplicate adjacent records with identical sequences.
     #[must_use]
-    pub fn dedup_by_sequence(self) -> Builder<O, C, F, RecordDedup, CS> {
-        self.dedup(AdjacentDedup::new(
+    pub fn dedup_by_sequence(self) -> Builder<O, C, F, CS> {
+        self.dedup_by(
             (|a: &SeqRecord, b: &SeqRecord| a.sequence() == b.sequence())
                 as fn(&SeqRecord, &SeqRecord) -> bool,
-        ))
-    }
-
-    /// Deduplicate adjacent records with identical quality scores.
-    #[must_use]
-    pub fn dedup_by_quality(self) -> Builder<O, C, F, RecordDedup, CS> {
-        self.dedup(AdjacentDedup::new(
-            (|a: &SeqRecord, b: &SeqRecord| a.quality() == b.quality())
-                as fn(&SeqRecord, &SeqRecord) -> bool,
-        ))
+        )
     }
 
     /// Deduplicate adjacent records with identical sequence and
     /// quality.
     #[must_use]
-    pub fn dedup_by_sequence_and_quality(self) -> Builder<O, C, F, RecordDedup, CS> {
-        self.dedup(AdjacentDedup::new(
+    pub fn dedup_by_sequence_and_quality(self) -> Builder<O, C, F, CS> {
+        self.dedup_by(
             (|a: &SeqRecord, b: &SeqRecord| {
                 a.sequence() == b.sequence() && a.quality() == b.quality()
             }) as fn(&SeqRecord, &SeqRecord) -> bool,
-        ))
+        )
     }
 
     /// Use single-threaded comparison sort for in-memory chunks.
@@ -937,7 +966,7 @@ impl<O, C, F, D, CS> Builder<O, C, F, D, CS> {
     /// This overrides the default sort engine (which is radix sort
     /// for sequence orders, and sequential for everything else).
     #[must_use]
-    pub fn sort_with_sequential(self) -> Builder<O, C, F, D, Sequential> {
+    pub fn sort_with_sequential(self) -> Builder<O, C, F, Sequential> {
         self.chunk_sort(Sequential)
     }
 
@@ -947,7 +976,7 @@ impl<O, C, F, D, CS> Builder<O, C, F, D, CS> {
     /// feature to be enabled on spillover.
     #[cfg(feature = "rayon")]
     #[must_use]
-    pub fn sort_with_parallel(self) -> Builder<O, C, F, D, spillover::chunk::Parallel> {
+    pub fn sort_with_parallel(self) -> Builder<O, C, F, spillover::chunk::Parallel> {
         self.chunk_sort(spillover::chunk::Parallel)
     }
 }
@@ -958,7 +987,7 @@ impl<O, C, F, D, CS> Builder<O, C, F, D, CS> {
 // `NeedsCodec` → raw DryIceCodec, `NeedsFlush` → 1 GiB budget.
 // This single impl covers all four combinations of has/needs.
 
-impl<O, C, F, D, CS> Builder<HasKeyedOrder<O>, C, F, D, CS>
+impl<O, C, F, CS> Builder<HasKeyedOrder<O>, C, F, CS>
 where
     O: KeyedSortOrder,
     O::SortKey: Send + Sync + 'static,
@@ -970,7 +999,6 @@ where
     O::RecordKey: RecordKey + Clone + 'static,
     C: sealed::ResolveCodec,
     F: sealed::ResolveFlush,
-    D: Dedup<SeqRecord, spillover::merge::MergeError<dryice::DryIceError>>,
     CS: ChunkSorter<SeqRecord>,
 {
     /// Build the sorter (keyed merge path).
@@ -986,7 +1014,6 @@ where
         O::SortKey,
         KeyedDryIceCodec<C::S, C::Q, C::N, O::RecordKey>,
         O::Compare,
-        D,
         CS,
         spillover::sorter::Keyed,
     > {
@@ -999,7 +1026,7 @@ where
             .key(order.sort_key())
             .compare(order.compare())
             .keyed_codec(keyed_codec)
-            .dedup(self.dedup)
+            .dedup(Identity)
             .chunk_sort(self.chunk_sort)
             .merge_config(self.merge_config);
 
@@ -1012,13 +1039,16 @@ where
             }
         };
 
-        Sorter { inner }
+        Sorter {
+            inner,
+            dedup: self.dedup,
+        }
     }
 }
 
 // build() for unkeyed sort orders.
 
-impl<O, C, F, D, CS> Builder<HasUnkeyedOrder<O>, C, F, D, CS>
+impl<O, C, F, CS> Builder<HasUnkeyedOrder<O>, C, F, CS>
 where
     O: SortOrder<Strategy = Basic>,
     O::SortKey: Send + Sync + 'static,
@@ -1026,7 +1056,6 @@ where
         for<'a> Compare<<O::SortKey as SortKey<SeqRecord>>::Key<'a>> + Send + Sync + 'static,
     C: sealed::ResolveCodec,
     F: sealed::ResolveFlush,
-    D: Dedup<SeqRecord, spillover::merge::MergeError<dryice::DryIceError>>,
     CS: ChunkSorter<SeqRecord>,
 {
     /// Build the sorter (basic merge path, no record keys).
@@ -1038,14 +1067,8 @@ where
     #[must_use]
     pub fn build(
         self,
-    ) -> Sorter<
-        O::SortKey,
-        DryIceCodec<C::S, C::Q, C::N>,
-        O::Compare,
-        D,
-        CS,
-        spillover::sorter::Basic,
-    > {
+    ) -> Sorter<O::SortKey, DryIceCodec<C::S, C::Q, C::N>, O::Compare, CS, spillover::sorter::Basic>
+    {
         let order = self.order.0;
         let codec = self.codec.resolve();
         let flush = self.flush.resolve();
@@ -1054,7 +1077,7 @@ where
             .key(order.sort_key())
             .compare(order.compare())
             .codec(codec)
-            .dedup(self.dedup)
+            .dedup(Identity)
             .chunk_sort(self.chunk_sort)
             .merge_config(self.merge_config);
 
@@ -1067,7 +1090,10 @@ where
             }
         };
 
-        Sorter { inner }
+        Sorter {
+            inner,
+            dedup: self.dedup,
+        }
     }
 }
 

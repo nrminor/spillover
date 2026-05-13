@@ -166,6 +166,37 @@ fn sorted_record_stream_writes_to_custom_sink() {
 }
 
 #[test]
+fn sorted_record_stream_applies_dedup_when_writing_to_sink() {
+    let mut sorter = Builder::new()
+        .sort_by_illumina()
+        .dedup_by_sequence()
+        .codec(DryIceCodec::new())
+        .max_buffer_items(2)
+        .build();
+
+    sorter
+        .push(make_record(b"r1", b"AAAAAAAA", b"IIIIIIII"))
+        .expect("push");
+    sorter
+        .push(make_record(b"r2", b"AAAAAAAA", b"!!!!!!!!"))
+        .expect("push");
+    sorter
+        .push(make_record(b"r3", b"CCCCCCCC", b"!!!!!!!!"))
+        .expect("push");
+
+    let mut sink = VecSink::default();
+    sorter
+        .finish()
+        .expect("finish should succeed")
+        .write_to(&mut sink)
+        .expect("write_to should succeed");
+
+    assert_eq!(sink.records.len(), 2);
+    assert_eq!(sink.records[0].sequence(), b"AAAAAAAA");
+    assert_eq!(sink.records[1].sequence(), b"CCCCCCCC");
+}
+
+#[test]
 fn sorted_record_stream_wraps_sink_errors() {
     let mut sorter = Builder::new()
         .sort_by_illumina()
@@ -422,14 +453,10 @@ fn sort_by_length_orders_shortest_first() {
 
 #[test]
 fn dedup_removes_duplicate_sequences() {
-    use spillover::dedup::AdjacentDedup;
-
     let mut sorter = Builder::new()
         .sort_by_illumina()
         .codec(DryIceCodec::new())
-        .dedup(AdjacentDedup::new(|a: &SeqRecord, b: &SeqRecord| {
-            a.sequence() == b.sequence()
-        }))
+        .dedup_by(|a: &SeqRecord, b: &SeqRecord| a.sequence() == b.sequence())
         .max_buffer_items(100)
         .build();
 
@@ -807,15 +834,11 @@ fn all_identical_records_sort_and_preserve_count() {
 
 #[test]
 fn dedup_with_spilling_removes_cross_chunk_duplicates() {
-    use spillover::dedup::AdjacentDedup;
-
     // Buffer holds 3 records. Duplicates span chunk boundaries.
     let mut sorter = Builder::new()
         .sort_by_illumina()
         .codec(DryIceCodec::new())
-        .dedup(AdjacentDedup::new(|a: &SeqRecord, b: &SeqRecord| {
-            a.sequence() == b.sequence()
-        }))
+        .dedup_by(|a: &SeqRecord, b: &SeqRecord| a.sequence() == b.sequence())
         .max_buffer_items(3)
         .build();
 
