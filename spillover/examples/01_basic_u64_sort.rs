@@ -1,7 +1,7 @@
 use std::io::{BufReader, BufWriter, Read, Write};
 
 use spillover::{
-    codec::{Codec, CodecReader, CodecWriter},
+    codec::{Codec, CodecCursor, CodecWriter},
     key::Owned,
     sorter::Builder,
 };
@@ -30,7 +30,7 @@ struct U64Reader<R: Read> {
     current: Option<u64>,
 }
 
-impl<R: Read> CodecReader<u64> for U64Reader<R> {
+impl<R: Read> CodecCursor<u64> for U64Reader<R> {
     type Error = std::io::Error;
     type Current<'a>
         = u64
@@ -70,7 +70,7 @@ impl Codec for U64Codec {
     type Item = u64;
     type Error = std::io::Error;
     type Writer<W: Write> = U64Writer<W>;
-    type Reader<R: Read> = U64Reader<R>;
+    type Cursor<R: Read> = U64Reader<R>;
 
     fn writer<W: Write>(&self, dest: W) -> Self::Writer<W> {
         U64Writer {
@@ -78,7 +78,7 @@ impl Codec for U64Codec {
         }
     }
 
-    fn reader<R: Read>(&self, source: R) -> Self::Reader<R> {
+    fn cursor<R: Read>(&self, source: R) -> Self::Cursor<R> {
         U64Reader {
             inner: BufReader::new(source),
             current: None,

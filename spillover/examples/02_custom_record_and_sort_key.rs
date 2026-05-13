@@ -1,7 +1,7 @@
 use std::io::{BufRead, BufReader, BufWriter, Write};
 
 use spillover::{
-    codec::{Codec, CodecReader, CodecWriter},
+    codec::{Codec, CodecCursor, CodecWriter},
     sorter::Builder,
 };
 
@@ -41,7 +41,7 @@ struct LogReader<R: std::io::Read> {
     current: Option<LogEvent>,
 }
 
-impl<R: std::io::Read> CodecReader<LogEvent> for LogReader<R> {
+impl<R: std::io::Read> CodecCursor<LogEvent> for LogReader<R> {
     type Error = std::io::Error;
     type Current<'a>
         = &'a LogEvent
@@ -106,7 +106,7 @@ impl Codec for LogCodec {
     type Item = LogEvent;
     type Error = std::io::Error;
     type Writer<W: Write> = LogWriter<W>;
-    type Reader<R: std::io::Read> = LogReader<R>;
+    type Cursor<R: std::io::Read> = LogReader<R>;
 
     fn writer<W: Write>(&self, dest: W) -> Self::Writer<W> {
         LogWriter {
@@ -114,7 +114,7 @@ impl Codec for LogCodec {
         }
     }
 
-    fn reader<R: std::io::Read>(&self, source: R) -> Self::Reader<R> {
+    fn cursor<R: std::io::Read>(&self, source: R) -> Self::Cursor<R> {
         LogReader {
             inner: BufReader::new(source),
             line: String::new(),

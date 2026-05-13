@@ -3,7 +3,7 @@
 //! [`Codec`] defines how items are written to and read from
 //! temporary files during the sort. The codec itself is a
 //! stateless `Copy` configuration object — it spawns stateful
-//! [`CodecWriter`] and [`CodecReader`] instances that handle
+//! [`CodecWriter`] and [`CodecCursor`] instances that handle
 //! the actual I/O. This separation allows block-oriented
 //! formats (like dryice) to manage internal buffering in the
 //! writer while keeping the codec trivially duplicatable.
@@ -45,14 +45,14 @@ pub trait CodecWriter<I: ?Sized> {
 
 /// A stateful cursor created by a [`Codec`] for reading items
 /// back from a sorted run.
-pub trait CodecReader<T> {
+pub trait CodecCursor<T> {
     /// The error type for read failures.
     type Error: std::error::Error + Send + Sync + 'static;
 
-    /// The cheapest representation of the current item for this reader.
+    /// The cheapest representation of the current item for this cursor.
     ///
-    /// Readers backed by reusable decode buffers can expose borrowed views here.
-    /// Owned-only readers may use owned values or references to internally stored
+    /// Cursors backed by reusable decode buffers can expose borrowed views here.
+    /// Owned-only cursors may use owned values or references to internally stored
     /// owned values.
     type Current<'a>
     where
@@ -70,7 +70,7 @@ pub trait CodecReader<T> {
 
     /// Materialize the current item as an owned value.
     ///
-    /// Valid only after [`advance`](Self::advance) returned `true`. Readers may
+    /// Valid only after [`advance`](Self::advance) returned `true`. Cursors may
     /// consume internal current-position state when materializing owned values,
     /// so callers should use either `current()` or `with_current(...)` for a
     /// position before advancing again.
@@ -80,7 +80,7 @@ pub trait CodecReader<T> {
     /// Returns an error if decoding or materialization fails.
     fn current(&mut self) -> Result<T, Self::Error>;
 
-    /// Visit the current item in this reader's cheapest representation.
+    /// Visit the current item in this cursor's cheapest representation.
     ///
     /// The value passed to the callback is valid only for the callback. This is
     /// valid only after [`advance`](Self::advance) returned `true`.
@@ -97,15 +97,15 @@ pub trait CodecReader<T> {
 /// Defines the on-disk format for sorted runs.
 ///
 /// A codec is a stateless, `Copy` configuration object that
-/// knows how to create writers and readers for its format.
-/// The writers and readers hold whatever state the format
+/// knows how to create writers and cursors for its format.
+/// The writers and cursors hold whatever state the format
 /// needs (I/O buffers, block accumulators, etc.).
 ///
 /// The core crate provides no built-in codecs — implementations
 /// live in domain crates (e.g., `spillover-bio` provides a
 /// dryice-based codec) or in application code for simple cases.
 pub trait Codec: Copy {
-    /// The item type materialized by readers for this codec.
+    /// The item type materialized by cursors for this codec.
     type Item;
 
     /// The error type for encode/decode failures.
@@ -114,14 +114,14 @@ pub trait Codec: Copy {
     /// A stateful writer for encoding items into a sorted run.
     type Writer<W: Write>;
 
-    /// A stateful reader for decoding items from a sorted run.
-    type Reader<R: Read>: CodecReader<Self::Item, Error = Self::Error>;
+    /// A stateful cursor for decoding items from a sorted run.
+    type Cursor<R: Read>: CodecCursor<Self::Item, Error = Self::Error>;
 
     /// Create a writer that encodes items into `dest`.
     fn writer<W: Write>(&self, dest: W) -> Self::Writer<W>;
 
-    /// Create a reader that decodes items from `source`.
-    fn reader<R: Read>(&self, source: R) -> Self::Reader<R>;
+    /// Create a cursor that decodes items from `source`.
+    fn cursor<R: Read>(&self, source: R) -> Self::Cursor<R>;
 }
 
 /// A stateful writer that stores items alongside precomputed keys.
@@ -150,15 +150,15 @@ pub trait KeyedCodecWriter<I: ?Sized, K> {
 /// A stateful cursor that separates key access from full record
 /// materialization.
 ///
-/// The merge engine calls [`advance`](CodecReader::advance) to position the
-/// reader, [`current_key`](Self::current_key) to feed the heap, and
-/// [`current`](CodecReader::current) or [`with_current`](CodecReader::with_current)
+/// The merge engine calls [`advance`](CodecCursor::advance) to position the
+/// cursor, [`current_key`](Self::current_key) to feed the heap, and
+/// [`current`](CodecCursor::current) or [`with_current`](CodecCursor::with_current)
 /// only for the merge winner. This avoids materializing records that lose the
 /// heap comparison.
-pub trait KeyedCodecReader<T, K>: CodecReader<T> {
+pub trait KeyedCodecCursor<T, K>: CodecCursor<T> {
     /// Return the stored key for the current entry.
     ///
-    /// Valid only after [`advance`](CodecReader::advance) returned `true`.
+    /// Valid only after [`advance`](CodecCursor::advance) returned `true`.
     ///
     /// # Errors
     ///
@@ -198,9 +198,9 @@ pub trait KeyedCodec: Codec {
     /// A stateful writer that encodes items with their keys.
     type KeyedWriter<W: Write>: KeyedCodecWriter<Self::Item, Self::Key, Error = Self::Error>;
 
-    /// A stateful reader that can retrieve keys and records
+    /// A stateful cursor that can retrieve keys and records
     /// independently.
-    type KeyedReader<R: Read>: KeyedCodecReader<Self::Item, Self::Key, Error = Self::Error>;
+    type KeyedCursor<R: Read>: KeyedCodecCursor<Self::Item, Self::Key, Error = Self::Error>;
 
     /// Derive the record key for an item. Called by the sorter
     /// during flush to compute keys before writing them to disk
@@ -211,8 +211,8 @@ pub trait KeyedCodec: Codec {
     /// into `dest`.
     fn keyed_writer<W: Write>(&self, dest: W) -> Self::KeyedWriter<W>;
 
-    /// Create a keyed reader over a byte source.
-    fn keyed_reader<R: Read>(&self, source: R) -> Self::KeyedReader<R>;
+    /// Create a keyed cursor over a byte source.
+    fn keyed_cursor<R: Read>(&self, source: R) -> Self::KeyedCursor<R>;
 }
 
 #[cfg(test)]
@@ -247,7 +247,7 @@ mod tests {
         current: Option<u64>,
     }
 
-    impl<R: Read> CodecReader<u64> for U64Reader<R> {
+    impl<R: Read> CodecCursor<u64> for U64Reader<R> {
         type Error = std::io::Error;
         type Current<'a>
             = u64
@@ -287,7 +287,7 @@ mod tests {
         type Item = u64;
         type Error = std::io::Error;
         type Writer<W: Write> = U64Writer<W>;
-        type Reader<R: Read> = U64Reader<R>;
+        type Cursor<R: Read> = U64Reader<R>;
 
         fn writer<W: Write>(&self, dest: W) -> U64Writer<W> {
             U64Writer {
@@ -295,7 +295,7 @@ mod tests {
             }
         }
 
-        fn reader<R: Read>(&self, source: R) -> U64Reader<R> {
+        fn cursor<R: Read>(&self, source: R) -> U64Reader<R> {
             U64Reader {
                 inner: source,
                 current: None,
@@ -311,7 +311,7 @@ mod tests {
         writer.finish().expect("finish should succeed");
         assert_eq!(buf.len(), 8, "u64 should write exactly 8 bytes");
 
-        let mut reader = U64Codec.reader(std::io::Cursor::new(&buf));
+        let mut reader = U64Codec.cursor(std::io::Cursor::new(&buf));
         assert!(reader.advance().expect("advance should succeed"));
         let visited = reader
             .with_current(|item| item)
@@ -331,7 +331,7 @@ mod tests {
         }
         writer.finish().expect("finish should succeed");
 
-        let mut reader = U64Codec.reader(std::io::Cursor::new(&buf));
+        let mut reader = U64Codec.cursor(std::io::Cursor::new(&buf));
         let mut recovered = Vec::new();
         while reader.advance().expect("advance should succeed") {
             recovered.push(reader.current().expect("current should succeed"));
@@ -346,7 +346,7 @@ mod tests {
     #[test]
     fn codec_read_empty_returns_none() {
         let buf: Vec<u8> = Vec::new();
-        let mut reader = U64Codec.reader(std::io::Cursor::new(&buf));
+        let mut reader = U64Codec.cursor(std::io::Cursor::new(&buf));
         let result = reader.advance().expect("reading empty should not error");
         assert!(!result, "reading from an empty source should return false");
     }
@@ -354,7 +354,7 @@ mod tests {
     #[test]
     fn codec_read_truncated_returns_error() {
         let buf = vec![0u8; 3]; // less than 8 bytes
-        let mut reader = U64Codec.reader(std::io::Cursor::new(&buf));
+        let mut reader = U64Codec.cursor(std::io::Cursor::new(&buf));
         let result = reader.advance();
         assert!(
             result.is_err(),

@@ -16,7 +16,7 @@
 use std::{cmp::Reverse, collections::BinaryHeap, num::NonZeroUsize, path::PathBuf};
 
 use crate::{
-    codec::{Codec, CodecReader, CodecWriter, KeyedCodec, KeyedCodecReader, KeyedCodecWriter},
+    codec::{Codec, CodecCursor, CodecWriter, KeyedCodec, KeyedCodecCursor, KeyedCodecWriter},
     compare::{Compare, WithOrd},
 };
 
@@ -146,14 +146,14 @@ pub(crate) trait MergeReader {
 
 /// Basic merge reader: heap holds full records.
 pub(crate) struct BasicMergeReader<T, C: Codec<Item = T>> {
-    reader: C::Reader<std::fs::File>,
+    reader: C::Cursor<std::fs::File>,
     _item: std::marker::PhantomData<fn() -> T>,
 }
 
 impl<T, C: Codec<Item = T>> BasicMergeReader<T, C> {
     pub fn new(codec: C, file: std::fs::File) -> Self {
         Self {
-            reader: codec.reader(file),
+            reader: codec.cursor(file),
             _item: std::marker::PhantomData,
         }
     }
@@ -183,14 +183,14 @@ where
 /// Keyed merge reader: heap holds compact keys, records
 /// fetched on demand for the winner only.
 pub(crate) struct KeyedMergeReader<T, C: KeyedCodec<Item = T>> {
-    reader: C::KeyedReader<std::fs::File>,
+    reader: C::KeyedCursor<std::fs::File>,
     _item: std::marker::PhantomData<fn() -> T>,
 }
 
 impl<T, C: KeyedCodec<Item = T>> KeyedMergeReader<T, C> {
     pub fn new(codec: C, file: std::fs::File) -> Self {
         Self {
-            reader: codec.keyed_reader(file),
+            reader: codec.keyed_cursor(file),
             _item: std::marker::PhantomData,
         }
     }
@@ -734,7 +734,7 @@ mod tests {
         current: Option<u64>,
     }
 
-    impl<R: Read> CodecReader<u64> for U64Reader<R> {
+    impl<R: Read> CodecCursor<u64> for U64Reader<R> {
         type Error = std::io::Error;
         type Current<'a>
             = u64
@@ -774,7 +774,7 @@ mod tests {
         type Item = u64;
         type Error = std::io::Error;
         type Writer<W: Write> = U64Writer<W>;
-        type Reader<R: Read> = U64Reader<R>;
+        type Cursor<R: Read> = U64Reader<R>;
 
         fn writer<W: Write>(&self, dest: W) -> U64Writer<W> {
             U64Writer {
@@ -782,7 +782,7 @@ mod tests {
             }
         }
 
-        fn reader<R: Read>(&self, source: R) -> U64Reader<R> {
+        fn cursor<R: Read>(&self, source: R) -> U64Reader<R> {
             U64Reader {
                 inner: source,
                 current: None,
@@ -811,7 +811,7 @@ mod tests {
         current: Option<u64>,
     }
 
-    impl<R: Read> CodecReader<u64> for U64KeyedReader<R> {
+    impl<R: Read> CodecCursor<u64> for U64KeyedReader<R> {
         type Error = std::io::Error;
         type Current<'a>
             = u64
@@ -851,7 +851,7 @@ mod tests {
         type Item = u64;
         type Error = std::io::Error;
         type Writer<W: Write> = U64KeyedWriter<W>;
-        type Reader<R: Read> = U64KeyedReader<R>;
+        type Cursor<R: Read> = U64KeyedReader<R>;
 
         fn writer<W: Write>(&self, dest: W) -> U64KeyedWriter<W> {
             U64KeyedWriter {
@@ -859,7 +859,7 @@ mod tests {
             }
         }
 
-        fn reader<R: Read>(&self, source: R) -> U64KeyedReader<R> {
+        fn cursor<R: Read>(&self, source: R) -> U64KeyedReader<R> {
             U64KeyedReader {
                 inner: source,
                 current: None,
@@ -890,7 +890,7 @@ mod tests {
         current: Option<u64>,
     }
 
-    impl<R: Read> CodecReader<u64> for U64OnlyKeyedReader<R> {
+    impl<R: Read> CodecCursor<u64> for U64OnlyKeyedReader<R> {
         type Error = std::io::Error;
         type Current<'a>
             = u64
@@ -929,7 +929,7 @@ mod tests {
         }
     }
 
-    impl<R: Read> KeyedCodecReader<u64, u8> for U64OnlyKeyedReader<R> {
+    impl<R: Read> KeyedCodecCursor<u64, u8> for U64OnlyKeyedReader<R> {
         fn current_key(&self) -> Result<u8, Self::Error> {
             self.current_key
                 .ok_or_else(|| std::io::Error::other("current_key called before advance"))
@@ -939,7 +939,7 @@ mod tests {
     impl KeyedCodec for U64KeyedCodec {
         type Key = u8;
         type KeyedWriter<W: Write> = U64OnlyKeyedWriter<W>;
-        type KeyedReader<R: Read> = U64OnlyKeyedReader<R>;
+        type KeyedCursor<R: Read> = U64OnlyKeyedReader<R>;
 
         fn derive_key(&self, item: &u64) -> u8 {
             // coarse key: values in the same decade tie
@@ -952,7 +952,7 @@ mod tests {
             }
         }
 
-        fn keyed_reader<R: Read>(&self, source: R) -> Self::KeyedReader<R> {
+        fn keyed_cursor<R: Read>(&self, source: R) -> Self::KeyedCursor<R> {
             U64OnlyKeyedReader {
                 inner: source,
                 current_key: None,

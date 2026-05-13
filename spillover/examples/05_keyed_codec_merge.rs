@@ -1,7 +1,7 @@
 use std::io::{BufReader, BufWriter, Read, Write};
 
 use spillover::{
-    codec::{Codec, CodecReader, CodecWriter, KeyedCodec, KeyedCodecReader, KeyedCodecWriter},
+    codec::{Codec, CodecCursor, CodecWriter, KeyedCodec, KeyedCodecCursor, KeyedCodecWriter},
     key::Owned,
     sorter::Builder,
 };
@@ -51,7 +51,7 @@ struct Reader<R: Read> {
     current: Option<u64>,
 }
 
-impl<R: Read> CodecReader<u64> for Reader<R> {
+impl<R: Read> CodecCursor<u64> for Reader<R> {
     type Error = std::io::Error;
     type Current<'a>
         = u64
@@ -90,7 +90,7 @@ impl<R: Read> CodecReader<u64> for Reader<R> {
     }
 }
 
-impl<R: Read> KeyedCodecReader<u64, u8> for Reader<R> {
+impl<R: Read> KeyedCodecCursor<u64, u8> for Reader<R> {
     fn current_key(&self) -> Result<u8, Self::Error> {
         self.current_key.ok_or_else(|| {
             std::io::Error::new(
@@ -105,7 +105,7 @@ impl Codec for DecadeKeyedCodec {
     type Item = u64;
     type Error = std::io::Error;
     type Writer<W: Write> = Writer<W>;
-    type Reader<R: Read> = Reader<R>;
+    type Cursor<R: Read> = Reader<R>;
 
     fn writer<W: Write>(&self, dest: W) -> Self::Writer<W> {
         Writer {
@@ -113,7 +113,7 @@ impl Codec for DecadeKeyedCodec {
         }
     }
 
-    fn reader<R: Read>(&self, source: R) -> Self::Reader<R> {
+    fn cursor<R: Read>(&self, source: R) -> Self::Cursor<R> {
         Reader {
             inner: BufReader::new(source),
             current_key: None,
@@ -125,7 +125,7 @@ impl Codec for DecadeKeyedCodec {
 impl KeyedCodec for DecadeKeyedCodec {
     type Key = u8;
     type KeyedWriter<W: Write> = Writer<W>;
-    type KeyedReader<R: Read> = Reader<R>;
+    type KeyedCursor<R: Read> = Reader<R>;
 
     fn derive_key(&self, item: &u64) -> Self::Key {
         u8::try_from(*item / 10).expect("example values fit in u8 decade key")
@@ -135,8 +135,8 @@ impl KeyedCodec for DecadeKeyedCodec {
         self.writer(dest)
     }
 
-    fn keyed_reader<R: Read>(&self, source: R) -> Self::KeyedReader<R> {
-        self.reader(source)
+    fn keyed_cursor<R: Read>(&self, source: R) -> Self::KeyedCursor<R> {
+        self.cursor(source)
     }
 }
 

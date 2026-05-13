@@ -601,7 +601,7 @@ mod tests {
 
     use super::*;
     use crate::{
-        codec::{CodecReader, CodecWriter},
+        codec::{CodecCursor, CodecWriter},
         compare::Reverse,
         dedup::AdjacentDedup,
         key::Owned,
@@ -631,7 +631,7 @@ mod tests {
         current: Option<u64>,
     }
 
-    impl<R: Read> CodecReader<u64> for U64Reader<R> {
+    impl<R: Read> CodecCursor<u64> for U64Reader<R> {
         type Error = std::io::Error;
         type Current<'a>
             = u64
@@ -671,7 +671,7 @@ mod tests {
         type Item = u64;
         type Error = std::io::Error;
         type Writer<W: Write> = U64Writer<W>;
-        type Reader<R: Read> = U64Reader<R>;
+        type Cursor<R: Read> = U64Reader<R>;
 
         fn writer<W: Write>(&self, dest: W) -> U64Writer<W> {
             U64Writer {
@@ -679,7 +679,7 @@ mod tests {
             }
         }
 
-        fn reader<R: Read>(&self, source: R) -> U64Reader<R> {
+        fn cursor<R: Read>(&self, source: R) -> U64Reader<R> {
             U64Reader {
                 inner: source,
                 current: None,

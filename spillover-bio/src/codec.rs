@@ -11,7 +11,7 @@
 //!   full-record fallback when keys tie).
 //!
 //! Both are `Copy` configuration markers — stateful writers and
-//! readers are created by the merge engine as needed. Thin newtype
+//! cursors are created by the merge engine as needed. Thin newtype
 //! adapters bridge dryice's types to spillover's traits.
 
 use std::{
@@ -24,7 +24,7 @@ use dryice::{
     RawQualityCodec, RecordKey, SeqRecordLike, SequenceCodec,
 };
 use spillover::codec::{
-    Codec, CodecReader, CodecWriter, KeyedCodec, KeyedCodecReader, KeyedCodecWriter,
+    Codec, CodecCursor, CodecWriter, KeyedCodec, KeyedCodecCursor, KeyedCodecWriter,
 };
 
 use crate::record::{SeqRecord, SeqRecordParts, SeqRecordView};
@@ -340,12 +340,12 @@ impl<
 // ── Reader adapters ──────────────────────────────────────────
 
 /// Newtype wrapping an unkeyed [`DryIceReader`] to implement
-/// spillover's [`CodecReader`]. Yields owned [`SeqRecord`] values.
+/// spillover's [`CodecCursor`]. Yields owned [`SeqRecord`] values.
 pub struct UnkeyedReaderAdapter<R, S: SequenceCodec, Q: QualityCodec, N: NameCodec>(
     DryIceReader<R, S, Q, N, dryice::NoRecordKey>,
 );
 
-impl<R: Read, S: SequenceCodec, Q: QualityCodec, N: NameCodec> CodecReader<SeqRecord>
+impl<R: Read, S: SequenceCodec, Q: QualityCodec, N: NameCodec> CodecCursor<SeqRecord>
     for UnkeyedReaderAdapter<R, S, Q, N>
 {
     type Error = DryIceError;
@@ -379,12 +379,12 @@ impl<R: Read, S: SequenceCodec, Q: QualityCodec, N: NameCodec> CodecReader<SeqRe
 }
 
 /// Newtype wrapping a keyed [`DryIceReader`] to implement both
-/// [`CodecReader`] and [`KeyedCodecReader`].
+/// [`CodecCursor`] and [`KeyedCodecCursor`].
 pub struct KeyedReaderAdapter<R, S: SequenceCodec, Q: QualityCodec, N: NameCodec, K>(
     DryIceReader<R, S, Q, N, K>,
 );
 
-impl<R: Read, S: SequenceCodec, Q: QualityCodec, N: NameCodec, K: RecordKey> CodecReader<SeqRecord>
+impl<R: Read, S: SequenceCodec, Q: QualityCodec, N: NameCodec, K: RecordKey> CodecCursor<SeqRecord>
     for KeyedReaderAdapter<R, S, Q, N, K>
 {
     type Error = DryIceError;
@@ -418,7 +418,7 @@ impl<R: Read, S: SequenceCodec, Q: QualityCodec, N: NameCodec, K: RecordKey> Cod
 }
 
 impl<R: Read, S: SequenceCodec, Q: QualityCodec, N: NameCodec, K: RecordKey + Clone>
-    KeyedCodecReader<SeqRecord, K> for KeyedReaderAdapter<R, S, Q, N, K>
+    KeyedCodecCursor<SeqRecord, K> for KeyedReaderAdapter<R, S, Q, N, K>
 {
     fn current_key(&self) -> Result<K, DryIceError> {
         self.0.record_key()
@@ -431,7 +431,7 @@ impl<S: SequenceCodec, Q: QualityCodec, N: NameCodec> Codec for DryIceCodec<S, Q
     type Item = SeqRecord;
     type Error = DryIceError;
     type Writer<W: Write> = UnkeyedWriterAdapter<W, S, Q, N>;
-    type Reader<R: Read> = UnkeyedReaderAdapter<R, S, Q, N>;
+    type Cursor<R: Read> = UnkeyedReaderAdapter<R, S, Q, N>;
 
     fn writer<W: Write>(&self, dest: W) -> Self::Writer<W> {
         UnkeyedWriterAdapter(
@@ -445,7 +445,7 @@ impl<S: SequenceCodec, Q: QualityCodec, N: NameCodec> Codec for DryIceCodec<S, Q
         )
     }
 
-    fn reader<R: Read>(&self, source: R) -> Self::Reader<R> {
+    fn cursor<R: Read>(&self, source: R) -> Self::Cursor<R> {
         UnkeyedReaderAdapter(
             DryIceReader::with_codecs::<S, Q, N>(source)
                 .expect("dryice file header should be valid"),
@@ -459,7 +459,7 @@ impl<S: SequenceCodec, Q: QualityCodec, N: NameCodec, K: RecordKey + Clone> Code
     type Item = SeqRecord;
     type Error = DryIceError;
     type Writer<W: Write> = KeyedWriterAdapter<W, S, Q, N, K>;
-    type Reader<R: Read> = KeyedReaderAdapter<R, S, Q, N, K>;
+    type Cursor<R: Read> = KeyedReaderAdapter<R, S, Q, N, K>;
 
     fn writer<W: Write>(&self, dest: W) -> Self::Writer<W> {
         KeyedWriterAdapter(
@@ -474,7 +474,7 @@ impl<S: SequenceCodec, Q: QualityCodec, N: NameCodec, K: RecordKey + Clone> Code
         )
     }
 
-    fn reader<R: Read>(&self, source: R) -> Self::Reader<R> {
+    fn cursor<R: Read>(&self, source: R) -> Self::Cursor<R> {
         KeyedReaderAdapter(
             DryIceReader::open::<S, Q, N, K>(source).expect("dryice file header should be valid"),
         )
@@ -486,7 +486,7 @@ impl<S: SequenceCodec, Q: QualityCodec, N: NameCodec, K: RecordKey + Clone> Keye
 {
     type Key = K;
     type KeyedWriter<W: Write> = KeyedWriterAdapter<W, S, Q, N, K>;
-    type KeyedReader<R: Read> = KeyedReaderAdapter<R, S, Q, N, K>;
+    type KeyedCursor<R: Read> = KeyedReaderAdapter<R, S, Q, N, K>;
 
     fn derive_key(&self, item: &SeqRecord) -> K {
         (self.derive_key)(item)
@@ -505,7 +505,7 @@ impl<S: SequenceCodec, Q: QualityCodec, N: NameCodec, K: RecordKey + Clone> Keye
         )
     }
 
-    fn keyed_reader<R: Read>(&self, source: R) -> Self::KeyedReader<R> {
+    fn keyed_cursor<R: Read>(&self, source: R) -> Self::KeyedCursor<R> {
         KeyedReaderAdapter(
             DryIceReader::open::<S, Q, N, K>(source).expect("dryice file header should be valid"),
         )
@@ -536,7 +536,7 @@ mod tests {
         }
         writer.finish().expect("finish should succeed");
 
-        let mut reader = codec.reader(std::io::Cursor::new(&buf));
+        let mut reader = codec.cursor(std::io::Cursor::new(&buf));
         let mut recovered = Vec::new();
         while reader.advance().expect("advance should succeed") {
             reader
@@ -566,7 +566,7 @@ mod tests {
         }
         writer.finish().expect("finish should succeed");
 
-        let mut reader = codec.reader(std::io::Cursor::new(&buf));
+        let mut reader = codec.cursor(std::io::Cursor::new(&buf));
         let mut recovered = Vec::new();
         while reader.advance().expect("advance should succeed") {
             recovered.push(reader.current().expect("current should succeed"));
@@ -597,7 +597,7 @@ mod tests {
         }
         writer.finish().expect("finish should succeed");
 
-        let mut reader = codec.keyed_reader(std::io::Cursor::new(&buf));
+        let mut reader = codec.keyed_cursor(std::io::Cursor::new(&buf));
         let mut recovered_keys = Vec::new();
         let mut recovered_records = Vec::new();
         while reader.advance().expect("advance should succeed") {
@@ -631,7 +631,7 @@ mod tests {
         }
         writer.finish().expect("finish should succeed");
 
-        let mut reader = codec.keyed_reader(std::io::Cursor::new(&buf));
+        let mut reader = codec.keyed_cursor(std::io::Cursor::new(&buf));
         let mut recovered_records = Vec::new();
         while reader.advance().expect("advance should succeed") {
             recovered_records.push(reader.current().expect("current should succeed"));
@@ -648,7 +648,7 @@ mod tests {
         let writer = codec.writer(&mut buf);
         writer.finish().expect("finish empty should succeed");
 
-        let mut reader = codec.reader(std::io::Cursor::new(&buf));
+        let mut reader = codec.cursor(std::io::Cursor::new(&buf));
         assert!(
             !reader.advance().expect("advance should succeed"),
             "empty file should yield no records"
@@ -714,7 +714,7 @@ mod tests {
         }
         writer.finish().expect("finish should succeed");
 
-        let mut reader = codec.keyed_reader(std::io::Cursor::new(&buf));
+        let mut reader = codec.keyed_cursor(std::io::Cursor::new(&buf));
         let mut count = 0;
         while reader.advance().expect("advance") {
             let _key = reader.current_key().expect("current_key");
