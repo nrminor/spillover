@@ -5,8 +5,8 @@
 //! [`Compare`], [`Codec`], [`Dedup`], [`ChunkSorter`]) and the
 //! merge engine into a single, configurable pipeline. Construct
 //! one via the type-state [`Builder`], push items into it, and
-//! call [`finish`](Sorter::finish) to get a sorted, optionally
-//! deduplicated output iterator.
+//! call [`finish`](Sorter::finish) to get a finalized sorted output
+//! handle.
 //!
 //! [`SortKey`]: crate::key::SortKey
 //! [`Compare`]: crate::compare::Compare
@@ -375,6 +375,37 @@ pub struct Sorter<T, SK, Cod, Cmp, D, CS, M = Basic> {
     _marker: std::marker::PhantomData<M>,
 }
 
+/// Finalized sorted output.
+///
+/// `Sorted` owns the state needed to produce sorted items after a
+/// [`Sorter`] has been finished. It implements [`Iterator`] for the
+/// owned materialization path, so ordinary collection remains the
+/// primary way to collect sorted output into memory:
+///
+/// ```ignore
+/// let items: Vec<_> = sorter.finish()?.collect::<Result<Vec<_>, _>>()?;
+/// ```
+pub struct Sorted<I> {
+    source: I,
+}
+
+impl<I> Sorted<I> {
+    fn new(source: I) -> Self {
+        Self { source }
+    }
+}
+
+impl<I> Iterator for Sorted<I>
+where
+    I: Iterator,
+{
+    type Item = I::Item;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        self.source.next()
+    }
+}
+
 // ── Basic path: push + flush + finish ────────────────────
 
 impl<T, SK, Cod, Cmp, D, CS> Sorter<T, SK, Cod, Cmp, D, CS, Basic>
@@ -424,7 +455,8 @@ where
         Ok(())
     }
 
-    /// Flush remaining items, merge all sorted runs, apply dedup.
+    /// Flush remaining items, merge all sorted runs, apply dedup,
+    /// and return finalized sorted output.
     ///
     /// # Errors
     ///
@@ -437,7 +469,7 @@ where
     pub fn finish(
         mut self,
     ) -> Result<
-        impl Iterator<Item = Result<D::Output, MergeError<Cod::Error>>>,
+        Sorted<impl Iterator<Item = Result<D::Output, MergeError<Cod::Error>>>>,
         MergeError<Cod::Error>,
     >
     where
@@ -456,7 +488,7 @@ where
             .take()
             .expect("dedup is always Some until finish() consumes it");
 
-        Ok(dedup.dedup(merged))
+        Ok(Sorted::new(dedup.dedup(merged)))
     }
 }
 
@@ -525,7 +557,8 @@ where
         Ok(())
     }
 
-    /// Flush remaining items, merge all sorted runs, apply dedup.
+    /// Flush remaining items, merge all sorted runs, apply dedup,
+    /// and return finalized sorted output.
     ///
     /// # Errors
     ///
@@ -538,7 +571,7 @@ where
     pub fn finish(
         mut self,
     ) -> Result<
-        impl Iterator<Item = Result<D::Output, MergeError<Cod::Error>>>,
+        Sorted<impl Iterator<Item = Result<D::Output, MergeError<Cod::Error>>>>,
         MergeError<Cod::Error>,
     >
     where
@@ -558,7 +591,7 @@ where
             .take()
             .expect("dedup is always Some until finish() consumes it");
 
-        Ok(dedup.dedup(merged))
+        Ok(Sorted::new(dedup.dedup(merged)))
     }
 }
 

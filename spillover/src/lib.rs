@@ -21,3 +21,4 @@ pub mod sorter;
 
 pub use error::SpilloverError;
 pub use get_size2::GetSize;
+pub use sorter::Sorted;
