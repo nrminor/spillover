@@ -628,21 +628,42 @@ mod tests {
 
     struct U64Reader<R: Read> {
         inner: R,
+        current: Option<u64>,
     }
 
     impl<R: Read> CodecReader<u64> for U64Reader<R> {
         type Error = std::io::Error;
+        type Current<'a>
+            = u64
+        where
+            Self: 'a;
 
-        fn read(&mut self) -> Result<Option<u64>, Self::Error> {
+        fn advance(&mut self) -> Result<bool, Self::Error> {
             let mut buf = [0u8; 8];
             match self.inner.read(&mut buf[..1]) {
-                Ok(0) => Ok(None),
+                Ok(0) => {
+                    self.current = None;
+                    Ok(false)
+                }
                 Ok(_) => {
                     self.inner.read_exact(&mut buf[1..])?;
-                    Ok(Some(u64::from_le_bytes(buf)))
+                    self.current = Some(u64::from_le_bytes(buf));
+                    Ok(true)
                 }
                 Err(e) => Err(e),
             }
+        }
+
+        fn current(&mut self) -> Result<u64, Self::Error> {
+            self.current
+                .ok_or_else(|| std::io::Error::other("current called before advance"))
+        }
+
+        fn with_current<'a, F>(
+            &'a mut self,
+            f: impl FnOnce(Self::Current<'a>) -> F,
+        ) -> Result<F, Self::Error> {
+            self.current().map(f)
         }
     }
 
@@ -659,7 +680,10 @@ mod tests {
         }
 
         fn reader<R: Read>(&self, source: R) -> U64Reader<R> {
-            U64Reader { inner: source }
+            U64Reader {
+                inner: source,
+                current: None,
+            }
         }
     }
 

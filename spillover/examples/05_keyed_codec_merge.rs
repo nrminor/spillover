@@ -52,18 +52,38 @@ struct Reader<R: Read> {
 
 impl<R: Read> CodecReader<u64> for Reader<R> {
     type Error = std::io::Error;
+    type Current<'a>
+        = u64
+    where
+        Self: 'a;
 
-    fn read(&mut self) -> Result<Option<u64>, Self::Error> {
+    fn advance(&mut self) -> Result<bool, Self::Error> {
         let mut key = [0_u8; 1];
-        match self.inner.read_exact(&mut key) {
-            Ok(()) => {
+        match self.inner.read(&mut key) {
+            Ok(0) => {
+                self.current = None;
+                Ok(false)
+            }
+            Ok(_) => {
                 let mut bytes = [0_u8; 8];
                 self.inner.read_exact(&mut bytes)?;
-                Ok(Some(u64::from_le_bytes(bytes)))
+                self.current = Some(u64::from_le_bytes(bytes));
+                Ok(true)
             }
-            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => Ok(None),
             Err(e) => Err(e),
         }
+    }
+
+    fn current(&mut self) -> Result<u64, Self::Error> {
+        self.current
+            .ok_or_else(|| std::io::Error::other("current called before advance"))
+    }
+
+    fn with_current<'a, T>(
+        &'a mut self,
+        f: impl FnOnce(Self::Current<'a>) -> T,
+    ) -> Result<T, Self::Error> {
+        self.current().map(f)
     }
 }
 

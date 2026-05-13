@@ -30,18 +30,41 @@ impl<W: Write> CodecWriter<String> for LineWriter<W> {
 struct LineReader<R: std::io::Read> {
     inner: BufReader<R>,
     line: String,
+    current: Option<String>,
 }
 
 impl<R: std::io::Read> CodecReader<String> for LineReader<R> {
     type Error = std::io::Error;
+    type Current<'a>
+        = &'a str
+    where
+        Self: 'a;
 
-    fn read(&mut self) -> Result<Option<String>, Self::Error> {
+    fn advance(&mut self) -> Result<bool, Self::Error> {
         self.line.clear();
         let n = self.inner.read_line(&mut self.line)?;
         if n == 0 {
-            return Ok(None);
+            self.current = None;
+            return Ok(false);
         }
-        Ok(Some(self.line.trim_end().to_string()))
+        self.current = Some(self.line.trim_end().to_string());
+        Ok(true)
+    }
+
+    fn current(&mut self) -> Result<String, Self::Error> {
+        self.current
+            .take()
+            .ok_or_else(|| std::io::Error::other("current called before advance"))
+    }
+
+    fn with_current<'a, T>(
+        &'a mut self,
+        f: impl FnOnce(Self::Current<'a>) -> T,
+    ) -> Result<T, Self::Error> {
+        match self.current.as_deref() {
+            Some(current) => Ok(f(current)),
+            None => Err(std::io::Error::other("current called before advance")),
+        }
     }
 }
 
@@ -61,6 +84,7 @@ impl Codec for LineCodec {
         LineReader {
             inner: BufReader::new(source),
             line: String::new(),
+            current: None,
         }
     }
 }

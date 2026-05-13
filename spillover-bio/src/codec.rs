@@ -27,7 +27,7 @@ use spillover::codec::{
     Codec, CodecReader, CodecWriter, KeyedCodec, KeyedCodecReader, KeyedCodecWriter,
 };
 
-use crate::record::{SeqRecord, SeqRecordParts};
+use crate::record::{SeqRecord, SeqRecordParts, SeqRecordView};
 
 /// Compile-time marker for dryice codec type parameters.
 /// Uses the fn pointer pattern so the params don't impose
@@ -349,17 +349,32 @@ impl<R: Read, S: SequenceCodec, Q: QualityCodec, N: NameCodec> CodecReader<SeqRe
     for UnkeyedReaderAdapter<R, S, Q, N>
 {
     type Error = DryIceError;
+    type Current<'a>
+        = SeqRecordView<'a>
+    where
+        Self: 'a;
 
-    fn read(&mut self) -> Result<Option<SeqRecord>, DryIceError> {
-        if self.0.next_record()? {
-            Ok(Some(SeqRecord::from_slices(
-                self.0.name(),
-                self.0.sequence(),
-                self.0.quality(),
-            )))
-        } else {
-            Ok(None)
-        }
+    fn advance(&mut self) -> Result<bool, DryIceError> {
+        self.0.next_record()
+    }
+
+    fn current(&mut self) -> Result<SeqRecord, DryIceError> {
+        Ok(SeqRecord::from_slices(
+            self.0.name(),
+            self.0.sequence(),
+            self.0.quality(),
+        ))
+    }
+
+    fn with_current<'a, T>(
+        &'a mut self,
+        f: impl FnOnce(Self::Current<'a>) -> T,
+    ) -> Result<T, DryIceError> {
+        Ok(f(SeqRecordView::new(
+            self.0.name(),
+            self.0.sequence(),
+            self.0.quality(),
+        )))
     }
 }
 
@@ -373,17 +388,32 @@ impl<R: Read, S: SequenceCodec, Q: QualityCodec, N: NameCodec, K: RecordKey> Cod
     for KeyedReaderAdapter<R, S, Q, N, K>
 {
     type Error = DryIceError;
+    type Current<'a>
+        = SeqRecordView<'a>
+    where
+        Self: 'a;
 
-    fn read(&mut self) -> Result<Option<SeqRecord>, DryIceError> {
-        if self.0.next_record()? {
-            Ok(Some(SeqRecord::from_slices(
-                self.0.name(),
-                self.0.sequence(),
-                self.0.quality(),
-            )))
-        } else {
-            Ok(None)
-        }
+    fn advance(&mut self) -> Result<bool, DryIceError> {
+        self.0.next_record()
+    }
+
+    fn current(&mut self) -> Result<SeqRecord, DryIceError> {
+        Ok(SeqRecord::from_slices(
+            self.0.name(),
+            self.0.sequence(),
+            self.0.quality(),
+        ))
+    }
+
+    fn with_current<'a, T>(
+        &'a mut self,
+        f: impl FnOnce(Self::Current<'a>) -> T,
+    ) -> Result<T, DryIceError> {
+        Ok(f(SeqRecordView::new(
+            self.0.name(),
+            self.0.sequence(),
+            self.0.quality(),
+        )))
     }
 }
 
@@ -522,8 +552,17 @@ mod tests {
 
         let mut reader = codec.reader(std::io::Cursor::new(&buf));
         let mut recovered = Vec::new();
-        while let Some(rec) = reader.read().expect("read should succeed") {
-            recovered.push(rec);
+        while reader.advance().expect("advance should succeed") {
+            reader
+                .with_current(|view| {
+                    assert_eq!(
+                        view,
+                        records[recovered.len()].as_view(),
+                        "current view should borrow the positioned record"
+                    );
+                })
+                .expect("with_current should succeed");
+            recovered.push(reader.current().expect("current should succeed"));
         }
 
         assert_eq!(recovered, records);
@@ -543,8 +582,8 @@ mod tests {
 
         let mut reader = codec.reader(std::io::Cursor::new(&buf));
         let mut recovered = Vec::new();
-        while let Some(rec) = reader.read().expect("read should succeed") {
-            recovered.push(rec);
+        while reader.advance().expect("advance should succeed") {
+            recovered.push(reader.current().expect("current should succeed"));
         }
 
         assert_eq!(recovered, records);
@@ -637,7 +676,7 @@ mod tests {
 
         let mut reader = codec.reader(std::io::Cursor::new(&buf));
         assert!(
-            reader.read().expect("read should succeed").is_none(),
+            !reader.advance().expect("advance should succeed"),
             "empty file should yield no records"
         );
     }

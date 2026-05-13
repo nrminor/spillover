@@ -38,16 +38,22 @@ impl<W: Write> CodecWriter<LogEvent> for LogWriter<W> {
 struct LogReader<R: std::io::Read> {
     inner: BufReader<R>,
     line: String,
+    current: Option<LogEvent>,
 }
 
 impl<R: std::io::Read> CodecReader<LogEvent> for LogReader<R> {
     type Error = std::io::Error;
+    type Current<'a>
+        = &'a LogEvent
+    where
+        Self: 'a;
 
-    fn read(&mut self) -> Result<Option<LogEvent>, Self::Error> {
+    fn advance(&mut self) -> Result<bool, Self::Error> {
         self.line.clear();
         let n = self.inner.read_line(&mut self.line)?;
         if n == 0 {
-            return Ok(None);
+            self.current = None;
+            return Ok(false);
         }
 
         let mut parts = self.line.trim_end().splitn(3, '\t');
@@ -71,11 +77,28 @@ impl<R: std::io::Read> CodecReader<LogEvent> for LogReader<R> {
             )
         })?;
 
-        Ok(Some(LogEvent {
+        self.current = Some(LogEvent {
             timestamp,
             level,
             message: msg.to_string(),
-        }))
+        });
+        Ok(true)
+    }
+
+    fn current(&mut self) -> Result<LogEvent, Self::Error> {
+        self.current
+            .take()
+            .ok_or_else(|| std::io::Error::other("current called before advance"))
+    }
+
+    fn with_current<'a, T>(
+        &'a mut self,
+        f: impl FnOnce(Self::Current<'a>) -> T,
+    ) -> Result<T, Self::Error> {
+        match self.current.as_ref() {
+            Some(current) => Ok(f(current)),
+            None => Err(std::io::Error::other("current called before advance")),
+        }
     }
 }
 
@@ -95,6 +118,7 @@ impl Codec for LogCodec {
         LogReader {
             inner: BufReader::new(source),
             line: String::new(),
+            current: None,
         }
     }
 }

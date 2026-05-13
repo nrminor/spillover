@@ -43,21 +43,55 @@ pub trait CodecWriter<I: ?Sized> {
     fn finish(self) -> Result<(), Self::Error>;
 }
 
-/// A stateful reader created by a [`Codec`] for reading items
+/// A stateful cursor created by a [`Codec`] for reading items
 /// back from a sorted run.
 pub trait CodecReader<T> {
     /// The error type for read failures.
     type Error: std::error::Error + Send + Sync + 'static;
 
-    /// Read the next item, or return `None` at clean EOF.
-    /// A partial read (some bytes but not a complete item)
-    /// should return an error, not `None`.
+    /// The cheapest representation of the current item for this reader.
+    ///
+    /// Readers backed by reusable decode buffers can expose borrowed views here.
+    /// Owned-only readers may use owned values or references to internally stored
+    /// owned values.
+    type Current<'a>
+    where
+        Self: 'a;
+
+    /// Advance to the next item, returning `false` at clean EOF.
+    /// A partial read (some bytes but not a complete item) should return an
+    /// error, not `false`.
     ///
     /// # Errors
     ///
-    /// Returns an error if decoding fails or the stream
-    /// contains a partial record.
-    fn read(&mut self) -> Result<Option<T>, Self::Error>;
+    /// Returns an error if decoding fails or the stream contains a partial
+    /// record.
+    fn advance(&mut self) -> Result<bool, Self::Error>;
+
+    /// Materialize the current item as an owned value.
+    ///
+    /// Valid only after [`advance`](Self::advance) returned `true`. Readers may
+    /// consume internal current-position state when materializing owned values,
+    /// so callers should use either `current()` or `with_current(...)` for a
+    /// position before advancing again.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if decoding or materialization fails.
+    fn current(&mut self) -> Result<T, Self::Error>;
+
+    /// Visit the current item in this reader's cheapest representation.
+    ///
+    /// The value passed to the callback is valid only for the callback. This is
+    /// valid only after [`advance`](Self::advance) returned `true`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if decoding or current-item access fails.
+    fn with_current<'a, R>(
+        &'a mut self,
+        f: impl FnOnce(Self::Current<'a>) -> R,
+    ) -> Result<R, Self::Error>;
 }
 
 /// Defines the on-disk format for sorted runs.
@@ -220,21 +254,42 @@ mod tests {
 
     struct U64Reader<R: Read> {
         inner: R,
+        current: Option<u64>,
     }
 
     impl<R: Read> CodecReader<u64> for U64Reader<R> {
         type Error = std::io::Error;
+        type Current<'a>
+            = u64
+        where
+            Self: 'a;
 
-        fn read(&mut self) -> Result<Option<u64>, Self::Error> {
+        fn advance(&mut self) -> Result<bool, Self::Error> {
             let mut buf = [0u8; 8];
             match self.inner.read(&mut buf[..1]) {
-                Ok(0) => Ok(None),
+                Ok(0) => {
+                    self.current = None;
+                    Ok(false)
+                }
                 Ok(_) => {
                     self.inner.read_exact(&mut buf[1..])?;
-                    Ok(Some(u64::from_le_bytes(buf)))
+                    self.current = Some(u64::from_le_bytes(buf));
+                    Ok(true)
                 }
                 Err(e) => Err(e),
             }
+        }
+
+        fn current(&mut self) -> Result<u64, Self::Error> {
+            self.current
+                .ok_or_else(|| std::io::Error::other("current called before advance"))
+        }
+
+        fn with_current<'a, F>(
+            &'a mut self,
+            f: impl FnOnce(Self::Current<'a>) -> F,
+        ) -> Result<F, Self::Error> {
+            self.current().map(f)
         }
     }
 
@@ -251,7 +306,10 @@ mod tests {
         }
 
         fn reader<R: Read>(&self, source: R) -> U64Reader<R> {
-            U64Reader { inner: source }
+            U64Reader {
+                inner: source,
+                current: None,
+            }
         }
     }
 
@@ -264,10 +322,12 @@ mod tests {
         assert_eq!(buf.len(), 8, "u64 should write exactly 8 bytes");
 
         let mut reader = U64Codec.reader(std::io::Cursor::new(&buf));
-        let item = reader
-            .read()
-            .expect("read should succeed")
-            .expect("should find one item");
+        assert!(reader.advance().expect("advance should succeed"));
+        let visited = reader
+            .with_current(|item| item)
+            .expect("with_current should succeed");
+        assert_eq!(visited, 42, "current representation should match");
+        let item = reader.current().expect("current should succeed");
         assert_eq!(item, 42, "round-tripped value should match");
     }
 
@@ -283,8 +343,8 @@ mod tests {
 
         let mut reader = U64Codec.reader(std::io::Cursor::new(&buf));
         let mut recovered = Vec::new();
-        while let Some(v) = reader.read().expect("read should succeed") {
-            recovered.push(v);
+        while reader.advance().expect("advance should succeed") {
+            recovered.push(reader.current().expect("current should succeed"));
         }
 
         assert_eq!(
@@ -297,18 +357,15 @@ mod tests {
     fn codec_read_empty_returns_none() {
         let buf: Vec<u8> = Vec::new();
         let mut reader = U64Codec.reader(std::io::Cursor::new(&buf));
-        let result = reader.read().expect("reading empty should not error");
-        assert!(
-            result.is_none(),
-            "reading from an empty source should return None"
-        );
+        let result = reader.advance().expect("reading empty should not error");
+        assert!(!result, "reading from an empty source should return false");
     }
 
     #[test]
     fn codec_read_truncated_returns_error() {
         let buf = vec![0u8; 3]; // less than 8 bytes
         let mut reader = U64Codec.reader(std::io::Cursor::new(&buf));
-        let result = reader.read();
+        let result = reader.advance();
         assert!(
             result.is_err(),
             "reading a partial record should return an error, not None"
