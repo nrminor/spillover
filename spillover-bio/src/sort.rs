@@ -403,7 +403,62 @@ pub const LENGTH_ORDER: LengthOrder = LengthOrder;
 #[derive(Debug, Clone, Copy)]
 enum RecordDedup {
     None,
-    Adjacent(fn(&SeqRecord, &SeqRecord) -> bool),
+    Adjacent(fn(&PreviousRecord, &SeqRecord) -> bool),
+}
+
+#[derive(Debug, Default)]
+struct PreviousRecord {
+    bytes: Vec<u8>,
+    name_len: usize,
+    sequence_len: usize,
+}
+
+impl PreviousRecord {
+    fn copy_from<R: SeqRecordParts + ?Sized>(&mut self, record: &R) {
+        let total_len = record.name().len() + record.sequence().len() + record.quality().len();
+
+        self.bytes.clear();
+        self.bytes.reserve(total_len);
+        self.name_len = record.name().len();
+        self.sequence_len = record.sequence().len();
+        self.bytes.extend_from_slice(record.name());
+        self.bytes.extend_from_slice(record.sequence());
+        self.bytes.extend_from_slice(record.quality());
+    }
+
+    fn sequence_start(&self) -> usize {
+        self.name_len
+    }
+
+    fn sequence_end(&self) -> usize {
+        self.name_len + self.sequence_len
+    }
+}
+
+impl SeqRecordParts for PreviousRecord {
+    fn name(&self) -> &[u8] {
+        &self.bytes[..self.name_len]
+    }
+
+    fn sequence(&self) -> &[u8] {
+        &self.bytes[self.sequence_start()..self.sequence_end()]
+    }
+
+    fn quality(&self) -> &[u8] {
+        &self.bytes[self.sequence_end()..]
+    }
+}
+
+fn records_have_same_name(previous: &PreviousRecord, current: &SeqRecord) -> bool {
+    previous.name() == current.name()
+}
+
+fn records_have_same_sequence(previous: &PreviousRecord, current: &SeqRecord) -> bool {
+    previous.sequence() == current.sequence()
+}
+
+fn records_have_same_sequence_and_quality(previous: &PreviousRecord, current: &SeqRecord) -> bool {
+    previous.sequence() == current.sequence() && previous.quality() == current.quality()
 }
 
 /// Builder marker: no sort order chosen yet.
@@ -543,7 +598,7 @@ pub struct Sorter<SK, Cod, Cmp, CS, M> {
 pub struct SortedRecordStream<I> {
     inner: spillover::Sorted<I>,
     dedup: RecordDedup,
-    last_emitted: Option<SeqRecord>,
+    previous: Option<PreviousRecord>,
     fused: bool,
 }
 
@@ -610,7 +665,7 @@ where
             match self.inner.next() {
                 Some(Ok(record)) => {
                     let is_duplicate = self
-                        .last_emitted
+                        .previous
                         .as_ref()
                         .is_some_and(|previous| eq_fn(previous, &record));
 
@@ -618,7 +673,9 @@ where
                         continue;
                     }
 
-                    self.last_emitted = Some(record.clone());
+                    self.previous
+                        .get_or_insert_with(PreviousRecord::default)
+                        .copy_from(&record);
                     return Some(Ok(record));
                 }
                 Some(Err(err)) => {
@@ -719,7 +776,7 @@ where
         Ok(SortedRecordStream {
             inner: self.inner.finish()?,
             dedup: self.dedup,
-            last_emitted: None,
+            previous: None,
             fused: false,
         })
     }
@@ -759,7 +816,7 @@ where
         Ok(SortedRecordStream {
             inner: self.inner.finish()?,
             dedup: self.dedup,
-            last_emitted: None,
+            previous: None,
             fused: false,
         })
     }
@@ -894,23 +951,6 @@ impl<O, C, CS> Builder<O, C, NeedsFlush, CS> {
 // Optional configuration.
 
 impl<O, C, F, CS> Builder<O, C, F, CS> {
-    /// Deduplicate adjacent sorted records with a custom predicate.
-    ///
-    /// The predicate receives the previous emitted record and the current
-    /// candidate record. Return `true` when the current record should be treated
-    /// as a duplicate and skipped.
-    #[must_use]
-    pub fn dedup_by(self, eq_fn: fn(&SeqRecord, &SeqRecord) -> bool) -> Builder<O, C, F, CS> {
-        Builder {
-            order: self.order,
-            codec: self.codec,
-            flush: self.flush,
-            dedup: RecordDedup::Adjacent(eq_fn),
-            chunk_sort: self.chunk_sort,
-            merge_config: self.merge_config,
-        }
-    }
-
     /// Set a custom chunk sorting strategy. Defaults to
     /// [`Sequential`].
     #[must_use]
@@ -935,30 +975,41 @@ impl<O, C, F, CS> Builder<O, C, F, CS> {
     /// Deduplicate adjacent records with identical names.
     #[must_use]
     pub fn dedup_by_name(self) -> Builder<O, C, F, CS> {
-        self.dedup_by(
-            (|a: &SeqRecord, b: &SeqRecord| a.name() == b.name())
-                as fn(&SeqRecord, &SeqRecord) -> bool,
-        )
+        Builder {
+            order: self.order,
+            codec: self.codec,
+            flush: self.flush,
+            dedup: RecordDedup::Adjacent(records_have_same_name),
+            chunk_sort: self.chunk_sort,
+            merge_config: self.merge_config,
+        }
     }
 
     /// Deduplicate adjacent records with identical sequences.
     #[must_use]
     pub fn dedup_by_sequence(self) -> Builder<O, C, F, CS> {
-        self.dedup_by(
-            (|a: &SeqRecord, b: &SeqRecord| a.sequence() == b.sequence())
-                as fn(&SeqRecord, &SeqRecord) -> bool,
-        )
+        Builder {
+            order: self.order,
+            codec: self.codec,
+            flush: self.flush,
+            dedup: RecordDedup::Adjacent(records_have_same_sequence),
+            chunk_sort: self.chunk_sort,
+            merge_config: self.merge_config,
+        }
     }
 
     /// Deduplicate adjacent records with identical sequence and
     /// quality.
     #[must_use]
     pub fn dedup_by_sequence_and_quality(self) -> Builder<O, C, F, CS> {
-        self.dedup_by(
-            (|a: &SeqRecord, b: &SeqRecord| {
-                a.sequence() == b.sequence() && a.quality() == b.quality()
-            }) as fn(&SeqRecord, &SeqRecord) -> bool,
-        )
+        Builder {
+            order: self.order,
+            codec: self.codec,
+            flush: self.flush,
+            dedup: RecordDedup::Adjacent(records_have_same_sequence_and_quality),
+            chunk_sort: self.chunk_sort,
+            merge_config: self.merge_config,
+        }
     }
 
     /// Use single-threaded comparison sort for in-memory chunks.

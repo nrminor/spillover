@@ -456,7 +456,7 @@ fn dedup_removes_duplicate_sequences() {
     let mut sorter = Builder::new()
         .sort_by_illumina()
         .codec(DryIceCodec::new())
-        .dedup_by(|a: &SeqRecord, b: &SeqRecord| a.sequence() == b.sequence())
+        .dedup_by_sequence()
         .max_buffer_items(100)
         .build();
 
@@ -838,7 +838,7 @@ fn dedup_with_spilling_removes_cross_chunk_duplicates() {
     let mut sorter = Builder::new()
         .sort_by_illumina()
         .codec(DryIceCodec::new())
-        .dedup_by(|a: &SeqRecord, b: &SeqRecord| a.sequence() == b.sequence())
+        .dedup_by_sequence()
         .max_buffer_items(3)
         .build();
 
