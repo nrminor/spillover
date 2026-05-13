@@ -1,11 +1,7 @@
 use spillover_bio::{codec::DryIceCodec, record::SeqRecord, sort::Builder};
 
 fn rec(name: &str, qual: &str) -> SeqRecord {
-    SeqRecord::new(
-        name.as_bytes().to_vec(),
-        b"ACGTACGT".to_vec(),
-        qual.as_bytes().to_vec(),
-    )
+    SeqRecord::new(name.as_bytes(), b"ACGTACGT", qual.as_bytes())
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {

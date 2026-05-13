@@ -3,7 +3,7 @@
 use spillover_bio::{codec::DryIceCodec, record::SeqRecord, sort::Builder};
 
 fn make_record(name: &[u8], seq: &[u8], qual: &[u8]) -> SeqRecord {
-    SeqRecord::new(name.to_vec(), seq.to_vec(), qual.to_vec())
+    SeqRecord::new(name, seq, qual)
 }
 
 #[test]
@@ -784,7 +784,7 @@ mod proptests {
     /// (no padding ambiguity with trailing A's).
     fn arb_record(seq_len: usize) -> impl Strategy<Value = SeqRecord> {
         (arb_fixed_len_sequence(seq_len), arb_quality(seq_len))
-            .prop_map(|(seq, qual)| SeqRecord::new(b"r".to_vec(), seq, qual))
+            .prop_map(|(seq, qual)| SeqRecord::new(b"r", seq, qual))
     }
 
     proptest! {

@@ -309,10 +309,10 @@ impl<R: Read, S: SequenceCodec, Q: QualityCodec, N: NameCodec> CodecReader<SeqRe
 
     fn read(&mut self) -> Result<Option<SeqRecord>, DryIceError> {
         if self.0.next_record()? {
-            Ok(Some(SeqRecord::new(
-                self.0.name().to_vec(),
-                self.0.sequence().to_vec(),
-                self.0.quality().to_vec(),
+            Ok(Some(SeqRecord::from_slices(
+                self.0.name(),
+                self.0.sequence(),
+                self.0.quality(),
             )))
         } else {
             Ok(None)
@@ -333,10 +333,10 @@ impl<R: Read, S: SequenceCodec, Q: QualityCodec, N: NameCodec, K: RecordKey> Cod
 
     fn read(&mut self) -> Result<Option<SeqRecord>, DryIceError> {
         if self.0.next_record()? {
-            Ok(Some(SeqRecord::new(
-                self.0.name().to_vec(),
-                self.0.sequence().to_vec(),
-                self.0.quality().to_vec(),
+            Ok(Some(SeqRecord::from_slices(
+                self.0.name(),
+                self.0.sequence(),
+                self.0.quality(),
             )))
         } else {
             Ok(None)
@@ -358,10 +358,10 @@ impl<R: Read, S: SequenceCodec, Q: QualityCodec, N: NameCodec, K: RecordKey + Cl
     }
 
     fn current_record(&mut self) -> Result<SeqRecord, DryIceError> {
-        Ok(SeqRecord::new(
-            self.0.name().to_vec(),
-            self.0.sequence().to_vec(),
-            self.0.quality().to_vec(),
+        Ok(SeqRecord::from_slices(
+            self.0.name(),
+            self.0.sequence(),
+            self.0.quality(),
         ))
     }
 }
@@ -457,9 +457,9 @@ mod tests {
 
     fn test_records() -> Vec<SeqRecord> {
         vec![
-            SeqRecord::new(b"r1".to_vec(), b"ACGT".to_vec(), b"!!!!".to_vec()),
-            SeqRecord::new(b"r2".to_vec(), b"TGCA".to_vec(), b"####".to_vec()),
-            SeqRecord::new(b"r3".to_vec(), b"AAAA".to_vec(), b"IIII".to_vec()),
+            SeqRecord::new(b"r1", b"ACGT", b"!!!!"),
+            SeqRecord::new(b"r2", b"TGCA", b"####"),
+            SeqRecord::new(b"r3", b"AAAA", b"IIII"),
         ]
     }
 

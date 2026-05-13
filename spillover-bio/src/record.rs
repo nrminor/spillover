@@ -1,8 +1,9 @@
 //! Sequence record type for spillover-bio.
 //!
-//! [`SeqRecord`] is the item type sorted by spillover-bio. It
-//! holds owned name, sequence, and quality bytes, and implements
-//! [`GetSize`] for accurate memory budget tracking.
+//! [`SeqRecord`] is the item type sorted by spillover-bio. It holds
+//! owned name, sequence, and quality bytes in one contiguous backing
+//! allocation, and implements [`GetSize`] for accurate memory budget
+//! tracking.
 //!
 //! Conversions to and from `dryice::SeqRecord` are provided via
 //! `From` impls, so records move between spillover-bio and dryice
@@ -84,38 +85,61 @@ impl<'a> SeqRecordView<'a> {
 /// decouple the public API from dryice's semver.
 #[derive(Debug, Clone, PartialEq, Eq, GetSize)]
 pub struct SeqRecord {
-    name: Vec<u8>,
-    sequence: Vec<u8>,
-    quality: Vec<u8>,
+    bytes: Box<[u8]>,
+    name_len: usize,
+    sequence_len: usize,
 }
 
 impl SeqRecord {
-    /// Create a new record from owned byte vectors.
+    /// Create a new record by copying field bytes into one
+    /// contiguous backing allocation.
     #[must_use]
-    pub fn new(name: Vec<u8>, sequence: Vec<u8>, quality: Vec<u8>) -> Self {
+    pub fn new(
+        name: impl AsRef<[u8]>,
+        sequence: impl AsRef<[u8]>,
+        quality: impl AsRef<[u8]>,
+    ) -> Self {
+        Self::from_slices(name.as_ref(), sequence.as_ref(), quality.as_ref())
+    }
+
+    /// Create a new record by copying borrowed field slices into one
+    /// contiguous backing allocation.
+    #[must_use]
+    pub fn from_slices(name: &[u8], sequence: &[u8], quality: &[u8]) -> Self {
+        let name_len = name.len();
+        let sequence_len = sequence.len();
+
+        let mut bytes = Vec::with_capacity(name.len() + sequence.len() + quality.len());
+        bytes.extend_from_slice(name);
+        bytes.extend_from_slice(sequence);
+        bytes.extend_from_slice(quality);
+
         Self {
-            name,
-            sequence,
-            quality,
+            bytes: bytes.into_boxed_slice(),
+            name_len,
+            sequence_len,
         }
     }
 
     /// The record name/identifier.
     #[must_use]
     pub fn name(&self) -> &[u8] {
-        &self.name
+        &self.bytes[..self.name_len]
     }
 
     /// The nucleotide sequence.
     #[must_use]
     pub fn sequence(&self) -> &[u8] {
-        &self.sequence
+        let start = self.name_len;
+        let end = start + self.sequence_len;
+        &self.bytes[start..end]
     }
 
     /// The quality scores.
     #[must_use]
     pub fn quality(&self) -> &[u8] {
-        &self.quality
+        let start = self.name_len + self.sequence_len;
+        &self.bytes[start..]
     }
 
     /// Borrow this record as a [`SeqRecordView`].
@@ -155,15 +179,15 @@ impl SeqRecordParts for SeqRecordView<'_> {
 
 impl SeqRecordLike for SeqRecord {
     fn name(&self) -> &[u8] {
-        &self.name
+        self.name()
     }
 
     fn sequence(&self) -> &[u8] {
-        &self.sequence
+        self.sequence()
     }
 
     fn quality(&self) -> &[u8] {
-        &self.quality
+        self.quality()
     }
 }
 
@@ -183,18 +207,18 @@ impl SeqRecordLike for SeqRecordView<'_> {
 
 impl From<dryice::SeqRecord> for SeqRecord {
     fn from(rec: dryice::SeqRecord) -> Self {
-        Self {
-            name: rec.name().to_vec(),
-            sequence: rec.sequence().to_vec(),
-            quality: rec.quality().to_vec(),
-        }
+        Self::from_slices(rec.name(), rec.sequence(), rec.quality())
     }
 }
 
 impl From<SeqRecord> for dryice::SeqRecord {
     fn from(rec: SeqRecord) -> Self {
-        dryice::SeqRecord::new(rec.name, rec.sequence, rec.quality)
-            .expect("spillover-bio SeqRecord fields are valid for dryice")
+        dryice::SeqRecord::new(
+            rec.name().to_vec(),
+            rec.sequence().to_vec(),
+            rec.quality().to_vec(),
+        )
+        .expect("spillover-bio SeqRecord fields are valid for dryice")
     }
 }
 
@@ -204,11 +228,7 @@ mod tests {
 
     #[test]
     fn record_accessors() {
-        let rec = SeqRecord::new(
-            b"read1".to_vec(),
-            b"ACGTACGT".to_vec(),
-            b"!!!!!!!!".to_vec(),
-        );
+        let rec = SeqRecord::new(b"read1", b"ACGTACGT", b"!!!!!!!!");
         assert_eq!(rec.name(), b"read1");
         assert_eq!(rec.sequence(), b"ACGTACGT");
         assert_eq!(rec.quality(), b"!!!!!!!!");
@@ -216,7 +236,7 @@ mod tests {
 
     #[test]
     fn round_trip_to_dryice() {
-        let rec = SeqRecord::new(b"read1".to_vec(), b"ACGT".to_vec(), b"!!!!".to_vec());
+        let rec = SeqRecord::new(b"read1", b"ACGT", b"!!!!");
         let dryice_rec: dryice::SeqRecord = rec.clone().into();
         let back: SeqRecord = dryice_rec.into();
         assert_eq!(rec, back);
@@ -224,7 +244,7 @@ mod tests {
 
     #[test]
     fn implements_seq_record_like() {
-        let rec = SeqRecord::new(b"r1".to_vec(), b"ACGT".to_vec(), b"!!!!".to_vec());
+        let rec = SeqRecord::new(b"r1", b"ACGT", b"!!!!");
         // SeqRecordLike is used by dryice writers.
         let like: &dyn SeqRecordLike = &rec;
         assert_eq!(like.sequence(), b"ACGT");
@@ -241,7 +261,7 @@ mod tests {
 
     #[test]
     fn seq_record_as_view_borrows_owned_record() {
-        let rec = SeqRecord::new(b"r1".to_vec(), b"ACGT".to_vec(), b"!!!!".to_vec());
+        let rec = SeqRecord::new(b"r1", b"ACGT", b"!!!!");
         let view = rec.as_view();
 
         assert_eq!(view.name(), rec.name());
@@ -255,7 +275,7 @@ mod tests {
             record.sequence_len()
         }
 
-        let rec = SeqRecord::new(b"r1".to_vec(), b"ACGT".to_vec(), b"!!!!".to_vec());
+        let rec = SeqRecord::new(b"r1", b"ACGT", b"!!!!");
         let view = rec.as_view();
 
         assert_eq!(sequence_len(&rec), 4);
@@ -275,11 +295,7 @@ mod tests {
 
     #[test]
     fn get_size_accounts_for_heap() {
-        let rec = SeqRecord::new(
-            b"read1".to_vec(),
-            b"ACGTACGT".to_vec(),
-            b"!!!!!!!!".to_vec(),
-        );
+        let rec = SeqRecord::new(b"read1", b"ACGTACGT", b"!!!!!!!!");
         let size = rec.get_size();
         assert!(
             size > std::mem::size_of::<SeqRecord>(),

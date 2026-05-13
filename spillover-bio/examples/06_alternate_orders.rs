@@ -5,11 +5,7 @@ use spillover_bio::{
 };
 
 fn rec(name: &str, seq: &str, qual: &str) -> SeqRecord {
-    SeqRecord::new(
-        name.as_bytes().to_vec(),
-        seq.as_bytes().to_vec(),
-        qual.as_bytes().to_vec(),
-    )
+    SeqRecord::new(name.as_bytes(), seq.as_bytes(), qual.as_bytes())
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {

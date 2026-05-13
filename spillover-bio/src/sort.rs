@@ -891,7 +891,7 @@ mod tests {
     use super::*;
 
     fn make_record(name: &[u8], seq: &[u8], qual: &[u8]) -> SeqRecord {
-        SeqRecord::new(name.to_vec(), seq.to_vec(), qual.to_vec())
+        SeqRecord::new(name, seq, qual)
     }
 
     // ── Sort key tests ───────────────────────────────────
