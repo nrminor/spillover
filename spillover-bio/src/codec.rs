@@ -420,22 +420,8 @@ impl<R: Read, S: SequenceCodec, Q: QualityCodec, N: NameCodec, K: RecordKey> Cod
 impl<R: Read, S: SequenceCodec, Q: QualityCodec, N: NameCodec, K: RecordKey + Clone>
     KeyedCodecReader<SeqRecord, K> for KeyedReaderAdapter<R, S, Q, N, K>
 {
-    type Error = DryIceError;
-
-    fn next_key(&mut self) -> Result<Option<K>, DryIceError> {
-        if self.0.next_record()? {
-            Ok(Some(self.0.record_key()?))
-        } else {
-            Ok(None)
-        }
-    }
-
-    fn current_record(&mut self) -> Result<SeqRecord, DryIceError> {
-        Ok(SeqRecord::from_slices(
-            self.0.name(),
-            self.0.sequence(),
-            self.0.quality(),
-        ))
+    fn current_key(&self) -> Result<K, DryIceError> {
+        self.0.record_key()
     }
 }
 
@@ -614,13 +600,9 @@ mod tests {
         let mut reader = codec.keyed_reader(std::io::Cursor::new(&buf));
         let mut recovered_keys = Vec::new();
         let mut recovered_records = Vec::new();
-        while let Some(key) = reader.next_key().expect("next_key should succeed") {
-            recovered_keys.push(key);
-            recovered_records.push(
-                reader
-                    .current_record()
-                    .expect("current_record should succeed"),
-            );
+        while reader.advance().expect("advance should succeed") {
+            recovered_keys.push(reader.current_key().expect("current_key should succeed"));
+            recovered_records.push(reader.current().expect("current should succeed"));
         }
 
         assert_eq!(recovered_records, records);
@@ -651,16 +633,8 @@ mod tests {
 
         let mut reader = codec.keyed_reader(std::io::Cursor::new(&buf));
         let mut recovered_records = Vec::new();
-        while reader
-            .next_key()
-            .expect("next_key should succeed")
-            .is_some()
-        {
-            recovered_records.push(
-                reader
-                    .current_record()
-                    .expect("current_record should succeed"),
-            );
+        while reader.advance().expect("advance should succeed") {
+            recovered_records.push(reader.current().expect("current should succeed"));
         }
 
         assert_eq!(recovered_records, records);
@@ -742,8 +716,9 @@ mod tests {
 
         let mut reader = codec.keyed_reader(std::io::Cursor::new(&buf));
         let mut count = 0;
-        while let Some(_key) = reader.next_key().expect("next_key") {
-            let _rec = reader.current_record().expect("current_record");
+        while reader.advance().expect("advance") {
+            let _key = reader.current_key().expect("current_key");
+            let _rec = reader.current().expect("current");
             count += 1;
         }
         assert_eq!(count, records.len());

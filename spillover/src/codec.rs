@@ -147,33 +147,23 @@ pub trait KeyedCodecWriter<I: ?Sized, K> {
     fn finish(self) -> Result<(), Self::Error>;
 }
 
-/// A stateful reader that separates key access from full record
-/// deserialization.
+/// A stateful cursor that separates key access from full record
+/// materialization.
 ///
-/// The merge engine calls [`next_key`](Self::next_key) to advance
-/// the reader and feed the heap, then
-/// [`current_record`](Self::current_record) only for the merge
-/// winner. This avoids deserializing records that lose the heap
-/// comparison.
-pub trait KeyedCodecReader<T, K> {
-    /// The error type, which must match the parent codec's error.
-    type Error: std::error::Error + Send + Sync + 'static;
-
-    /// Advance to the next entry and return its key. Returns
-    /// `None` at clean EOF.
+/// The merge engine calls [`advance`](CodecReader::advance) to position the
+/// reader, [`current_key`](Self::current_key) to feed the heap, and
+/// [`current`](CodecReader::current) or [`with_current`](CodecReader::with_current)
+/// only for the merge winner. This avoids materializing records that lose the
+/// heap comparison.
+pub trait KeyedCodecReader<T, K>: CodecReader<T> {
+    /// Return the stored key for the current entry.
+    ///
+    /// Valid only after [`advance`](CodecReader::advance) returned `true`.
     ///
     /// # Errors
     ///
     /// Returns an error if reading or decoding the key fails.
-    fn next_key(&mut self) -> Result<Option<K>, Self::Error>;
-
-    /// Retrieve the full record at the current position. Only
-    /// valid after [`next_key`](Self::next_key) returned `Some`.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if reading or decoding the record fails.
-    fn current_record(&mut self) -> Result<T, Self::Error>;
+    fn current_key(&self) -> Result<K, Self::Error>;
 }
 
 /// Extension trait for codecs that store a compact *record key*

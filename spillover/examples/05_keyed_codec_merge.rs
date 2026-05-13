@@ -47,6 +47,7 @@ impl<W: Write> KeyedCodecWriter<u64, u8> for Writer<W> {
 
 struct Reader<R: Read> {
     inner: BufReader<R>,
+    current_key: Option<u8>,
     current: Option<u64>,
 }
 
@@ -61,12 +62,14 @@ impl<R: Read> CodecReader<u64> for Reader<R> {
         let mut key = [0_u8; 1];
         match self.inner.read(&mut key) {
             Ok(0) => {
+                self.current_key = None;
                 self.current = None;
                 Ok(false)
             }
             Ok(_) => {
                 let mut bytes = [0_u8; 8];
                 self.inner.read_exact(&mut bytes)?;
+                self.current_key = Some(key[0]);
                 self.current = Some(u64::from_le_bytes(bytes));
                 Ok(true)
             }
@@ -88,30 +91,11 @@ impl<R: Read> CodecReader<u64> for Reader<R> {
 }
 
 impl<R: Read> KeyedCodecReader<u64, u8> for Reader<R> {
-    type Error = std::io::Error;
-
-    fn next_key(&mut self) -> Result<Option<u8>, Self::Error> {
-        let mut key = [0_u8; 1];
-        match self.inner.read_exact(&mut key) {
-            Ok(()) => {
-                let mut bytes = [0_u8; 8];
-                self.inner.read_exact(&mut bytes)?;
-                self.current = Some(u64::from_le_bytes(bytes));
-                Ok(Some(key[0]))
-            }
-            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
-                self.current = None;
-                Ok(None)
-            }
-            Err(e) => Err(e),
-        }
-    }
-
-    fn current_record(&mut self) -> Result<u64, Self::Error> {
-        self.current.ok_or_else(|| {
+    fn current_key(&self) -> Result<u8, Self::Error> {
+        self.current_key.ok_or_else(|| {
             std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
-                "current_record called before next_key",
+                "current_key called before advance",
             )
         })
     }
@@ -132,6 +116,7 @@ impl Codec for DecadeKeyedCodec {
     fn reader<R: Read>(&self, source: R) -> Self::Reader<R> {
         Reader {
             inner: BufReader::new(source),
+            current_key: None,
             current: None,
         }
     }

@@ -195,8 +195,8 @@ impl<T, C: KeyedCodec<Item = T>> KeyedMergeReader<T, C> {
         }
     }
 
-    fn current_record(&mut self) -> Result<T, C::Error> {
-        self.reader.current_record()
+    fn current(&mut self) -> Result<T, C::Error> {
+        self.reader.current()
     }
 }
 
@@ -209,11 +209,15 @@ where
     type Error = C::Error;
 
     fn next(&mut self) -> Result<Option<C::Key>, C::Error> {
-        self.reader.next_key()
+        if self.reader.advance()? {
+            self.reader.current_key().map(Some)
+        } else {
+            Ok(None)
+        }
     }
 
     fn output(&mut self, _key: C::Key) -> Result<T, C::Error> {
-        self.reader.current_record()
+        self.reader.current()
     }
 }
 
@@ -612,12 +616,12 @@ where
 
         let mut winner = 0usize;
         let mut winner_record = self.readers[tied[0].source_idx]
-            .current_record()
+            .current()
             .map_err(MergeError::Codec)?;
 
         for (idx, entry) in tied.iter().enumerate().skip(1) {
             let candidate = self.readers[entry.source_idx]
-                .current_record()
+                .current()
                 .map_err(MergeError::Codec)?;
             let ordering = self.item_cmp.compare(&candidate, &winner_record);
 
@@ -882,32 +886,53 @@ mod tests {
 
     struct U64OnlyKeyedReader<R: Read> {
         inner: R,
+        current_key: Option<u8>,
         current: Option<u64>,
     }
 
-    impl<R: Read> KeyedCodecReader<u64, u8> for U64OnlyKeyedReader<R> {
+    impl<R: Read> CodecReader<u64> for U64OnlyKeyedReader<R> {
         type Error = std::io::Error;
+        type Current<'a>
+            = u64
+        where
+            Self: 'a;
 
-        fn next_key(&mut self) -> Result<Option<u8>, Self::Error> {
+        fn advance(&mut self) -> Result<bool, Self::Error> {
             let mut key = [0u8; 1];
             match self.inner.read(&mut key) {
                 Ok(0) => {
+                    self.current_key = None;
                     self.current = None;
-                    Ok(None)
+                    Ok(false)
                 }
                 Ok(_) => {
                     let mut item = [0u8; 8];
                     self.inner.read_exact(&mut item)?;
+                    self.current_key = Some(key[0]);
                     self.current = Some(u64::from_le_bytes(item));
-                    Ok(Some(key[0]))
+                    Ok(true)
                 }
                 Err(e) => Err(e),
             }
         }
 
-        fn current_record(&mut self) -> Result<u64, Self::Error> {
+        fn current(&mut self) -> Result<u64, Self::Error> {
             self.current
-                .ok_or_else(|| std::io::Error::other("current_record called without key"))
+                .ok_or_else(|| std::io::Error::other("current called before advance"))
+        }
+
+        fn with_current<'a, T>(
+            &'a mut self,
+            f: impl FnOnce(Self::Current<'a>) -> T,
+        ) -> Result<T, Self::Error> {
+            self.current().map(f)
+        }
+    }
+
+    impl<R: Read> KeyedCodecReader<u64, u8> for U64OnlyKeyedReader<R> {
+        fn current_key(&self) -> Result<u8, Self::Error> {
+            self.current_key
+                .ok_or_else(|| std::io::Error::other("current_key called before advance"))
         }
     }
 
@@ -930,6 +955,7 @@ mod tests {
         fn keyed_reader<R: Read>(&self, source: R) -> Self::KeyedReader<R> {
             U64OnlyKeyedReader {
                 inner: source,
+                current_key: None,
                 current: None,
             }
         }
