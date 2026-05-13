@@ -22,7 +22,7 @@ use std::io::{Read, Write};
 /// block for block-oriented formats). [`finish`](Self::finish)
 /// must be called after the last item to flush any buffered data
 /// and finalize the format.
-pub trait CodecWriter<T> {
+pub trait CodecWriter<I: ?Sized> {
     /// The error type for write failures.
     type Error: std::error::Error + Send + Sync + 'static;
 
@@ -31,7 +31,7 @@ pub trait CodecWriter<T> {
     /// # Errors
     ///
     /// Returns an error if encoding or writing fails.
-    fn write(&mut self, item: &T) -> Result<(), Self::Error>;
+    fn write(&mut self, item: &I) -> Result<(), Self::Error>;
 
     /// Flush any buffered data and finalize. Must be called
     /// after the last item — block-oriented formats need this
@@ -91,7 +91,7 @@ pub trait Codec<T>: Copy {
 ///
 /// Created by [`KeyedCodec::keyed_writer`]. Like [`CodecWriter`],
 /// [`finish`](Self::finish) must be called after the last item.
-pub trait KeyedCodecWriter<T, K> {
+pub trait KeyedCodecWriter<I: ?Sized, K> {
     /// The error type for write failures.
     type Error: std::error::Error + Send + Sync + 'static;
 
@@ -100,7 +100,7 @@ pub trait KeyedCodecWriter<T, K> {
     /// # Errors
     ///
     /// Returns an error if encoding or writing fails.
-    fn write_keyed(&mut self, item: &T, key: &K) -> Result<(), Self::Error>;
+    fn write_keyed(&mut self, item: &I, key: &K) -> Result<(), Self::Error>;
 
     /// Flush any buffered data and finalize.
     ///
