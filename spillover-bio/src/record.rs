@@ -177,6 +177,12 @@ impl SeqRecordParts for SeqRecordView<'_> {
     }
 }
 
+impl From<SeqRecordView<'_>> for SeqRecord {
+    fn from(record: SeqRecordView<'_>) -> Self {
+        Self::from_slices(record.name(), record.sequence(), record.quality())
+    }
+}
+
 impl SeqRecordLike for SeqRecord {
     fn name(&self) -> &[u8] {
         self.name()
@@ -267,6 +273,16 @@ mod tests {
         assert_eq!(view.name(), rec.name());
         assert_eq!(view.sequence(), rec.sequence());
         assert_eq!(view.quality(), rec.quality());
+    }
+
+    #[test]
+    fn record_view_converts_to_owned_compact_record() {
+        let view = SeqRecordView::new(b"r1", b"ACGT", b"!!!!");
+        let rec = SeqRecord::from(view);
+
+        assert_eq!(rec.name(), b"r1");
+        assert_eq!(rec.sequence(), b"ACGT");
+        assert_eq!(rec.quality(), b"!!!!");
     }
 
     #[test]

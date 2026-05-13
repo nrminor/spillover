@@ -524,8 +524,8 @@ pub struct Builder<O = NeedsOrder, C = NeedsCodec, F = NeedsFlush, D = Identity,
 
 /// Active genomics sorter.
 ///
-/// Construct a sorter with [`Builder`], push unsorted [`SeqRecord`] values into
-/// it, then call [`finish`](Self::finish) to produce a [`SortedRecordStream`].
+/// Construct a sorter with [`Builder`], push unsorted records into it, then call
+/// [`finish`](Self::finish) to produce a [`SortedRecordStream`].
 pub struct Sorter<SK, Cod, Cmp, D, CS, M> {
     inner: spillover::sorter::Sorter<SeqRecord, SK, Cod, Cmp, D, CS, M>,
 }
@@ -588,8 +588,8 @@ where
     /// # Errors
     ///
     /// Returns an error if flushing buffered records to disk fails.
-    pub fn push(&mut self, record: SeqRecord) -> Result<(), MergeError<Cod::Error>> {
-        self.inner.push(record)
+    pub fn push(&mut self, record: impl Into<SeqRecord>) -> Result<(), MergeError<Cod::Error>> {
+        self.inner.push(record.into())
     }
 
     /// Finish sorting and return the finalized sorted record stream.
@@ -628,8 +628,8 @@ where
     /// # Errors
     ///
     /// Returns an error if flushing buffered records to disk fails.
-    pub fn push(&mut self, record: SeqRecord) -> Result<(), MergeError<Cod::Error>> {
-        self.inner.push(record)
+    pub fn push(&mut self, record: impl Into<SeqRecord>) -> Result<(), MergeError<Cod::Error>> {
+        self.inner.push(record.into())
     }
 
     /// Finish sorting and return the finalized sorted record stream.
