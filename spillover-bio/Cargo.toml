@@ -15,6 +15,7 @@ bitnuc = "0.4.1"
 dryice-bio = "0.1.2"
 get-size2 = { version = "0.7.4", features = ["derive"] }
 spillover = { version = "0.1.2", path = "../spillover" }
+thiserror = { workspace = true }
 
 [lints]
 workspace = true

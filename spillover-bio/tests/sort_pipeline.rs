@@ -1,13 +1,47 @@
 //! End-to-end integration tests for the spillover-bio sort pipeline.
 
+use dryice::SeqRecordLike;
 use spillover_bio::{
     codec::DryIceCodec,
-    record::SeqRecord,
-    sort::{Builder, ILLUMINA_ORDER},
+    error::SortedRecordStreamError,
+    record::{SeqRecord, SeqRecordParts},
+    sort::{Builder, ILLUMINA_ORDER, SeqRecordSink},
 };
 
 fn make_record(name: &[u8], seq: &[u8], qual: &[u8]) -> SeqRecord {
     SeqRecord::new(name, seq, qual)
+}
+
+#[derive(Default)]
+struct VecSink {
+    records: Vec<SeqRecord>,
+}
+
+impl SeqRecordSink for VecSink {
+    type Error = std::convert::Infallible;
+
+    fn write_record<R: SeqRecordParts + ?Sized>(&mut self, record: &R) -> Result<(), Self::Error> {
+        self.records.push(SeqRecord::from_slices(
+            record.name(),
+            record.sequence(),
+            record.quality(),
+        ));
+
+        Ok(())
+    }
+}
+
+struct FailingSink;
+
+impl SeqRecordSink for FailingSink {
+    type Error = std::io::Error;
+
+    fn write_record<R: SeqRecordParts + ?Sized>(&mut self, _record: &R) -> Result<(), Self::Error> {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::BrokenPipe,
+            "destination closed",
+        ))
+    }
 }
 
 #[test]
@@ -98,6 +132,94 @@ fn unkeyed_sorter_accepts_borrowed_record_views() {
     assert_eq!(results[0].sequence(), b"AAAAAAAA");
     assert_eq!(results[1].sequence(), b"CCCCCCCC");
     assert_eq!(results[2].sequence(), b"TTTTTTTT");
+}
+
+#[test]
+fn sorted_record_stream_writes_to_custom_sink() {
+    let mut sorter = Builder::new()
+        .sort_by_illumina()
+        .codec(DryIceCodec::new())
+        .max_buffer_items(2)
+        .build();
+
+    sorter
+        .push(make_record(b"r3", b"TTTTTTTT", b"!!!!!!!!"))
+        .expect("push");
+    sorter
+        .push(make_record(b"r1", b"AAAAAAAA", b"!!!!!!!!"))
+        .expect("push");
+    sorter
+        .push(make_record(b"r2", b"CCCCCCCC", b"!!!!!!!!"))
+        .expect("push");
+
+    let mut sink = VecSink::default();
+    sorter
+        .finish()
+        .expect("finish should succeed")
+        .write_to(&mut sink)
+        .expect("write_to should succeed");
+
+    assert_eq!(sink.records.len(), 3);
+    assert_eq!(sink.records[0].sequence(), b"AAAAAAAA");
+    assert_eq!(sink.records[1].sequence(), b"CCCCCCCC");
+    assert_eq!(sink.records[2].sequence(), b"TTTTTTTT");
+}
+
+#[test]
+fn sorted_record_stream_wraps_sink_errors() {
+    let mut sorter = Builder::new()
+        .sort_by_illumina()
+        .codec(DryIceCodec::new())
+        .max_buffer_items(2)
+        .build();
+
+    sorter
+        .push(make_record(b"r1", b"AAAAAAAA", b"!!!!!!!!"))
+        .expect("push");
+
+    let err = sorter
+        .finish()
+        .expect("finish should succeed")
+        .write_to(&mut FailingSink)
+        .expect_err("sink error should be wrapped");
+
+    assert!(matches!(err, SortedRecordStreamError::Sink(_)));
+}
+
+#[test]
+fn sorted_record_stream_writes_to_dryice_writer() {
+    let mut sorter = Builder::new()
+        .sort_by_illumina()
+        .codec(DryIceCodec::new())
+        .max_buffer_items(2)
+        .build();
+
+    sorter
+        .push(make_record(b"r3", b"TTTTTTTT", b"!!!!!!!!"))
+        .expect("push");
+    sorter
+        .push(make_record(b"r1", b"AAAAAAAA", b"!!!!!!!!"))
+        .expect("push");
+    sorter
+        .push(make_record(b"r2", b"CCCCCCCC", b"!!!!!!!!"))
+        .expect("push");
+
+    let mut output = Vec::new();
+    let mut writer = dryice::DryIceWriter::builder().inner(&mut output).build();
+    sorter
+        .finish()
+        .expect("finish should succeed")
+        .write_to(&mut writer)
+        .expect("write_to should succeed");
+    writer.finish().expect("writer should finish");
+
+    let mut reader = dryice::DryIceReader::new(output.as_slice()).expect("reader should open");
+    let mut sequences = Vec::new();
+    while reader.next_record().expect("reader should advance") {
+        sequences.push(reader.sequence().to_vec());
+    }
+
+    assert_eq!(sequences, [b"AAAAAAAA", b"CCCCCCCC", b"TTTTTTTT"]);
 }
 
 #[test]

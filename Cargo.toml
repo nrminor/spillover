@@ -19,6 +19,7 @@ unwrap_used = "deny"
 
 [workspace.dependencies]
 proptest = "1.10.0"
+thiserror = "2.0.18"
 
 [profile.dev]
 incremental = true

@@ -12,7 +12,8 @@
 //! The [`Builder`] is the main entry point for creating a sorter.
 
 use dryice::{
-    NameCodec, QualityCodec, RawAsciiCodec, RawNameCodec, RawQualityCodec, RecordKey, SequenceCodec,
+    DryIceWriter, NameCodec, QualityCodec, RawAsciiCodec, RawNameCodec, RawQualityCodec, RecordKey,
+    SequenceCodec,
 };
 use spillover::{
     chunk::{ChunkSorter, Sequential},
@@ -25,9 +26,10 @@ use spillover::{
 
 use crate::{
     codec::{DryIceCodec, KeyedDryIceCodec},
+    error::SortedRecordStreamError,
     key::PackedSequenceKey,
     radix::RadixThenRefine,
-    record::SeqRecord,
+    record::{SeqRecord, SeqRecordParts},
 };
 
 /// Sort key that extracts sequence and quality as a tuple.
@@ -539,6 +541,50 @@ pub struct SortedRecordStream<I> {
     inner: spillover::Sorted<I>,
 }
 
+/// Destination for sequence records produced by a sorted stream.
+pub trait SeqRecordSink {
+    /// Error returned when the destination fails to write a record.
+    type Error: std::error::Error + Send + Sync + 'static;
+
+    /// Write one sequence record to the destination.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the destination rejects the record or fails while
+    /// writing it.
+    fn write_record<R: SeqRecordParts + ?Sized>(&mut self, record: &R) -> Result<(), Self::Error>;
+}
+
+struct SeqRecordPartsAdapter<'a, R: ?Sized>(&'a R);
+
+impl<R: SeqRecordParts + ?Sized> dryice::SeqRecordLike for SeqRecordPartsAdapter<'_, R> {
+    fn name(&self) -> &[u8] {
+        self.0.name()
+    }
+
+    fn sequence(&self) -> &[u8] {
+        self.0.sequence()
+    }
+
+    fn quality(&self) -> &[u8] {
+        self.0.quality()
+    }
+}
+
+impl<W, S, Q, N> SeqRecordSink for DryIceWriter<W, S, Q, N, dryice::NoRecordKey>
+where
+    W: std::io::Write,
+    S: SequenceCodec,
+    Q: QualityCodec,
+    N: NameCodec,
+{
+    type Error = dryice::DryIceError;
+
+    fn write_record<R: SeqRecordParts + ?Sized>(&mut self, record: &R) -> Result<(), Self::Error> {
+        self.write_record(&SeqRecordPartsAdapter(record))
+    }
+}
+
 impl<I> Iterator for SortedRecordStream<I>
 where
     spillover::Sorted<I>: Iterator,
@@ -547,6 +593,37 @@ where
 
     fn next(&mut self) -> Option<Self::Item> {
         self.inner.next()
+    }
+}
+
+impl<I, RE> SortedRecordStream<I>
+where
+    spillover::Sorted<I>: Iterator<Item = Result<SeqRecord, RE>>,
+    RE: std::error::Error + Send + Sync + 'static,
+{
+    /// Write all sorted records to a destination sink.
+    ///
+    /// This initial implementation drains the stream through owned
+    /// [`SeqRecord`] values. Later allocation-light paths can preserve this
+    /// callsite while changing how records are visited internally.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SortedRecordStreamError::Source`] if the sorted stream fails to
+    /// produce a record, or [`SortedRecordStreamError::Sink`] if the destination
+    /// sink fails to write a record.
+    pub fn write_to<W>(self, writer: &mut W) -> Result<(), SortedRecordStreamError<RE, W::Error>>
+    where
+        W: SeqRecordSink,
+    {
+        for record in self {
+            let record = record.map_err(SortedRecordStreamError::Source)?;
+            writer
+                .write_record(&record)
+                .map_err(SortedRecordStreamError::Sink)?;
+        }
+
+        Ok(())
     }
 }
 

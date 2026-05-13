@@ -45,6 +45,7 @@
 !/spillover-bio/README.md
 !/spillover-bio/src
 !/spillover-bio/src/lib.rs
+!/spillover-bio/src/error.rs
 !/spillover-bio/src/record.rs
 !/spillover-bio/src/key.rs
 !/spillover-bio/src/codec.rs
