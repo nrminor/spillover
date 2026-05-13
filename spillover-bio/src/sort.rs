@@ -16,10 +16,11 @@ use dryice::{
 };
 use spillover::{
     chunk::{ChunkSorter, Sequential},
+    codec::{Codec, CodecWriter, KeyedCodec, KeyedCodecWriter},
     compare::{Compare, Natural},
     dedup::{AdjacentDedup, Dedup, Identity},
     key::SortKey,
-    merge::MergeConfig,
+    merge::{MergeConfig, MergeError},
 };
 
 use crate::{
@@ -521,6 +522,34 @@ pub struct Builder<O = NeedsOrder, C = NeedsCodec, F = NeedsFlush, D = Identity,
     merge_config: MergeConfig,
 }
 
+/// Active genomics sorter.
+///
+/// Construct a sorter with [`Builder`], push unsorted [`SeqRecord`] values into
+/// it, then call [`finish`](Self::finish) to produce a [`SortedRecordStream`].
+pub struct Sorter<SK, Cod, Cmp, D, CS, M> {
+    inner: spillover::sorter::Sorter<SeqRecord, SK, Cod, Cmp, D, CS, M>,
+}
+
+/// Finalized stream of sorted sequence records.
+///
+/// `SortedRecordStream` owns the sorted output source after a [`Sorter`] has
+/// been finished. It implements [`Iterator`] for owned materialization, so
+/// ordinary `.collect()` callsites continue to work.
+pub struct SortedRecordStream<I> {
+    inner: spillover::Sorted<I>,
+}
+
+impl<I> Iterator for SortedRecordStream<I>
+where
+    spillover::Sorted<I>: Iterator,
+{
+    type Item = <spillover::Sorted<I> as Iterator>::Item;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        self.inner.next()
+    }
+}
+
 impl Builder {
     /// Start building a new sorter.
     #[must_use]
@@ -539,6 +568,88 @@ impl Builder {
 impl Default for Builder {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+// These bounds intentionally mirror the core sorter's basic and keyed
+// push/finish implementations. The bio wrapper owns the public lifecycle
+// vocabulary; core owns the sorting mechanics.
+
+impl<SK, Cod, Cmp, D, CS> Sorter<SK, Cod, Cmp, D, CS, spillover::sorter::Basic>
+where
+    SK: SortKey<SeqRecord> + Copy + Send + Sync + 'static,
+    Cod: Codec<Item = SeqRecord> + Copy + 'static,
+    for<'a> Cod::Writer<&'a mut std::fs::File>: CodecWriter<SeqRecord, Error = Cod::Error>,
+    Cmp: for<'a> Compare<SK::Key<'a>> + Copy + Send + Sync + 'static,
+    CS: ChunkSorter<SeqRecord>,
+{
+    /// Add an unsorted record to the sorter.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if flushing buffered records to disk fails.
+    pub fn push(&mut self, record: SeqRecord) -> Result<(), MergeError<Cod::Error>> {
+        self.inner.push(record)
+    }
+
+    /// Finish sorting and return the finalized sorted record stream.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if flushing, merging, or deduplicating output fails.
+    #[allow(clippy::type_complexity)]
+    pub fn finish(
+        self,
+    ) -> Result<
+        SortedRecordStream<impl Iterator<Item = Result<D::Output, MergeError<Cod::Error>>>>,
+        MergeError<Cod::Error>,
+    >
+    where
+        D: Dedup<SeqRecord, MergeError<Cod::Error>>,
+    {
+        Ok(SortedRecordStream {
+            inner: self.inner.finish()?,
+        })
+    }
+}
+
+impl<SK, Cod, Cmp, D, CS> Sorter<SK, Cod, Cmp, D, CS, spillover::sorter::Keyed>
+where
+    SK: SortKey<SeqRecord> + Copy + Send + Sync + 'static,
+    Cod: KeyedCodec<Item = SeqRecord> + Copy + 'static,
+    for<'a> Cod::Writer<&'a mut std::fs::File>: CodecWriter<SeqRecord, Error = Cod::Error>,
+    for<'a> Cod::KeyedWriter<&'a mut std::fs::File>:
+        KeyedCodecWriter<SeqRecord, Cod::Key, Error = Cod::Error>,
+    Cmp: for<'a> Compare<SK::Key<'a>> + Compare<Cod::Key> + Copy + Send + Sync + 'static,
+    CS: ChunkSorter<SeqRecord>,
+{
+    /// Add an unsorted record to the sorter.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if flushing buffered records to disk fails.
+    pub fn push(&mut self, record: SeqRecord) -> Result<(), MergeError<Cod::Error>> {
+        self.inner.push(record)
+    }
+
+    /// Finish sorting and return the finalized sorted record stream.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if flushing, merging, or deduplicating output fails.
+    #[allow(clippy::type_complexity)]
+    pub fn finish(
+        self,
+    ) -> Result<
+        SortedRecordStream<impl Iterator<Item = Result<D::Output, MergeError<Cod::Error>>>>,
+        MergeError<Cod::Error>,
+    >
+    where
+        D: Dedup<SeqRecord, MergeError<Cod::Error>>,
+    {
+        Ok(SortedRecordStream {
+            inner: self.inner.finish()?,
+        })
     }
 }
 
@@ -794,8 +905,7 @@ where
     #[must_use]
     pub fn build(
         self,
-    ) -> spillover::sorter::Sorter<
-        SeqRecord,
+    ) -> Sorter<
         O::SortKey,
         KeyedDryIceCodec<C::S, C::Q, C::N, O::RecordKey>,
         O::Compare,
@@ -816,14 +926,16 @@ where
             .chunk_sort(self.chunk_sort)
             .merge_config(self.merge_config);
 
-        match flush {
+        let inner = match flush {
             FlushConfig::MeasuredBudget(budget) => {
                 builder.measured_budget::<SeqRecord>(budget).build()
             }
             FlushConfig::MaxItems(max_items) => {
                 builder.max_buffer_items::<SeqRecord>(max_items).build()
             }
-        }
+        };
+
+        Sorter { inner }
     }
 }
 
@@ -849,8 +961,7 @@ where
     #[must_use]
     pub fn build(
         self,
-    ) -> spillover::sorter::Sorter<
-        SeqRecord,
+    ) -> Sorter<
         O::SortKey,
         DryIceCodec<C::S, C::Q, C::N>,
         O::Compare,
@@ -870,14 +981,16 @@ where
             .chunk_sort(self.chunk_sort)
             .merge_config(self.merge_config);
 
-        match flush {
+        let inner = match flush {
             FlushConfig::MeasuredBudget(budget) => {
                 builder.measured_budget::<SeqRecord>(budget).build()
             }
             FlushConfig::MaxItems(max_items) => {
                 builder.max_buffer_items::<SeqRecord>(max_items).build()
             }
-        }
+        };
+
+        Sorter { inner }
     }
 }
 
