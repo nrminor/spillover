@@ -145,12 +145,12 @@ pub(crate) trait MergeReader {
 }
 
 /// Basic merge reader: heap holds full records.
-pub(crate) struct BasicMergeReader<T, C: Codec<T>> {
+pub(crate) struct BasicMergeReader<T, C: Codec<Item = T>> {
     reader: C::Reader<std::fs::File>,
     _item: std::marker::PhantomData<fn() -> T>,
 }
 
-impl<T, C: Codec<T>> BasicMergeReader<T, C> {
+impl<T, C: Codec<Item = T>> BasicMergeReader<T, C> {
     pub fn new(codec: C, file: std::fs::File) -> Self {
         Self {
             reader: codec.reader(file),
@@ -159,7 +159,10 @@ impl<T, C: Codec<T>> BasicMergeReader<T, C> {
     }
 }
 
-impl<T, C: Codec<T>> MergeReader for BasicMergeReader<T, C> {
+impl<T, C> MergeReader for BasicMergeReader<T, C>
+where
+    C: Codec<Item = T>,
+{
     type HeapItem = T;
     type Output = T;
     type Error = C::Error;
@@ -175,12 +178,12 @@ impl<T, C: Codec<T>> MergeReader for BasicMergeReader<T, C> {
 
 /// Keyed merge reader: heap holds compact keys, records
 /// fetched on demand for the winner only.
-pub(crate) struct KeyedMergeReader<T, C: KeyedCodec<T>> {
+pub(crate) struct KeyedMergeReader<T, C: KeyedCodec<Item = T>> {
     reader: C::KeyedReader<std::fs::File>,
     _item: std::marker::PhantomData<fn() -> T>,
 }
 
-impl<T, C: KeyedCodec<T>> KeyedMergeReader<T, C> {
+impl<T, C: KeyedCodec<Item = T>> KeyedMergeReader<T, C> {
     pub fn new(codec: C, file: std::fs::File) -> Self {
         Self {
             reader: codec.keyed_reader(file),
@@ -193,7 +196,10 @@ impl<T, C: KeyedCodec<T>> KeyedMergeReader<T, C> {
     }
 }
 
-impl<T, C: KeyedCodec<T>> MergeReader for KeyedMergeReader<T, C> {
+impl<T, C> MergeReader for KeyedMergeReader<T, C>
+where
+    C: KeyedCodec<Item = T>,
+{
     type HeapItem = C::Key;
     type Output = T;
     type Error = C::Error;
@@ -210,15 +216,17 @@ impl<T, C: KeyedCodec<T>> MergeReader for KeyedMergeReader<T, C> {
 // ── RunMerger ────────────────────────────────────────────
 
 /// Orchestrates the creation and merging of sorted runs on disk.
-pub struct RunMerger<T, C: Codec<T>, Cmp: Compare<T> + Copy> {
+pub struct RunMerger<T, C: Codec<Item = T>, Cmp: Compare<T> + Copy> {
     codec: C,
     cmp: Cmp,
     config: MergeConfig,
     _item: std::marker::PhantomData<fn() -> T>,
 }
 
-impl<T: 'static, C: Codec<T> + Copy + 'static, Cmp: Compare<T> + Copy + 'static>
+impl<T: 'static, C: Codec<Item = T> + Copy + 'static, Cmp: Compare<T> + Copy + 'static>
     RunMerger<T, C, Cmp>
+where
+    for<'a> C::Writer<&'a mut std::fs::File>: CodecWriter<T, Error = C::Error>,
 {
     /// Create a new merger.
     #[must_use]
@@ -341,8 +349,11 @@ impl<T: 'static, C: Codec<T> + Copy + 'static, Cmp: Compare<T> + Copy + 'static>
 }
 
 // Keyed merge — only available when the codec supports keys.
-impl<T: 'static, C: KeyedCodec<T> + Copy + 'static, Cmp: Compare<T> + Copy + 'static>
+impl<T: 'static, C: KeyedCodec<Item = T> + Copy + 'static, Cmp: Compare<T> + Copy + 'static>
     RunMerger<T, C, Cmp>
+where
+    for<'a> C::Writer<&'a mut std::fs::File>: CodecWriter<T, Error = C::Error>,
+    for<'a> C::KeyedWriter<&'a mut std::fs::File>: KeyedCodecWriter<T, C::Key, Error = C::Error>,
 {
     /// Merge sorted runs using the keyed path (key-only
     /// comparison, full deserialization only for the winner).
@@ -410,7 +421,7 @@ impl<T: 'static, C: KeyedCodec<T> + Copy + 'static, Cmp: Compare<T> + Copy + 'st
 
 // ── Reader construction helpers ──────────────────────────
 
-fn open_basic_readers<T, C: Codec<T> + Copy>(
+fn open_basic_readers<T, C: Codec<Item = T> + Copy>(
     runs: Vec<SortedRun>,
     codec: C,
 ) -> MergeResult<Vec<BasicMergeReader<T, C>>, C::Error> {
@@ -422,7 +433,7 @@ fn open_basic_readers<T, C: Codec<T> + Copy>(
         .collect()
 }
 
-fn open_keyed_readers<T, C: KeyedCodec<T> + Copy>(
+fn open_keyed_readers<T, C: KeyedCodec<Item = T> + Copy>(
     runs: Vec<SortedRun>,
     codec: C,
 ) -> MergeResult<Vec<KeyedMergeReader<T, C>>, C::Error> {
@@ -516,7 +527,7 @@ impl<MR: MergeReader, Cmp: Compare<MR::HeapItem> + Copy> HeapMerge<MR, Cmp> {
 /// keys tie across runs it falls back to full-record comparison.
 struct KeyedHeapMerge<
     T,
-    C: KeyedCodec<T>,
+    C: KeyedCodec<Item = T>,
     KeyCmp: Compare<C::Key> + Copy,
     ItemCmp: Compare<T> + Copy,
 > {
@@ -528,7 +539,7 @@ struct KeyedHeapMerge<
 
 impl<T, C, KeyCmp, ItemCmp> KeyedHeapMerge<T, C, KeyCmp, ItemCmp>
 where
-    C: KeyedCodec<T>,
+    C: KeyedCodec<Item = T>,
     KeyCmp: Compare<C::Key> + Copy,
     ItemCmp: Compare<T> + Copy,
 {
@@ -656,7 +667,7 @@ impl<MR: MergeReader, Cmp: Compare<MR::HeapItem> + Copy> Iterator for MergedItem
 /// Iterator over merged sorted items for the keyed merge path.
 struct MergedKeyedItems<
     T,
-    C: KeyedCodec<T>,
+    C: KeyedCodec<Item = T>,
     KeyCmp: Compare<C::Key> + Copy,
     ItemCmp: Compare<T> + Copy,
 > {
@@ -665,7 +676,7 @@ struct MergedKeyedItems<
 
 impl<T, C, KeyCmp, ItemCmp> Iterator for MergedKeyedItems<T, C, KeyCmp, ItemCmp>
 where
-    C: KeyedCodec<T>,
+    C: KeyedCodec<Item = T>,
     KeyCmp: Compare<C::Key> + Copy,
     ItemCmp: Compare<T> + Copy,
 {
@@ -730,7 +741,8 @@ mod tests {
         }
     }
 
-    impl Codec<u64> for U64Codec {
+    impl Codec for U64Codec {
+        type Item = u64;
         type Error = std::io::Error;
         type Writer<W: Write> = U64Writer<W>;
         type Reader<R: Read> = U64Reader<R>;
@@ -782,7 +794,8 @@ mod tests {
         }
     }
 
-    impl Codec<u64> for U64KeyedCodec {
+    impl Codec for U64KeyedCodec {
+        type Item = u64;
         type Error = std::io::Error;
         type Writer<W: Write> = U64KeyedWriter<W>;
         type Reader<R: Read> = U64KeyedReader<R>;
@@ -846,7 +859,7 @@ mod tests {
         }
     }
 
-    impl KeyedCodec<u64> for U64KeyedCodec {
+    impl KeyedCodec for U64KeyedCodec {
         type Key = u8;
         type KeyedWriter<W: Write> = U64OnlyKeyedWriter<W>;
         type KeyedReader<R: Read> = U64OnlyKeyedReader<R>;

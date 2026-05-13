@@ -79,7 +79,8 @@ impl<R: std::io::Read> CodecReader<LogEvent> for LogReader<R> {
     }
 }
 
-impl Codec<LogEvent> for LogCodec {
+impl Codec for LogCodec {
+    type Item = LogEvent;
     type Error = std::io::Error;
     type Writer<W: Write> = LogWriter<W>;
     type Reader<R: std::io::Read> = LogReader<R>;

@@ -45,7 +45,8 @@ impl<R: std::io::Read> CodecReader<String> for LineReader<R> {
     }
 }
 
-impl Codec<String> for LineCodec {
+impl Codec for LineCodec {
+    type Item = String;
     type Error = std::io::Error;
     type Writer<W: Write> = LineWriter<W>;
     type Reader<R: std::io::Read> = LineReader<R>;

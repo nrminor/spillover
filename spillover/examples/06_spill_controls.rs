@@ -46,7 +46,8 @@ impl<R: Read> CodecReader<u64> for U64Reader<R> {
     }
 }
 
-impl Codec<u64> for U64Codec {
+impl Codec for U64Codec {
+    type Item = u64;
     type Error = std::io::Error;
     type Writer<W: Write> = U64Writer<W>;
     type Reader<R: Read> = U64Reader<R>;

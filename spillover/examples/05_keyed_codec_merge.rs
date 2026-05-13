@@ -97,7 +97,8 @@ impl<R: Read> KeyedCodecReader<u64, u8> for Reader<R> {
     }
 }
 
-impl Codec<u64> for DecadeKeyedCodec {
+impl Codec for DecadeKeyedCodec {
+    type Item = u64;
     type Error = std::io::Error;
     type Writer<W: Write> = Writer<W>;
     type Reader<R: Read> = Reader<R>;
@@ -116,7 +117,7 @@ impl Codec<u64> for DecadeKeyedCodec {
     }
 }
 
-impl KeyedCodec<u64> for DecadeKeyedCodec {
+impl KeyedCodec for DecadeKeyedCodec {
     type Key = u8;
     type KeyedWriter<W: Write> = Writer<W>;
     type KeyedReader<R: Read> = Reader<R>;

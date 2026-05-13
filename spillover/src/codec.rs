@@ -70,15 +70,18 @@ pub trait CodecReader<T> {
 /// The core crate provides no built-in codecs — implementations
 /// live in domain crates (e.g., `spillover-bio` provides a
 /// dryice-based codec) or in application code for simple cases.
-pub trait Codec<T>: Copy {
+pub trait Codec: Copy {
+    /// The item type materialized by readers for this codec.
+    type Item;
+
     /// The error type for encode/decode failures.
     type Error: std::error::Error + Send + Sync + 'static;
 
     /// A stateful writer for encoding items into a sorted run.
-    type Writer<W: Write>: CodecWriter<T, Error = Self::Error>;
+    type Writer<W: Write>;
 
     /// A stateful reader for decoding items from a sorted run.
-    type Reader<R: Read>: CodecReader<T, Error = Self::Error>;
+    type Reader<R: Read>: CodecReader<Self::Item, Error = Self::Error>;
 
     /// Create a writer that encodes items into `dest`.
     fn writer<W: Write>(&self, dest: W) -> Self::Writer<W>;
@@ -159,7 +162,7 @@ pub trait KeyedCodecReader<T, K> {
 /// The merge engine selects between the base [`Codec`] path and
 /// the `KeyedCodec` fast path at compile time based on whether
 /// the user calls `.codec()` or `.keyed_codec()` on the builder.
-pub trait KeyedCodec<T>: Codec<T> {
+pub trait KeyedCodec: Codec {
     /// The compact record key stored alongside each record on
     /// disk for merge acceleration. This is distinct from the
     /// [`SortKey`](crate::key::SortKey), which is a transient,
@@ -169,16 +172,16 @@ pub trait KeyedCodec<T>: Codec<T> {
     type Key: Clone;
 
     /// A stateful writer that encodes items with their keys.
-    type KeyedWriter<W: Write>: KeyedCodecWriter<T, Self::Key, Error = Self::Error>;
+    type KeyedWriter<W: Write>: KeyedCodecWriter<Self::Item, Self::Key, Error = Self::Error>;
 
     /// A stateful reader that can retrieve keys and records
     /// independently.
-    type KeyedReader<R: Read>: KeyedCodecReader<T, Self::Key, Error = Self::Error>;
+    type KeyedReader<R: Read>: KeyedCodecReader<Self::Item, Self::Key, Error = Self::Error>;
 
     /// Derive the record key for an item. Called by the sorter
     /// during flush to compute keys before writing them to disk
     /// alongside the records.
-    fn derive_key(&self, item: &T) -> Self::Key;
+    fn derive_key(&self, item: &Self::Item) -> Self::Key;
 
     /// Create a keyed writer that encodes items with their keys
     /// into `dest`.
@@ -235,7 +238,8 @@ mod tests {
         }
     }
 
-    impl Codec<u64> for U64Codec {
+    impl Codec for U64Codec {
+        type Item = u64;
         type Error = std::io::Error;
         type Writer<W: Write> = U64Writer<W>;
         type Reader<R: Read> = U64Reader<R>;

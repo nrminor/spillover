@@ -368,7 +368,8 @@ impl<R: Read, S: SequenceCodec, Q: QualityCodec, N: NameCodec, K: RecordKey + Cl
 
 // ── Codec impls ──────────────────────────────────────────────
 
-impl<S: SequenceCodec, Q: QualityCodec, N: NameCodec> Codec<SeqRecord> for DryIceCodec<S, Q, N> {
+impl<S: SequenceCodec, Q: QualityCodec, N: NameCodec> Codec for DryIceCodec<S, Q, N> {
+    type Item = SeqRecord;
     type Error = DryIceError;
     type Writer<W: Write> = UnkeyedWriterAdapter<W, S, Q, N>;
     type Reader<R: Read> = UnkeyedReaderAdapter<R, S, Q, N>;
@@ -393,9 +394,10 @@ impl<S: SequenceCodec, Q: QualityCodec, N: NameCodec> Codec<SeqRecord> for DryIc
     }
 }
 
-impl<S: SequenceCodec, Q: QualityCodec, N: NameCodec, K: RecordKey + Clone> Codec<SeqRecord>
+impl<S: SequenceCodec, Q: QualityCodec, N: NameCodec, K: RecordKey + Clone> Codec
     for KeyedDryIceCodec<S, Q, N, K>
 {
+    type Item = SeqRecord;
     type Error = DryIceError;
     type Writer<W: Write> = KeyedWriterAdapter<W, S, Q, N, K>;
     type Reader<R: Read> = KeyedReaderAdapter<R, S, Q, N, K>;
@@ -420,7 +422,7 @@ impl<S: SequenceCodec, Q: QualityCodec, N: NameCodec, K: RecordKey + Clone> Code
     }
 }
 
-impl<S: SequenceCodec, Q: QualityCodec, N: NameCodec, K: RecordKey + Clone> KeyedCodec<SeqRecord>
+impl<S: SequenceCodec, Q: QualityCodec, N: NameCodec, K: RecordKey + Clone> KeyedCodec
     for KeyedDryIceCodec<S, Q, N, K>
 {
     type Key = K;

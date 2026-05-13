@@ -18,7 +18,7 @@ use get_size2::GetSize;
 
 use crate::{
     chunk::{ChunkSorter, Sequential},
-    codec::{Codec, KeyedCodec, KeyedCodecWriter},
+    codec::{Codec, CodecWriter, KeyedCodec, KeyedCodecWriter},
     compare::{Compare, Natural},
     dedup::{Dedup, Identity},
     key::{KeyCompare, SortKey},
@@ -288,7 +288,7 @@ impl<SK, Cod, Cmp, D, CS> Builder<SK, Cod, NeedsFlushStrategy, Cmp, D, CS> {
 impl<T, SK, Cod, Cmp, D, CS> Builder<HasSortKey<SK>, HasCodec<Cod>, HasFlushStrategy<T>, Cmp, D, CS>
 where
     SK: SortKey<T> + Copy,
-    Cod: Codec<T> + Copy,
+    Cod: Codec<Item = T> + Copy,
     Cmp: for<'a> Compare<SK::Key<'a>> + Copy,
     CS: ChunkSorter<T>,
 {
@@ -316,7 +316,7 @@ impl<T, SK, Cod, Cmp, D, CS>
     Builder<HasSortKey<SK>, HasKeyedCodec<Cod>, HasFlushStrategy<T>, Cmp, D, CS>
 where
     SK: SortKey<T> + Copy,
-    Cod: KeyedCodec<T> + Copy,
+    Cod: KeyedCodec<Item = T> + Copy,
     Cmp: for<'a> Compare<SK::Key<'a>> + Compare<Cod::Key> + Copy,
     CS: ChunkSorter<T>,
 {
@@ -381,7 +381,8 @@ impl<T, SK, Cod, Cmp, D, CS> Sorter<T, SK, Cod, Cmp, D, CS, Basic>
 where
     T: 'static,
     SK: SortKey<T> + Copy + Send + Sync + 'static,
-    Cod: Codec<T> + Copy + 'static,
+    Cod: Codec<Item = T> + Copy + 'static,
+    for<'a> Cod::Writer<&'a mut std::fs::File>: CodecWriter<T, Error = Cod::Error>,
     Cmp: for<'a> Compare<SK::Key<'a>> + Copy + Send + Sync + 'static,
     CS: ChunkSorter<T>,
 {
@@ -465,7 +466,10 @@ impl<T, SK, Cod, Cmp, D, CS> Sorter<T, SK, Cod, Cmp, D, CS, Keyed>
 where
     T: 'static,
     SK: SortKey<T> + Copy + Send + Sync + 'static,
-    Cod: KeyedCodec<T> + Copy + 'static,
+    Cod: KeyedCodec<Item = T> + Copy + 'static,
+    for<'a> Cod::Writer<&'a mut std::fs::File>: CodecWriter<T, Error = Cod::Error>,
+    for<'a> Cod::KeyedWriter<&'a mut std::fs::File>:
+        KeyedCodecWriter<T, Cod::Key, Error = Cod::Error>,
     Cmp: for<'a> Compare<SK::Key<'a>> + Compare<Cod::Key> + Copy + Send + Sync + 'static,
     CS: ChunkSorter<T>,
 {
@@ -609,7 +613,8 @@ mod tests {
         }
     }
 
-    impl Codec<u64> for U64Codec {
+    impl Codec for U64Codec {
+        type Item = u64;
         type Error = std::io::Error;
         type Writer<W: Write> = U64Writer<W>;
         type Reader<R: Read> = U64Reader<R>;
