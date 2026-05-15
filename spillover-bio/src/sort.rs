@@ -16,12 +16,14 @@ use dryice::{
     SequenceCodec,
 };
 use spillover::{
+    SortedItemsError,
     chunk::{ChunkSorter, Sequential},
     codec::{Codec, CodecWriter, KeyedCodec, KeyedCodecWriter},
     compare::{Compare, Natural},
     dedup::Identity,
-    key::SortKey,
-    merge::{MergeConfig, MergeError},
+    key::{KeyCompare, SortKey},
+    merge::{KeyedRunMerge, MergeConfig, MergeError, RunMerge},
+    sorter::VisitSortedItems,
 };
 
 use crate::{
@@ -403,7 +405,35 @@ pub const LENGTH_ORDER: LengthOrder = LengthOrder;
 #[derive(Debug, Clone, Copy)]
 enum RecordDedup {
     None,
-    Adjacent(fn(&PreviousRecord, &SeqRecord) -> bool),
+    Name,
+    Sequence,
+    SequenceAndQuality,
+}
+
+impl RecordDedup {
+    #[inline]
+    fn is_enabled(self) -> bool {
+        !matches!(self, Self::None)
+    }
+
+    #[inline]
+    fn is_duplicate<R: SeqRecordParts + ?Sized>(
+        self,
+        previous: Option<&PreviousRecord>,
+        current: &R,
+    ) -> bool {
+        previous.is_some_and(|previous| self.matches(previous, current))
+    }
+
+    #[inline]
+    fn matches<R: SeqRecordParts + ?Sized>(self, previous: &PreviousRecord, current: &R) -> bool {
+        match self {
+            Self::None => false,
+            Self::Name => previous.has_same_name_as(current),
+            Self::Sequence => previous.has_same_sequence_as(current),
+            Self::SequenceAndQuality => previous.has_same_sequence_and_quality_as(current),
+        }
+    }
 }
 
 #[derive(Debug, Default)]
@@ -447,18 +477,6 @@ impl SeqRecordParts for PreviousRecord {
     fn quality(&self) -> &[u8] {
         &self.bytes[self.sequence_end()..]
     }
-}
-
-fn records_have_same_name(previous: &PreviousRecord, current: &SeqRecord) -> bool {
-    previous.name() == current.name()
-}
-
-fn records_have_same_sequence(previous: &PreviousRecord, current: &SeqRecord) -> bool {
-    previous.sequence() == current.sequence()
-}
-
-fn records_have_same_sequence_and_quality(previous: &PreviousRecord, current: &SeqRecord) -> bool {
-    previous.sequence() == current.sequence() && previous.quality() == current.quality()
 }
 
 /// Builder marker: no sort order chosen yet.
@@ -653,9 +671,9 @@ where
     type Item = Result<SeqRecord, E>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        let RecordDedup::Adjacent(eq_fn) = self.dedup else {
+        if !self.dedup.is_enabled() {
             return self.inner.next();
-        };
+        }
 
         if self.fused {
             return None;
@@ -664,12 +682,7 @@ where
         loop {
             match self.inner.next() {
                 Some(Ok(record)) => {
-                    let is_duplicate = self
-                        .previous
-                        .as_ref()
-                        .is_some_and(|previous| eq_fn(previous, &record));
-
-                    if is_duplicate {
+                    if self.dedup.is_duplicate(self.previous.as_ref(), &record) {
                         continue;
                     }
 
@@ -690,14 +703,15 @@ where
 
 impl<I, RE> SortedRecordStream<I>
 where
-    Self: Iterator<Item = Result<SeqRecord, RE>>,
+    I: VisitSortedItems<Error = RE>,
+    for<'a> I::Item<'a>: SeqRecordParts,
     RE: std::error::Error + Send + Sync + 'static,
 {
     /// Write all sorted records to a destination sink.
     ///
-    /// This initial implementation drains the stream through owned
-    /// [`SeqRecord`] values. Later allocation-light paths can preserve this
-    /// callsite while changing how records are visited internally.
+    /// This drains through the core current-item traversal seam. Keyed dryice
+    /// sources can write borrowed current record views, while sources without a
+    /// borrowed current representation may still materialize internally.
     ///
     /// # Errors
     ///
@@ -708,14 +722,36 @@ where
     where
         W: SeqRecordSink,
     {
-        for record in self {
-            let record = record.map_err(SortedRecordStreamError::Source)?;
-            writer
-                .write_record(&record)
-                .map_err(SortedRecordStreamError::Sink)?;
+        let Self {
+            inner,
+            dedup,
+            mut previous,
+            fused,
+        } = self;
+
+        if fused {
+            return Ok(());
         }
 
-        Ok(())
+        inner
+            .items()
+            .try_for_each(|record| {
+                if dedup.is_duplicate(previous.as_ref(), &record) {
+                    return Ok(());
+                }
+
+                if dedup.is_enabled() {
+                    let previous = previous.get_or_insert_with(PreviousRecord::default);
+                    previous.copy_from(&record);
+                    writer.write_record(previous)
+                } else {
+                    writer.write_record(&record)
+                }
+            })
+            .map_err(|err| match err {
+                SortedItemsError::Source(err) => SortedRecordStreamError::Source(err),
+                SortedItemsError::Sink(err) => SortedRecordStreamError::Sink(err),
+            })
     }
 }
 
@@ -770,7 +806,7 @@ where
     pub fn finish(
         self,
     ) -> Result<
-        SortedRecordStream<impl Iterator<Item = Result<SeqRecord, MergeError<Cod::Error>>>>,
+        SortedRecordStream<RunMerge<SeqRecord, Cod, KeyCompare<SK, Cmp>>>,
         MergeError<Cod::Error>,
     > {
         Ok(SortedRecordStream {
@@ -810,7 +846,7 @@ where
     pub fn finish(
         self,
     ) -> Result<
-        SortedRecordStream<impl Iterator<Item = Result<SeqRecord, MergeError<Cod::Error>>>>,
+        SortedRecordStream<KeyedRunMerge<SeqRecord, Cod, Cmp, KeyCompare<SK, Cmp>>>,
         MergeError<Cod::Error>,
     > {
         Ok(SortedRecordStream {
@@ -979,7 +1015,7 @@ impl<O, C, F, CS> Builder<O, C, F, CS> {
             order: self.order,
             codec: self.codec,
             flush: self.flush,
-            dedup: RecordDedup::Adjacent(records_have_same_name),
+            dedup: RecordDedup::Name,
             chunk_sort: self.chunk_sort,
             merge_config: self.merge_config,
         }
@@ -992,7 +1028,7 @@ impl<O, C, F, CS> Builder<O, C, F, CS> {
             order: self.order,
             codec: self.codec,
             flush: self.flush,
-            dedup: RecordDedup::Adjacent(records_have_same_sequence),
+            dedup: RecordDedup::Sequence,
             chunk_sort: self.chunk_sort,
             merge_config: self.merge_config,
         }
@@ -1006,7 +1042,7 @@ impl<O, C, F, CS> Builder<O, C, F, CS> {
             order: self.order,
             codec: self.codec,
             flush: self.flush,
-            dedup: RecordDedup::Adjacent(records_have_same_sequence_and_quality),
+            dedup: RecordDedup::SequenceAndQuality,
             chunk_sort: self.chunk_sort,
             merge_config: self.merge_config,
         }

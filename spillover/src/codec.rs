@@ -70,10 +70,11 @@ pub trait CodecCursor<T> {
 
     /// Materialize the current item as an owned value.
     ///
-    /// Valid only after [`advance`](Self::advance) returned `true`. Cursors may
-    /// consume internal current-position state when materializing owned values,
-    /// so callers should use either `current()` or `with_current(...)` for a
-    /// position before advancing again.
+    /// Valid only after [`advance`](Self::advance) returned `true`. Repeated
+    /// calls to `current()` and [`with_current`](Self::with_current) must keep
+    /// observing the same item until the next call to [`advance`](Self::advance).
+    /// This method may allocate, but it must not advance the cursor or consume
+    /// the current position.
     ///
     /// # Errors
     ///
@@ -83,7 +84,8 @@ pub trait CodecCursor<T> {
     /// Visit the current item in this cursor's cheapest representation.
     ///
     /// The value passed to the callback is valid only for the callback. This is
-    /// valid only after [`advance`](Self::advance) returned `true`.
+    /// valid only after [`advance`](Self::advance) returned `true`. Calling this
+    /// method must not advance the cursor or consume the current position.
     ///
     /// # Errors
     ///
@@ -159,6 +161,8 @@ pub trait KeyedCodecCursor<T, K>: CodecCursor<T> {
     /// Return the stored key for the current entry.
     ///
     /// Valid only after [`advance`](CodecCursor::advance) returned `true`.
+    /// Repeated calls must return the same key until the next call to
+    /// [`advance`](CodecCursor::advance).
     ///
     /// # Errors
     ///

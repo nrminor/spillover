@@ -17,12 +17,13 @@
 use get_size2::GetSize;
 
 use crate::{
+    SortedItemsError,
     chunk::{ChunkSorter, Sequential},
     codec::{Codec, CodecWriter, KeyedCodec, KeyedCodecWriter},
     compare::{Compare, Natural},
     dedup::{Dedup, Identity},
     key::{KeyCompare, SortKey},
-    merge::{MergeConfig, MergeError, RunMerger, SortedRun},
+    merge::{KeyedRunMerge, MergeConfig, MergeError, RunMerge, RunMerger, SortedRun},
 };
 
 /// How the sorter decides when to flush the in-memory buffer to
@@ -389,9 +390,73 @@ pub struct Sorted<I> {
     source: I,
 }
 
+/// Adapter for visiting sorted output items without using the owned
+/// [`Iterator`] namespace on [`Sorted`].
+///
+/// Constructed by [`Sorted::items`]. Like standard iterator adapter structs,
+/// this type is public and nameable but has private fields.
+pub struct SortedItems<S> {
+    source: S,
+}
+
+#[doc(hidden)]
+pub mod sealed {
+    pub trait Sealed {}
+}
+
+/// Implementation detail for sources that can be drained through
+/// [`SortedItems`].
+///
+/// This trait is sealed. Users should not implement it directly; use
+/// [`Sorted::items`] and [`SortedItems::try_for_each`] instead.
+#[doc(hidden)]
+pub trait VisitSortedItems: sealed::Sealed {
+    /// The item representation passed to the item sink.
+    type Item<'a>
+    where
+        Self: 'a;
+
+    /// The source error type.
+    type Error;
+
+    /// Visit each item in source order.
+    fn visit_items<F, FE>(self, f: F) -> Result<(), SortedItemsError<Self::Error, FE>>
+    where
+        F: for<'a> FnMut(Self::Item<'a>) -> Result<(), FE>;
+}
+
 impl<I> Sorted<I> {
     fn new(source: I) -> Self {
         Self { source }
+    }
+
+    /// Consume this sorted output handle and visit items through the
+    /// current-item traversal namespace.
+    pub fn items(self) -> SortedItems<I> {
+        SortedItems {
+            source: self.source,
+        }
+    }
+}
+
+impl<S> SortedItems<S>
+where
+    S: VisitSortedItems,
+{
+    /// Visit every sorted item in order.
+    ///
+    /// This method lives under the [`Sorted::items`] namespace so it does not
+    /// conflict with owned [`Iterator`] traversal on [`Sorted`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SortedItemsError::Source`] if the sorted source fails, or
+    /// [`SortedItemsError::Sink`] if the callback fails.
+    pub fn try_for_each<F, FE>(self, f: F) -> Result<(), SortedItemsError<S::Error, FE>>
+    where
+        F: for<'a> FnMut(S::Item<'a>) -> Result<(), FE>,
+    {
+        self.source.visit_items(f)
     }
 }
 
@@ -469,11 +534,11 @@ where
     pub fn finish(
         mut self,
     ) -> Result<
-        Sorted<impl Iterator<Item = Result<D::Output, MergeError<Cod::Error>>>>,
+        Sorted<<D as Dedup<RunMerge<T, Cod, KeyCompare<SK, Cmp>>>>::Deduped>,
         MergeError<Cod::Error>,
     >
     where
-        D: Dedup<T, MergeError<Cod::Error>>,
+        D: Dedup<RunMerge<T, Cod, KeyCompare<SK, Cmp>>>,
     {
         if !self.buffer.is_empty() {
             self.flush_basic()?;
@@ -571,11 +636,11 @@ where
     pub fn finish(
         mut self,
     ) -> Result<
-        Sorted<impl Iterator<Item = Result<D::Output, MergeError<Cod::Error>>>>,
+        Sorted<<D as Dedup<KeyedRunMerge<T, Cod, Cmp, KeyCompare<SK, Cmp>>>>::Deduped>,
         MergeError<Cod::Error>,
     >
     where
-        D: Dedup<T, MergeError<Cod::Error>>,
+        D: Dedup<KeyedRunMerge<T, Cod, Cmp, KeyCompare<SK, Cmp>>>,
     {
         if !self.buffer.is_empty() {
             self.flush_keyed()?;
@@ -697,6 +762,32 @@ mod tests {
             .build()
     }
 
+    struct TestVisitable {
+        items: Vec<u64>,
+    }
+
+    impl sealed::Sealed for TestVisitable {}
+
+    impl VisitSortedItems for TestVisitable {
+        type Item<'a>
+            = u64
+        where
+            Self: 'a;
+
+        type Error = std::convert::Infallible;
+
+        fn visit_items<F, FE>(self, mut f: F) -> Result<(), SortedItemsError<Self::Error, FE>>
+        where
+            F: for<'a> FnMut(u64) -> Result<(), FE>,
+        {
+            for item in self.items {
+                f(item).map_err(SortedItemsError::Sink)?;
+            }
+
+            Ok(())
+        }
+    }
+
     #[test]
     fn sort_single_item() {
         let mut sorter = u64_sorter(100);
@@ -707,6 +798,50 @@ mod tests {
             .map(|r| r.expect("read"))
             .collect();
         assert_eq!(results, vec![42]);
+    }
+
+    #[test]
+    fn sorted_items_visits_items_in_order() {
+        let mut visited = Vec::new();
+        Sorted::new(TestVisitable {
+            items: vec![1, 2, 3],
+        })
+        .items()
+        .try_for_each(|item| {
+            visited.push(item);
+            Ok::<(), std::convert::Infallible>(())
+        })
+        .expect("visit items");
+
+        assert_eq!(visited, vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn sorted_items_stops_on_visitor_error() {
+        #[derive(Debug, PartialEq, Eq)]
+        struct SinkError;
+
+        impl std::fmt::Display for SinkError {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("sink error")
+            }
+        }
+
+        impl std::error::Error for SinkError {}
+
+        let mut visited = Vec::new();
+        let err = Sorted::new(TestVisitable {
+            items: vec![1, 2, 3],
+        })
+        .items()
+        .try_for_each(|item| {
+            visited.push(item);
+            if item == 2 { Err(SinkError) } else { Ok(()) }
+        })
+        .expect_err("sink error should stop traversal");
+
+        assert!(matches!(err, SortedItemsError::Sink(SinkError)));
+        assert_eq!(visited, vec![1, 2]);
     }
 
     #[test]

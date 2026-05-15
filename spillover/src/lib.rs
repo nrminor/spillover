@@ -19,6 +19,6 @@ pub mod key;
 pub mod merge;
 pub mod sorter;
 
-pub use error::SpilloverError;
+pub use error::{SortedItemsError, SpilloverError};
 pub use get_size2::GetSize;
-pub use sorter::Sorted;
+pub use sorter::{Sorted, SortedItems};

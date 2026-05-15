@@ -43,6 +43,19 @@ pub enum SpilloverError {
     TruncatedRun,
 }
 
+/// Error returned while visiting finalized sorted output through
+/// [`SortedItems`](crate::SortedItems).
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum SortedItemsError<E, F> {
+    /// The sorted output source failed to produce the next item.
+    #[error("sorted output source failed: {0}")]
+    Source(E),
+
+    /// The item sink rejected or failed to process an item.
+    #[error("sorted item sink failed: {0}")]
+    Sink(F),
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

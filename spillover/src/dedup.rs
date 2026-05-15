@@ -1,33 +1,26 @@
 //! Post-merge deduplication strategies.
 //!
-//! [`Dedup`] defines a transform applied to the fully sorted,
-//! merged stream. [`Identity`] passes the stream through unchanged.
+//! [`Dedup`] defines a transform applied to a fully sorted source.
+//! [`Identity`] passes the source through unchanged.
 //! [`AdjacentDedup`] drops consecutive items that compare equal on
 //! a user-provided predicate, keeping the first item from each run.
 
-/// A transform applied to the sorted, merged stream.
+/// A transform applied to a sorted source.
 ///
-/// The trait is generic over the stream's error type `E` so that
-/// error composition is entirely in the user's hands. Infallible
-/// dedups like [`Identity`] and [`AdjacentDedup`] pass source
-/// errors through unchanged. A fallible dedup can require
-/// `E: From<MyDedupError>` on its impl and use `?` to convert its
-/// own errors, relying on the user's `#[from]` enum to unify them.
+/// `S` is the input source. [`Dedup::Deduped`] is the source produced after
+/// applying the deduplication strategy. [`Identity`] returns `S` unchanged,
+/// preserving whatever traversal capabilities the source already has. Other
+/// strategies may wrap the source and therefore expose fewer capabilities.
 ///
 /// More specialized dedup strategies (like group-by-key-and-reduce
 /// for database construction) can be implemented directly on this
 /// trait by downstream crates.
-pub trait Dedup<T, E> {
-    /// The type of items in the output stream. For filtering dedups
-    /// like [`AdjacentDedup`] this is the same as `T`. For dedups
-    /// that collapse items (e.g., a group-reduce), it may differ.
-    type Output;
+pub trait Dedup<S> {
+    /// The deduplicated source produced by this transform.
+    type Deduped;
 
-    /// Transform the sorted stream.
-    fn dedup(
-        self,
-        sorted: impl Iterator<Item = Result<T, E>>,
-    ) -> impl Iterator<Item = Result<Self::Output, E>>;
+    /// Transform the sorted source.
+    fn dedup(self, source: S) -> Self::Deduped;
 }
 
 /// Pass-through dedup that does nothing. This is the default when
@@ -43,14 +36,11 @@ pub trait Dedup<T, E> {
 /// ```
 pub struct Identity;
 
-impl<T, E> Dedup<T, E> for Identity {
-    type Output = T;
+impl<S> Dedup<S> for Identity {
+    type Deduped = S;
 
-    fn dedup(
-        self,
-        sorted: impl Iterator<Item = Result<T, E>>,
-    ) -> impl Iterator<Item = Result<T, E>> {
-        sorted
+    fn dedup(self, source: S) -> S {
+        source
     }
 }
 
@@ -93,19 +83,17 @@ impl<F> AdjacentDedup<F> {
     }
 }
 
-impl<T, E, F> Dedup<T, E> for AdjacentDedup<F>
+impl<S, T, E, F> Dedup<S> for AdjacentDedup<F>
 where
+    S: Iterator<Item = Result<T, E>>,
     T: Clone,
     F: Fn(&T, &T) -> bool,
 {
-    type Output = T;
+    type Deduped = AdjacentDedupIter<T, S, F>;
 
-    fn dedup(
-        self,
-        sorted: impl Iterator<Item = Result<T, E>>,
-    ) -> impl Iterator<Item = Result<T, E>> {
+    fn dedup(self, source: S) -> Self::Deduped {
         AdjacentDedupIter {
-            source: sorted,
+            source,
             eq_fn: self.eq_fn,
             last_emitted: None,
             fused: false,
@@ -114,7 +102,7 @@ where
 }
 
 /// The iterator produced by [`AdjacentDedup::dedup`].
-struct AdjacentDedupIter<T, I, F> {
+pub struct AdjacentDedupIter<T, I, F> {
     source: I,
     eq_fn: F,
     last_emitted: Option<T>,

@@ -35,6 +35,23 @@ pub trait SeqRecordParts {
     fn is_empty(&self) -> bool {
         self.sequence().is_empty()
     }
+
+    /// Whether this record has the same name as another record-shaped value.
+    fn has_same_name_as<R: SeqRecordParts + ?Sized>(&self, other: &R) -> bool {
+        self.name() == other.name()
+    }
+
+    /// Whether this record has the same nucleotide sequence as another
+    /// record-shaped value.
+    fn has_same_sequence_as<R: SeqRecordParts + ?Sized>(&self, other: &R) -> bool {
+        self.sequence() == other.sequence()
+    }
+
+    /// Whether this record has the same nucleotide sequence and quality scores
+    /// as another record-shaped value.
+    fn has_same_sequence_and_quality_as<R: SeqRecordParts + ?Sized>(&self, other: &R) -> bool {
+        self.sequence() == other.sequence() && self.quality() == other.quality()
+    }
 }
 
 /// A borrowed sequence record view.
@@ -297,6 +314,20 @@ mod tests {
         assert_eq!(sequence_len(&rec), 4);
         assert_eq!(sequence_len(&view), 4);
         assert!(!SeqRecordParts::is_empty(&view));
+    }
+
+    #[test]
+    fn parts_trait_compares_record_fields() {
+        let record = SeqRecord::new(b"r1", b"ACGT", b"!!!!");
+        let same_sequence = SeqRecordView::new(b"r2", b"ACGT", b"####");
+        let same_name = SeqRecordView::new(b"r1", b"TGCA", b"!!!!");
+        let same_sequence_quality = SeqRecordView::new(b"r3", b"ACGT", b"!!!!");
+
+        assert!(record.has_same_sequence_as(&same_sequence));
+        assert!(!record.has_same_name_as(&same_sequence));
+        assert!(record.has_same_name_as(&same_name));
+        assert!(record.has_same_sequence_and_quality_as(&same_sequence_quality));
+        assert!(!record.has_same_sequence_and_quality_as(&same_sequence));
     }
 
     #[test]
