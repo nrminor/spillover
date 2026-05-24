@@ -22,7 +22,7 @@ use spillover::{
     compare::{Compare, Natural},
     dedup::Identity,
     key::{KeyCompare, SortKey},
-    merge::{KeyedRunMerge, MergeConfig, MergeError, RunMerge},
+    merge::{KeyedRunMerge, MergeConfig, MergeError, RunMerge, RunMerger, SortedRun},
     sorter::VisitSortedItems,
 };
 
@@ -31,7 +31,7 @@ use crate::{
     error::SortedRecordStreamError,
     key::PackedSequenceKey,
     radix::RadixThenRefine,
-    record::{SeqRecord, SeqRecordArena, SeqRecordParts},
+    record::{SeqRecord, SeqRecordArena, SeqRecordHandle, SeqRecordParts, SeqRecordView},
 };
 
 /// Sort key that extracts sequence and quality as a tuple.
@@ -115,9 +115,17 @@ pub trait SortOrder: sealed::Sealed + Copy {
     /// The sort key for extracting the comparison value.
     type SortKey: SortKey<SeqRecord> + Copy + Send + Sync + 'static;
 
-    /// The comparator for key comparison. Must implement
-    /// `Compare<Key>` for whatever key type the `SortKey` produces.
-    type Compare: Copy + Send + Sync + 'static;
+    /// Comparator for record-shaped values under this order.
+    ///
+    /// This is the comparator callers should use when they already have records
+    /// or record views in memory.
+    type Comparator: Copy + Send + Sync + 'static;
+
+    /// Comparator for extracted sort keys and compact merge keys.
+    ///
+    /// This is the lower-level comparator used by the generic core sorter and
+    /// keyed merge path after records have been encoded into sorted runs.
+    type KeyComparator: Copy + Send + Sync + 'static;
 
     /// The merge strategy marker: [`Basic`] or [`Keyed`].
     type Strategy;
@@ -125,8 +133,11 @@ pub trait SortOrder: sealed::Sealed + Copy {
     /// The sort key extractor.
     fn sort_key(&self) -> Self::SortKey;
 
-    /// The comparator.
-    fn compare(&self) -> Self::Compare;
+    /// The record comparator.
+    fn comparator(&self) -> Self::Comparator;
+
+    /// The key comparator.
+    fn key_comparator(&self) -> Self::KeyComparator;
 }
 
 /// Derives dryice record keys from record-shaped values.
@@ -164,15 +175,28 @@ impl<const N: usize> sealed::Sealed for SequenceOrder<N> {}
 
 impl<const N: usize> SortOrder for SequenceOrder<N> {
     type SortKey = SequenceQualityKey;
-    type Compare = Natural;
+    type Comparator = Self;
+    type KeyComparator = Natural;
     type Strategy = Keyed;
 
     fn sort_key(&self) -> SequenceQualityKey {
         SequenceQualityKey
     }
 
-    fn compare(&self) -> Natural {
+    fn comparator(&self) -> Self {
+        *self
+    }
+
+    fn key_comparator(&self) -> Natural {
         Natural
+    }
+}
+
+impl<const N: usize, R: SeqRecordParts + ?Sized> Compare<R> for SequenceOrder<N> {
+    fn compare(&self, a: &R, b: &R) -> std::cmp::Ordering {
+        a.sequence()
+            .cmp(b.sequence())
+            .then_with(|| a.quality().cmp(b.quality()))
     }
 }
 
@@ -202,15 +226,26 @@ impl sealed::Sealed for NameOrder {}
 
 impl SortOrder for NameOrder {
     type SortKey = NameKey;
-    type Compare = Natural;
+    type Comparator = Self;
+    type KeyComparator = Natural;
     type Strategy = Keyed;
 
     fn sort_key(&self) -> NameKey {
         NameKey
     }
 
-    fn compare(&self) -> Natural {
+    fn comparator(&self) -> Self {
+        *self
+    }
+
+    fn key_comparator(&self) -> Natural {
         Natural
+    }
+}
+
+impl<R: SeqRecordParts + ?Sized> Compare<R> for NameOrder {
+    fn compare(&self, a: &R, b: &R) -> std::cmp::Ordering {
+        a.name().cmp(b.name())
     }
 }
 
@@ -246,15 +281,26 @@ impl sealed::Sealed for LengthOrder {}
 
 impl SortOrder for LengthOrder {
     type SortKey = LengthKey;
-    type Compare = Natural;
+    type Comparator = Self;
+    type KeyComparator = Natural;
     type Strategy = Keyed;
 
     fn sort_key(&self) -> LengthKey {
         LengthKey
     }
 
-    fn compare(&self) -> Natural {
+    fn comparator(&self) -> Self {
+        *self
+    }
+
+    fn key_comparator(&self) -> Natural {
         Natural
+    }
+}
+
+impl<R: SeqRecordParts + ?Sized> Compare<R> for LengthOrder {
+    fn compare(&self, a: &R, b: &R) -> std::cmp::Ordering {
+        a.sequence().len().cmp(&b.sequence().len())
     }
 }
 
@@ -289,15 +335,28 @@ impl sealed::Sealed for UnkeyedSequenceOrder {}
 
 impl SortOrder for UnkeyedSequenceOrder {
     type SortKey = SequenceQualityKey;
-    type Compare = Natural;
+    type Comparator = Self;
+    type KeyComparator = Natural;
     type Strategy = Basic;
 
     fn sort_key(&self) -> SequenceQualityKey {
         SequenceQualityKey
     }
 
-    fn compare(&self) -> Natural {
+    fn comparator(&self) -> Self {
+        *self
+    }
+
+    fn key_comparator(&self) -> Natural {
         Natural
+    }
+}
+
+impl<R: SeqRecordParts + ?Sized> Compare<R> for UnkeyedSequenceOrder {
+    fn compare(&self, a: &R, b: &R) -> std::cmp::Ordering {
+        a.sequence()
+            .cmp(b.sequence())
+            .then_with(|| a.quality().cmp(b.quality()))
     }
 }
 
@@ -309,15 +368,26 @@ impl sealed::Sealed for UnkeyedNameOrder {}
 
 impl SortOrder for UnkeyedNameOrder {
     type SortKey = NameKey;
-    type Compare = Natural;
+    type Comparator = Self;
+    type KeyComparator = Natural;
     type Strategy = Basic;
 
     fn sort_key(&self) -> NameKey {
         NameKey
     }
 
-    fn compare(&self) -> Natural {
+    fn comparator(&self) -> Self {
+        *self
+    }
+
+    fn key_comparator(&self) -> Natural {
         Natural
+    }
+}
+
+impl<R: SeqRecordParts + ?Sized> Compare<R> for UnkeyedNameOrder {
+    fn compare(&self, a: &R, b: &R) -> std::cmp::Ordering {
+        a.name().cmp(b.name())
     }
 }
 
@@ -329,15 +399,26 @@ impl sealed::Sealed for UnkeyedLengthOrder {}
 
 impl SortOrder for UnkeyedLengthOrder {
     type SortKey = LengthKey;
-    type Compare = Natural;
+    type Comparator = Self;
+    type KeyComparator = Natural;
     type Strategy = Basic;
 
     fn sort_key(&self) -> LengthKey {
         LengthKey
     }
 
-    fn compare(&self) -> Natural {
+    fn comparator(&self) -> Self {
+        *self
+    }
+
+    fn key_comparator(&self) -> Natural {
         Natural
+    }
+}
+
+impl<R: SeqRecordParts + ?Sized> Compare<R> for UnkeyedLengthOrder {
+    fn compare(&self, a: &R, b: &R) -> std::cmp::Ordering {
+        a.sequence().len().cmp(&b.sequence().len())
     }
 }
 
@@ -355,17 +436,32 @@ pub struct Reverse<O>(pub O);
 
 impl<O: sealed::Sealed> sealed::Sealed for Reverse<O> {}
 
-impl<O: SortOrder> SortOrder for Reverse<O> {
+impl<O: SortOrder + Send + Sync + 'static> SortOrder for Reverse<O> {
     type SortKey = O::SortKey;
-    type Compare = spillover::compare::Reverse<O::Compare>;
+    type Comparator = Self;
+    type KeyComparator = spillover::compare::Reverse<O::KeyComparator>;
     type Strategy = O::Strategy;
 
     fn sort_key(&self) -> Self::SortKey {
         self.0.sort_key()
     }
 
-    fn compare(&self) -> spillover::compare::Reverse<O::Compare> {
-        spillover::compare::Reverse(self.0.compare())
+    fn comparator(&self) -> Self {
+        *self
+    }
+
+    fn key_comparator(&self) -> spillover::compare::Reverse<O::KeyComparator> {
+        spillover::compare::Reverse(self.0.key_comparator())
+    }
+}
+
+impl<O, R> Compare<R> for Reverse<O>
+where
+    O: SortOrder + Compare<R>,
+    R: SeqRecordParts + ?Sized,
+{
+    fn compare(&self, a: &R, b: &R) -> std::cmp::Ordering {
+        self.0.compare(a, b).reverse()
     }
 }
 
@@ -495,10 +591,6 @@ pub struct OwnedStorage;
 
 /// Builder marker: use caller-provided arena storage for the spill window.
 pub struct ArenaStorage<'a> {
-    #[allow(
-        dead_code,
-        reason = "arena-backed build will consume the arena storage marker in the next phase"
-    )]
     arena: &'a mut SeqRecordArena,
 }
 
@@ -616,9 +708,34 @@ pub struct Builder<
 ///
 /// Construct a sorter with [`Builder`], push unsorted records into it, then call
 /// [`finish`](Self::finish) to produce a [`SortedRecordStream`].
-pub struct Sorter<SK, Cod, Cmp, CS, M> {
-    inner: spillover::sorter::Sorter<SeqRecord, SK, Cod, Cmp, Identity, CS, M>,
+pub struct Sorter<SK, Cod, Cmp, CS, M, B = OwnedBackend<SK, Cod, Cmp, CS, M>> {
+    inner: B,
     dedup: RecordDedup,
+    _types: std::marker::PhantomData<SorterTypeMarker<SK, Cod, Cmp, CS, M>>,
+}
+
+type SorterTypeMarker<SK, Cod, Cmp, CS, M> = fn() -> (SK, Cod, Cmp, CS, M);
+
+/// Default owned-record backend for [`Sorter`].
+#[doc(hidden)]
+pub struct OwnedBackend<SK, Cod, Cmp, CS, M> {
+    inner: spillover::sorter::Sorter<SeqRecord, SK, Cod, Cmp, Identity, CS, M>,
+}
+
+/// Arena-backed spill-window backend for [`Sorter`].
+#[doc(hidden)]
+pub struct ArenaBackend<'a, SK, Cod, KeyCmp, RecCmp, CS, M> {
+    arena: &'a mut SeqRecordArena,
+    handles: Vec<SeqRecordHandle>,
+    spilled_runs: Vec<SortedRun>,
+    sort_key: SK,
+    codec: Cod,
+    key_comparator: KeyCmp,
+    comparator: RecCmp,
+    chunk_sort: CS,
+    flush: FlushConfig,
+    merge_config: MergeConfig,
+    _mode: std::marker::PhantomData<fn() -> M>,
 }
 
 /// Finalized stream of sorted sequence records.
@@ -627,7 +744,7 @@ pub struct Sorter<SK, Cod, Cmp, CS, M> {
 /// been finished. It implements [`Iterator`] for owned materialization, so
 /// ordinary `.collect()` callsites continue to work.
 pub struct SortedRecordStream<I> {
-    inner: spillover::Sorted<I>,
+    inner: I,
     dedup: RecordDedup,
     previous: Option<PreviousRecord>,
     fused: bool,
@@ -677,9 +794,108 @@ where
     }
 }
 
+impl<SK, Cod, KeyCmp, RecCmp, CS, M> ArenaBackend<'_, SK, Cod, KeyCmp, RecCmp, CS, M> {
+    fn should_flush(&self) -> bool {
+        match self.flush {
+            FlushConfig::MeasuredBudget(budget) => self.arena.byte_len() >= budget,
+            FlushConfig::MaxItems(max_items) => self.handles.len() >= max_items,
+        }
+    }
+
+    fn sorted_views(&self) -> Vec<SeqRecordView<'_>> {
+        self.handles
+            .iter()
+            .map(|&handle| self.arena.view(handle))
+            .collect()
+    }
+
+    fn clear_spill_window(&mut self) {
+        self.handles.clear();
+        self.arena.clear();
+    }
+}
+
+impl<SK, Cod, KeyCmp, RecCmp, CS>
+    ArenaBackend<'_, SK, Cod, KeyCmp, RecCmp, CS, spillover::sorter::Basic>
+where
+    SK: SortKey<SeqRecord> + Copy + Send + Sync + 'static,
+    Cod: Codec<Item = SeqRecord> + Copy + 'static,
+    for<'r, 'v> Cod::Writer<&'r mut std::fs::File>:
+        CodecWriter<SeqRecordView<'v>, Error = Cod::Error>,
+    KeyCmp: for<'r> Compare<<SK as SortKey<SeqRecord>>::Key<'r>> + Copy + Send + Sync + 'static,
+    for<'v> RecCmp: Compare<SeqRecordView<'v>>,
+    RecCmp: Copy + Send + Sync + 'static,
+    for<'v> CS: ChunkSorter<SeqRecordView<'v>>,
+{
+    fn flush_basic(&mut self) -> Result<(), MergeError<Cod::Error>> {
+        if self.handles.is_empty() {
+            return Ok(());
+        }
+
+        let mut views = self.sorted_views();
+        let comparator = self.comparator;
+        self.chunk_sort
+            .sort(&mut views, move |a, b| comparator.compare(a, b));
+
+        let run_merger = RunMerger::new(
+            self.codec,
+            KeyCompare::new(self.sort_key, self.key_comparator),
+            self.merge_config.clone(),
+        );
+        let run = run_merger.spill_sorted(views)?;
+        self.spilled_runs.push(run);
+        self.clear_spill_window();
+
+        Ok(())
+    }
+}
+
+impl<SK, Cod, KeyCmp, RecCmp, CS>
+    ArenaBackend<'_, SK, Cod, KeyCmp, RecCmp, CS, spillover::sorter::Keyed>
+where
+    SK: SortKey<SeqRecord> + Copy + Send + Sync + 'static,
+    Cod: KeyedCodec<Item = SeqRecord> + DeriveKey<SeqRecord> + Copy + 'static,
+    for<'v> Cod: DeriveKey<SeqRecordView<'v>>,
+    for<'r> Cod::KeyedWriter<&'r mut std::fs::File>:
+        KeyedCodecWriter<SeqRecord, Cod::Key, Error = Cod::Error>,
+    for<'r, 'v> Cod::KeyedWriter<&'r mut std::fs::File>:
+        KeyedCodecWriter<SeqRecordView<'v>, Cod::Key, Error = Cod::Error>,
+    KeyCmp: for<'r> Compare<<SK as SortKey<SeqRecord>>::Key<'r>>
+        + Compare<Cod::Key>
+        + Copy
+        + Send
+        + Sync
+        + 'static,
+    for<'v> RecCmp: Compare<SeqRecordView<'v>>,
+    RecCmp: Copy + Send + Sync + 'static,
+    for<'v> CS: ChunkSorter<SeqRecordView<'v>>,
+{
+    fn flush_keyed(&mut self) -> Result<(), MergeError<Cod::Error>> {
+        if self.handles.is_empty() {
+            return Ok(());
+        }
+
+        let mut views = self.sorted_views();
+        let comparator = self.comparator;
+        self.chunk_sort
+            .sort(&mut views, move |a, b| comparator.compare(a, b));
+
+        let run_merger = RunMerger::new(
+            self.codec,
+            KeyCompare::new(self.sort_key, self.key_comparator),
+            self.merge_config.clone(),
+        );
+        let run = run_merger.spill_sorted_with_keys(views)?;
+        self.spilled_runs.push(run);
+        self.clear_spill_window();
+
+        Ok(())
+    }
+}
+
 impl<I, E> Iterator for SortedRecordStream<I>
 where
-    spillover::Sorted<I>: Iterator<Item = Result<SeqRecord, E>>,
+    I: Iterator<Item = Result<SeqRecord, E>>,
 {
     type Item = Result<SeqRecord, E>;
 
@@ -747,8 +963,7 @@ where
         }
 
         inner
-            .items()
-            .try_for_each(|record| {
+            .visit_items(|record| {
                 if dedup.is_duplicate(previous.as_ref(), &record) {
                     return Ok(());
                 }
@@ -794,7 +1009,15 @@ impl Default for Builder {
 // push/finish implementations. The bio wrapper owns the public lifecycle
 // vocabulary; core owns the sorting mechanics.
 
-impl<SK, Cod, Cmp, CS> Sorter<SK, Cod, Cmp, CS, spillover::sorter::Basic>
+impl<SK, Cod, Cmp, CS>
+    Sorter<
+        SK,
+        Cod,
+        Cmp,
+        CS,
+        spillover::sorter::Basic,
+        OwnedBackend<SK, Cod, Cmp, CS, spillover::sorter::Basic>,
+    >
 where
     SK: SortKey<SeqRecord> + Copy + Send + Sync + 'static,
     Cod: Codec<Item = SeqRecord> + Copy + 'static,
@@ -808,7 +1031,7 @@ where
     ///
     /// Returns an error if flushing buffered records to disk fails.
     pub fn push(&mut self, record: impl Into<SeqRecord>) -> Result<(), MergeError<Cod::Error>> {
-        self.inner.push(record.into())
+        self.inner.inner.push(record.into())
     }
 
     /// Finish sorting and return the finalized sorted record stream.
@@ -820,11 +1043,11 @@ where
     pub fn finish(
         self,
     ) -> Result<
-        SortedRecordStream<RunMerge<SeqRecord, Cod, KeyCompare<SK, Cmp>>>,
+        SortedRecordStream<spillover::Sorted<RunMerge<SeqRecord, Cod, KeyCompare<SK, Cmp>>>>,
         MergeError<Cod::Error>,
     > {
         Ok(SortedRecordStream {
-            inner: self.inner.finish()?,
+            inner: self.inner.inner.finish()?,
             dedup: self.dedup,
             previous: None,
             fused: false,
@@ -832,7 +1055,159 @@ where
     }
 }
 
-impl<SK, Cod, Cmp, CS> Sorter<SK, Cod, Cmp, CS, spillover::sorter::Keyed>
+impl<SK, Cod, Cmp, RecCmp, CS>
+    Sorter<
+        SK,
+        Cod,
+        Cmp,
+        CS,
+        spillover::sorter::Basic,
+        ArenaBackend<'_, SK, Cod, Cmp, RecCmp, CS, spillover::sorter::Basic>,
+    >
+where
+    SK: SortKey<SeqRecord> + Copy + Send + Sync + 'static,
+    Cod: Codec<Item = SeqRecord> + Copy + 'static,
+    for<'r> Cod::Writer<&'r mut std::fs::File>: CodecWriter<SeqRecord, Error = Cod::Error>,
+    for<'r, 'v> Cod::Writer<&'r mut std::fs::File>:
+        CodecWriter<SeqRecordView<'v>, Error = Cod::Error>,
+    Cmp: for<'r> Compare<<SK as SortKey<SeqRecord>>::Key<'r>> + Copy + Send + Sync + 'static,
+    for<'v> RecCmp: Compare<SeqRecordView<'v>>,
+    RecCmp: Copy + Send + Sync + 'static,
+    for<'v> CS: ChunkSorter<SeqRecordView<'v>>,
+{
+    /// Add an unsorted record to the arena-backed sorter.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if flushing buffered records to disk fails.
+    pub fn push<R: SeqRecordParts + ?Sized>(
+        &mut self,
+        record: &R,
+    ) -> Result<(), MergeError<Cod::Error>> {
+        let handle = self.inner.arena.store(record);
+        self.inner.handles.push(handle);
+
+        if self.inner.should_flush() {
+            self.inner.flush_basic()?;
+        }
+
+        Ok(())
+    }
+
+    /// Finish sorting and return the finalized sorted record stream.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if flushing or merging fails.
+    #[allow(clippy::type_complexity)]
+    pub fn finish(
+        mut self,
+    ) -> Result<
+        SortedRecordStream<RunMerge<SeqRecord, Cod, KeyCompare<SK, Cmp>>>,
+        MergeError<Cod::Error>,
+    > {
+        self.inner.flush_basic()?;
+
+        let item_cmp = KeyCompare::new(self.inner.sort_key, self.inner.key_comparator);
+        let run_merger =
+            RunMerger::new(self.inner.codec, item_cmp, self.inner.merge_config.clone());
+        let merged = run_merger.merge(std::mem::take(&mut self.inner.spilled_runs))?;
+
+        Ok(SortedRecordStream {
+            inner: merged,
+            dedup: self.dedup,
+            previous: None,
+            fused: false,
+        })
+    }
+}
+
+impl<SK, Cod, Cmp, RecCmp, CS>
+    Sorter<
+        SK,
+        Cod,
+        Cmp,
+        CS,
+        spillover::sorter::Keyed,
+        ArenaBackend<'_, SK, Cod, Cmp, RecCmp, CS, spillover::sorter::Keyed>,
+    >
+where
+    SK: SortKey<SeqRecord> + Copy + Send + Sync + 'static,
+    Cod: KeyedCodec<Item = SeqRecord> + DeriveKey<SeqRecord> + Copy + 'static,
+    for<'v> Cod: DeriveKey<SeqRecordView<'v>>,
+    for<'r> Cod::KeyedWriter<&'r mut std::fs::File>:
+        KeyedCodecWriter<SeqRecord, Cod::Key, Error = Cod::Error>,
+    for<'r, 'v> Cod::KeyedWriter<&'r mut std::fs::File>:
+        KeyedCodecWriter<SeqRecordView<'v>, Cod::Key, Error = Cod::Error>,
+    Cmp: for<'r> Compare<<SK as SortKey<SeqRecord>>::Key<'r>>
+        + Compare<Cod::Key>
+        + Copy
+        + Send
+        + Sync
+        + 'static,
+    for<'v> RecCmp: Compare<SeqRecordView<'v>>,
+    RecCmp: Copy + Send + Sync + 'static,
+    for<'v> CS: ChunkSorter<SeqRecordView<'v>>,
+{
+    /// Add an unsorted record to the arena-backed sorter.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if flushing buffered records to disk fails.
+    pub fn push<R: SeqRecordParts + ?Sized>(
+        &mut self,
+        record: &R,
+    ) -> Result<(), MergeError<Cod::Error>> {
+        let handle = self.inner.arena.store(record);
+        self.inner.handles.push(handle);
+
+        if self.inner.should_flush() {
+            self.inner.flush_keyed()?;
+        }
+
+        Ok(())
+    }
+
+    /// Finish sorting and return the finalized sorted record stream.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if flushing or merging fails.
+    #[allow(clippy::type_complexity)]
+    pub fn finish(
+        mut self,
+    ) -> Result<
+        SortedRecordStream<KeyedRunMerge<SeqRecord, Cod, Cmp, KeyCompare<SK, Cmp>>>,
+        MergeError<Cod::Error>,
+    > {
+        self.inner.flush_keyed()?;
+
+        let item_cmp = KeyCompare::new(self.inner.sort_key, self.inner.key_comparator);
+        let run_merger =
+            RunMerger::new(self.inner.codec, item_cmp, self.inner.merge_config.clone());
+        let merged = run_merger.merge_keyed(
+            std::mem::take(&mut self.inner.spilled_runs),
+            self.inner.key_comparator,
+        )?;
+
+        Ok(SortedRecordStream {
+            inner: merged,
+            dedup: self.dedup,
+            previous: None,
+            fused: false,
+        })
+    }
+}
+
+impl<SK, Cod, Cmp, CS>
+    Sorter<
+        SK,
+        Cod,
+        Cmp,
+        CS,
+        spillover::sorter::Keyed,
+        OwnedBackend<SK, Cod, Cmp, CS, spillover::sorter::Keyed>,
+    >
 where
     SK: SortKey<SeqRecord> + Copy + Send + Sync + 'static,
     Cod: KeyedCodec<Item = SeqRecord> + DeriveKey<SeqRecord> + Copy + 'static,
@@ -847,7 +1222,7 @@ where
     ///
     /// Returns an error if flushing buffered records to disk fails.
     pub fn push(&mut self, record: impl Into<SeqRecord>) -> Result<(), MergeError<Cod::Error>> {
-        self.inner.push(record.into())
+        self.inner.inner.push(record.into())
     }
 
     /// Finish sorting and return the finalized sorted record stream.
@@ -859,11 +1234,13 @@ where
     pub fn finish(
         self,
     ) -> Result<
-        SortedRecordStream<KeyedRunMerge<SeqRecord, Cod, Cmp, KeyCompare<SK, Cmp>>>,
+        SortedRecordStream<
+            spillover::Sorted<KeyedRunMerge<SeqRecord, Cod, Cmp, KeyCompare<SK, Cmp>>>,
+        >,
         MergeError<Cod::Error>,
     > {
         Ok(SortedRecordStream {
-            inner: self.inner.finish()?,
+            inner: self.inner.inner.finish()?,
             dedup: self.dedup,
             previous: None,
             fused: false,
@@ -1116,7 +1493,7 @@ impl<O, C, F, CS> Builder<HasKeyedOrder<O>, C, F, CS, OwnedStorage>
 where
     O: KeyedSortOrder,
     O::SortKey: Send + Sync + 'static,
-    O::Compare: for<'a> Compare<<O::SortKey as SortKey<SeqRecord>>::Key<'a>>
+    O::KeyComparator: for<'a> Compare<<O::SortKey as SortKey<SeqRecord>>::Key<'a>>
         + Compare<<O as RecordKeyer>::RecordKey>
         + Send
         + Sync
@@ -1138,7 +1515,7 @@ where
     ) -> Sorter<
         O::SortKey,
         KeyedDryIceCodec<O, C::S, C::Q, C::N>,
-        O::Compare,
+        O::KeyComparator,
         CS,
         spillover::sorter::Keyed,
     > {
@@ -1150,7 +1527,7 @@ where
 
         let builder = spillover::sorter::Builder::new()
             .key(order.sort_key())
-            .compare(order.compare())
+            .compare(order.key_comparator())
             .keyed_codec(keyed_codec)
             .dedup(Identity)
             .chunk_sort(self.chunk_sort)
@@ -1166,8 +1543,69 @@ where
         };
 
         Sorter {
-            inner,
+            inner: OwnedBackend { inner },
             dedup: self.dedup,
+            _types: std::marker::PhantomData,
+        }
+    }
+}
+
+impl<'a, O, C, F, CS> Builder<HasKeyedOrder<O>, C, F, CS, ArenaStorage<'a>>
+where
+    O: KeyedSortOrder,
+    O::SortKey: Send + Sync + 'static,
+    O::KeyComparator: for<'r> Compare<<O::SortKey as SortKey<SeqRecord>>::Key<'r>>
+        + Compare<<O as RecordKeyer>::RecordKey>
+        + Send
+        + Sync
+        + 'static,
+    <O as RecordKeyer>::RecordKey: RecordKey + Clone + 'static,
+    C: sealed::ResolveCodec,
+    F: sealed::ResolveFlush,
+    for<'v> CS: ChunkSorter<SeqRecordView<'v>>,
+    for<'v> O::Comparator: Compare<SeqRecordView<'v>>,
+{
+    /// Build an arena-backed sorter (keyed merge path).
+    #[allow(clippy::type_complexity)]
+    #[must_use]
+    pub fn build(
+        self,
+    ) -> Sorter<
+        O::SortKey,
+        KeyedDryIceCodec<O, C::S, C::Q, C::N>,
+        O::KeyComparator,
+        CS,
+        spillover::sorter::Keyed,
+        ArenaBackend<
+            'a,
+            O::SortKey,
+            KeyedDryIceCodec<O, C::S, C::Q, C::N>,
+            O::KeyComparator,
+            O::Comparator,
+            CS,
+            spillover::sorter::Keyed,
+        >,
+    > {
+        let order = self.order.0;
+        let codec = self.codec.resolve();
+        let keyed_codec = codec.with_record_keyer(order);
+
+        Sorter {
+            inner: ArenaBackend {
+                arena: self.storage.arena,
+                handles: Vec::new(),
+                spilled_runs: Vec::new(),
+                sort_key: order.sort_key(),
+                codec: keyed_codec,
+                key_comparator: order.key_comparator(),
+                comparator: order.comparator(),
+                chunk_sort: self.chunk_sort,
+                flush: self.flush.resolve(),
+                merge_config: self.merge_config,
+                _mode: std::marker::PhantomData,
+            },
+            dedup: self.dedup,
+            _types: std::marker::PhantomData,
         }
     }
 }
@@ -1178,7 +1616,7 @@ impl<O, C, F, CS> Builder<HasUnkeyedOrder<O>, C, F, CS, OwnedStorage>
 where
     O: SortOrder<Strategy = Basic>,
     O::SortKey: Send + Sync + 'static,
-    O::Compare:
+    O::KeyComparator:
         for<'a> Compare<<O::SortKey as SortKey<SeqRecord>>::Key<'a>> + Send + Sync + 'static,
     C: sealed::ResolveCodec,
     F: sealed::ResolveFlush,
@@ -1193,8 +1631,13 @@ where
     #[must_use]
     pub fn build(
         self,
-    ) -> Sorter<O::SortKey, DryIceCodec<C::S, C::Q, C::N>, O::Compare, CS, spillover::sorter::Basic>
-    {
+    ) -> Sorter<
+        O::SortKey,
+        DryIceCodec<C::S, C::Q, C::N>,
+        O::KeyComparator,
+        CS,
+        spillover::sorter::Basic,
+    > {
         let order = self.order.0;
         let _storage = self.storage;
         let codec = self.codec.resolve();
@@ -1202,7 +1645,7 @@ where
 
         let builder = spillover::sorter::Builder::new()
             .key(order.sort_key())
-            .compare(order.compare())
+            .compare(order.key_comparator())
             .codec(codec)
             .dedup(Identity)
             .chunk_sort(self.chunk_sort)
@@ -1218,8 +1661,63 @@ where
         };
 
         Sorter {
-            inner,
+            inner: OwnedBackend { inner },
             dedup: self.dedup,
+            _types: std::marker::PhantomData,
+        }
+    }
+}
+
+impl<'a, O, C, F, CS> Builder<HasUnkeyedOrder<O>, C, F, CS, ArenaStorage<'a>>
+where
+    O: SortOrder<Strategy = Basic>,
+    O::SortKey: Send + Sync + 'static,
+    O::KeyComparator:
+        for<'r> Compare<<O::SortKey as SortKey<SeqRecord>>::Key<'r>> + Send + Sync + 'static,
+    C: sealed::ResolveCodec,
+    F: sealed::ResolveFlush,
+    for<'v> CS: ChunkSorter<SeqRecordView<'v>>,
+    for<'v> O::Comparator: Compare<SeqRecordView<'v>>,
+{
+    /// Build an arena-backed sorter (basic merge path, no record keys).
+    #[allow(clippy::type_complexity)]
+    #[must_use]
+    pub fn build(
+        self,
+    ) -> Sorter<
+        O::SortKey,
+        DryIceCodec<C::S, C::Q, C::N>,
+        O::KeyComparator,
+        CS,
+        spillover::sorter::Basic,
+        ArenaBackend<
+            'a,
+            O::SortKey,
+            DryIceCodec<C::S, C::Q, C::N>,
+            O::KeyComparator,
+            O::Comparator,
+            CS,
+            spillover::sorter::Basic,
+        >,
+    > {
+        let order = self.order.0;
+
+        Sorter {
+            inner: ArenaBackend {
+                arena: self.storage.arena,
+                handles: Vec::new(),
+                spilled_runs: Vec::new(),
+                sort_key: order.sort_key(),
+                codec: self.codec.resolve(),
+                key_comparator: order.key_comparator(),
+                comparator: order.comparator(),
+                chunk_sort: self.chunk_sort,
+                flush: self.flush.resolve(),
+                merge_config: self.merge_config,
+                _mode: std::marker::PhantomData,
+            },
+            dedup: self.dedup,
+            _types: std::marker::PhantomData,
         }
     }
 }
@@ -1425,7 +1923,7 @@ mod tests {
     fn sequence_order_uses_tuple_key_with_tiebreaker() {
         let order = ILLUMINA_ORDER;
         let sk = order.sort_key();
-        let cmp = order.compare();
+        let cmp = order.key_comparator();
 
         let a = make_record(b"r1", b"ACGT", b"IIII");
         let b = make_record(b"r2", b"ACGT", b"!!!!");
@@ -1444,7 +1942,7 @@ mod tests {
     fn reverse_flips_key_ordering() {
         let order = Reverse(ILLUMINA_ORDER);
         let sk = order.sort_key();
-        let cmp = order.compare();
+        let cmp = order.key_comparator();
 
         let a = make_record(b"r1", b"AAAA", b"!!!!");
         let b = make_record(b"r2", b"TTTT", b"!!!!");

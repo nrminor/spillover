@@ -4,7 +4,7 @@ use dryice::SeqRecordLike;
 use spillover_bio::{
     codec::DryIceCodec,
     error::SortedRecordStreamError,
-    record::{SeqRecord, SeqRecordParts},
+    record::{SeqRecord, SeqRecordArena, SeqRecordParts, SeqRecordView},
     sort::{Builder, ILLUMINA_ORDER, SeqRecordSink},
 };
 
@@ -132,6 +132,97 @@ fn unkeyed_sorter_accepts_borrowed_record_views() {
     assert_eq!(results[0].sequence(), b"AAAAAAAA");
     assert_eq!(results[1].sequence(), b"CCCCCCCC");
     assert_eq!(results[2].sequence(), b"TTTTTTTT");
+}
+
+#[test]
+fn arena_keyed_sorter_sorts_borrowed_record_views() {
+    let mut arena = SeqRecordArena::new();
+    let mut sorter = Builder::new()
+        .sort_by_illumina()
+        .codec(DryIceCodec::new())
+        .arena(&mut arena)
+        .max_buffer_items(2)
+        .build();
+
+    let records = [
+        make_record(b"r3", b"TTTTTTTT", b"!!!!!!!!"),
+        make_record(b"r1", b"AAAAAAAA", b"!!!!!!!!"),
+        make_record(b"r2", b"CCCCCCCC", b"!!!!!!!!"),
+    ];
+
+    for rec in &records {
+        sorter.push(&rec.as_view()).expect("push should succeed");
+    }
+
+    let results: Vec<SeqRecord> = sorter
+        .finish()
+        .expect("finish should succeed")
+        .map(|r| r.expect("each record should decode"))
+        .collect();
+
+    assert_eq!(results.len(), 3);
+    assert_eq!(results[0].sequence(), b"AAAAAAAA");
+    assert_eq!(results[1].sequence(), b"CCCCCCCC");
+    assert_eq!(results[2].sequence(), b"TTTTTTTT");
+}
+
+#[test]
+fn arena_unkeyed_sorter_sorts_borrowed_record_views() {
+    let mut arena = SeqRecordArena::new();
+    let mut sorter = Builder::new()
+        .sort_by_unkeyed(ILLUMINA_ORDER.unkeyed())
+        .codec(DryIceCodec::new())
+        .arena(&mut arena)
+        .max_buffer_items(2)
+        .build();
+
+    let records = [
+        make_record(b"r3", b"TTTTTTTT", b"!!!!!!!!"),
+        make_record(b"r1", b"AAAAAAAA", b"!!!!!!!!"),
+        make_record(b"r2", b"CCCCCCCC", b"!!!!!!!!"),
+    ];
+
+    for rec in &records {
+        sorter.push(&rec.as_view()).expect("push should succeed");
+    }
+
+    let results: Vec<SeqRecord> = sorter
+        .finish()
+        .expect("finish should succeed")
+        .map(|r| r.expect("each record should decode"))
+        .collect();
+
+    assert_eq!(results.len(), 3);
+    assert_eq!(results[0].sequence(), b"AAAAAAAA");
+    assert_eq!(results[1].sequence(), b"CCCCCCCC");
+    assert_eq!(results[2].sequence(), b"TTTTTTTT");
+}
+
+#[test]
+fn arena_sorter_clears_arena_after_finish() {
+    let mut arena = SeqRecordArena::new();
+    {
+        let mut sorter = Builder::new()
+            .sort_by_illumina()
+            .codec(DryIceCodec::new())
+            .arena(&mut arena)
+            .max_buffer_items(10)
+            .build();
+
+        sorter
+            .push(&SeqRecordView::new(b"r1", b"AAAAAAAA", b"!!!!!!!!"))
+            .expect("push should succeed");
+
+        let results: Vec<SeqRecord> = sorter
+            .finish()
+            .expect("finish should succeed")
+            .map(|r| r.expect("each record should decode"))
+            .collect();
+
+        assert_eq!(results.len(), 1);
+    }
+
+    assert!(arena.is_empty());
 }
 
 #[test]

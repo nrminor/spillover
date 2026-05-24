@@ -471,6 +471,27 @@ where
     }
 }
 
+impl<I> sealed::Sealed for Sorted<I> where I: VisitSortedItems + 'static {}
+
+impl<I> VisitSortedItems for Sorted<I>
+where
+    I: VisitSortedItems + 'static,
+{
+    type Item<'a>
+        = I::Item<'a>
+    where
+        Self: 'a;
+
+    type Error = I::Error;
+
+    fn visit_items<F, FE>(self, f: F) -> Result<(), SortedItemsError<Self::Error, FE>>
+    where
+        F: for<'a> FnMut(Self::Item<'a>) -> Result<(), FE>,
+    {
+        self.source.visit_items(f)
+    }
+}
+
 // ── Basic path: push + flush + finish ────────────────────
 
 impl<T, SK, Cod, Cmp, D, CS> Sorter<T, SK, Cod, Cmp, D, CS, Basic>
