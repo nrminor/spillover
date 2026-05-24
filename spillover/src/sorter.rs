@@ -23,7 +23,7 @@ use crate::{
     compare::{Compare, Natural},
     dedup::{Dedup, Identity},
     key::{KeyCompare, SortKey},
-    merge::{KeyedRunMerge, MergeConfig, MergeError, RunMerge, RunMerger, SortedRun},
+    merge::{KeyedRunMerge, MergeConfig, MergeError, RunMerge, RunMerger, RunWriter, SortedRun},
 };
 
 /// How the sorter decides when to flush the in-memory buffer to
@@ -512,9 +512,10 @@ where
             Compare::compare(&item_cmp, a, b)
         });
 
-        let run_merger = RunMerger::new(self.codec, item_cmp, self.config.merge.clone());
-        let run = run_merger.spill_sorted(self.buffer.drain(..))?;
+        let run_writer = RunWriter::new_unkeyed(self.codec, self.config.merge.clone());
+        let run = run_writer.write_sorted(&self.buffer)?;
         self.spilled_runs.push(run);
+        self.buffer.clear();
         self.buffer_bytes = 0;
 
         Ok(())
@@ -599,22 +600,9 @@ where
             Compare::compare(&item_cmp, a, b)
         });
 
-        let named = match self.config.merge.temp_dir {
-            Some(ref dir) => tempfile::NamedTempFile::new_in(dir).map_err(MergeError::Io)?,
-            None => tempfile::NamedTempFile::new().map_err(MergeError::Io)?,
-        };
-        let mut file = named.reopen().map_err(MergeError::Io)?;
-        let mut writer = self.codec.keyed_writer(&mut file);
-        for item in &self.buffer {
-            let key = self.codec.derive_key(item);
-            writer.write_keyed(item, &key).map_err(MergeError::Codec)?;
-        }
-        writer.finish().map_err(MergeError::Codec)?;
-        drop(file);
-
-        self.spilled_runs.push(SortedRun {
-            path: named.into_temp_path(),
-        });
+        let run_writer = RunWriter::new_keyed(self.codec, self.config.merge.clone());
+        let run = run_writer.write_sorted(&self.buffer)?;
+        self.spilled_runs.push(run);
         self.buffer.clear();
         self.buffer_bytes = 0;
 

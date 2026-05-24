@@ -242,6 +242,101 @@ pub struct RunMerger<T, C: Codec<Item = T>, Cmp: Compare<T> + Copy> {
     _item: std::marker::PhantomData<fn() -> T>,
 }
 
+/// Writes sorted entries into temporary run files.
+pub(crate) struct RunWriter<C, M> {
+    codec: C,
+    config: MergeConfig,
+    _mode: std::marker::PhantomData<fn() -> M>,
+}
+
+pub(crate) struct Unkeyed;
+
+pub(crate) struct Keyed;
+
+impl<C> RunWriter<C, Unkeyed> {
+    pub(crate) fn new_unkeyed(codec: C, config: MergeConfig) -> Self {
+        Self {
+            codec,
+            config,
+            _mode: std::marker::PhantomData,
+        }
+    }
+}
+
+impl<C> RunWriter<C, Keyed> {
+    pub(crate) fn new_keyed(codec: C, config: MergeConfig) -> Self {
+        Self {
+            codec,
+            config,
+            _mode: std::marker::PhantomData,
+        }
+    }
+}
+
+impl<C, M> RunWriter<C, M> {
+    fn create_temp_file<CE>(&self) -> MergeResult<tempfile::NamedTempFile, CE> {
+        let file = match self.config.temp_dir {
+            Some(ref dir) => tempfile::NamedTempFile::new_in(dir)?,
+            None => tempfile::NamedTempFile::new()?,
+        };
+        Ok(file)
+    }
+}
+
+impl<C> RunWriter<C, Unkeyed>
+where
+    C: Codec + Copy,
+{
+    pub(crate) fn write_sorted<T>(&self, items: &[T]) -> MergeResult<SortedRun, C::Error>
+    where
+        C: Codec<Item = T>,
+        for<'a> C::Writer<&'a mut std::fs::File>: CodecWriter<T, Error = C::Error>,
+    {
+        let named = self.create_temp_file()?;
+        let mut file = named.reopen().map_err(MergeError::Io)?;
+        let mut writer = self.codec.writer(&mut file);
+
+        for item in items {
+            writer.write(item).map_err(MergeError::Codec)?;
+        }
+
+        writer.finish().map_err(MergeError::Codec)?;
+        drop(file);
+
+        Ok(SortedRun {
+            path: named.into_temp_path(),
+        })
+    }
+}
+
+impl<C> RunWriter<C, Keyed>
+where
+    C: KeyedCodec + Copy,
+{
+    pub(crate) fn write_sorted<T>(&self, items: &[T]) -> MergeResult<SortedRun, C::Error>
+    where
+        C: KeyedCodec<Item = T> + DeriveKey<T>,
+        for<'a> C::KeyedWriter<&'a mut std::fs::File>:
+            KeyedCodecWriter<T, C::Key, Error = C::Error>,
+    {
+        let named = self.create_temp_file()?;
+        let mut file = named.reopen().map_err(MergeError::Io)?;
+        let mut writer = self.codec.keyed_writer(&mut file);
+
+        for item in items {
+            let key = self.codec.derive_key(item);
+            writer.write_keyed(item, &key).map_err(MergeError::Codec)?;
+        }
+
+        writer.finish().map_err(MergeError::Codec)?;
+        drop(file);
+
+        Ok(SortedRun {
+            path: named.into_temp_path(),
+        })
+    }
+}
+
 impl<T: 'static, C: Codec<Item = T> + Copy + 'static, Cmp: Compare<T> + Copy + 'static>
     RunMerger<T, C, Cmp>
 {
