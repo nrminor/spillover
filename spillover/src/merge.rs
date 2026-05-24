@@ -300,7 +300,7 @@ where
             writer.write(item).map_err(MergeError::Codec)?;
         }
 
-        writer.finish().map_err(MergeError::Codec)?;
+        CodecWriter::<T>::finish(writer).map_err(MergeError::Codec)?;
         drop(file);
 
         Ok(SortedRun {
@@ -362,40 +362,30 @@ impl<T: 'static, C: Codec<Item = T> + Copy + 'static, Cmp: Compare<T> + Copy + '
 
 impl<T: 'static, C: Codec<Item = T> + Copy + 'static, Cmp: Compare<T> + Copy + 'static>
     RunMerger<T, C, Cmp>
-where
-    for<'a> C::Writer<&'a mut std::fs::File>: CodecWriter<T, Error = C::Error>,
 {
     /// Write a pre-sorted iterator of items to a temporary file.
+    ///
+    /// The write-side item type may differ from [`Codec::Item`]. This is useful
+    /// for callers that can expose borrowed or view-shaped records while the
+    /// codec cursor still materializes owned items when the run is read back.
+    /// The caller is responsible for providing items in sorted order.
     ///
     /// # Errors
     ///
     /// Returns an error if writing fails.
-    pub fn spill_sorted(
+    pub fn spill_sorted<I>(
         &self,
-        items: impl IntoIterator<Item = T>,
-    ) -> Result<SortedRun, MergeError<C::Error>> {
+        items: impl IntoIterator<Item = I>,
+    ) -> Result<SortedRun, MergeError<C::Error>>
+    where
+        for<'a> C::Writer<&'a mut std::fs::File>: CodecWriter<I, Error = C::Error>,
+    {
         let named = self.create_temp_file()?;
         let mut file = named.reopen().map_err(MergeError::Io)?;
         let mut writer = self.codec.writer(&mut file);
 
-        #[cfg(debug_assertions)]
-        let mut prev: Option<T> = None;
-
         for item in items {
-            #[cfg(debug_assertions)]
-            if let Some(ref p) = prev {
-                debug_assert!(
-                    self.cmp.le(p, &item),
-                    "spill_sorted received unsorted input"
-                );
-            }
-
             writer.write(&item).map_err(MergeError::Codec)?;
-
-            #[cfg(debug_assertions)]
-            {
-                prev = Some(item);
-            }
         }
 
         writer.finish().map_err(MergeError::Codec)?;
@@ -415,7 +405,10 @@ where
     /// # Errors
     ///
     /// Returns an error if reading or merging fails.
-    pub fn merge(&self, mut runs: Vec<SortedRun>) -> MergeResult<RunMerge<T, C, Cmp>, C::Error> {
+    pub fn merge(&self, mut runs: Vec<SortedRun>) -> MergeResult<RunMerge<T, C, Cmp>, C::Error>
+    where
+        for<'a> C::Writer<&'a mut std::fs::File>: CodecWriter<T, Error = C::Error>,
+    {
         let codec = self.codec;
         let cmp = self.cmp;
         let fan_in = self.config.max_fan_in.get();
@@ -444,14 +437,17 @@ where
         &self,
         heap: &mut HeapMerge<MR, HCmp>,
         codec: C,
-    ) -> MergeResult<SortedRun, C::Error> {
+    ) -> MergeResult<SortedRun, C::Error>
+    where
+        for<'a> C::Writer<&'a mut std::fs::File>: CodecWriter<T, Error = C::Error>,
+    {
         let named = self.create_temp_file()?;
         let mut file = named.reopen().map_err(MergeError::Io)?;
         let mut writer = codec.writer(&mut file);
         while let Some(item) = heap.next_output()? {
             writer.write(&item).map_err(MergeError::Codec)?;
         }
-        writer.finish().map_err(MergeError::Codec)?;
+        CodecWriter::<T>::finish(writer).map_err(MergeError::Codec)?;
         drop(file);
         Ok(SortedRun {
             path: named.into_temp_path(),
@@ -462,10 +458,43 @@ where
 // Keyed merge — only available when the codec supports keys.
 impl<T: 'static, C: KeyedCodec<Item = T> + Copy + 'static, Cmp: Compare<T> + Copy + 'static>
     RunMerger<T, C, Cmp>
-where
-    C: DeriveKey<T>,
-    for<'a> C::KeyedWriter<&'a mut std::fs::File>: KeyedCodecWriter<T, C::Key, Error = C::Error>,
 {
+    /// Write a pre-sorted iterator of items and stored keys to a temporary file.
+    ///
+    /// The write-side item type may differ from [`Codec::Item`]. Keys are
+    /// derived from each write-side item and stored alongside the record so the
+    /// resulting run can be consumed by [`merge_keyed`](Self::merge_keyed).
+    /// The caller is responsible for providing items in sorted order.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if key derivation, encoding, or writing fails.
+    pub fn spill_sorted_with_keys<I>(
+        &self,
+        items: impl IntoIterator<Item = I>,
+    ) -> MergeResult<SortedRun, C::Error>
+    where
+        C: DeriveKey<I>,
+        for<'a> C::KeyedWriter<&'a mut std::fs::File>:
+            KeyedCodecWriter<I, C::Key, Error = C::Error>,
+    {
+        let named = self.create_temp_file()?;
+        let mut file = named.reopen().map_err(MergeError::Io)?;
+        let mut writer = self.codec.keyed_writer(&mut file);
+
+        for item in items {
+            let key = self.codec.derive_key(&item);
+            writer.write_keyed(&item, &key).map_err(MergeError::Codec)?;
+        }
+
+        KeyedCodecWriter::<I, C::Key>::finish(writer).map_err(MergeError::Codec)?;
+        drop(file);
+
+        Ok(SortedRun {
+            path: named.into_temp_path(),
+        })
+    }
+
     /// Merge sorted runs using the keyed path (key-only
     /// comparison, full deserialization only for the winner).
     ///
@@ -481,7 +510,12 @@ where
         &self,
         mut runs: Vec<SortedRun>,
         key_cmp: KeyCmp,
-    ) -> MergeResult<KeyedRunMerge<T, C, KeyCmp, Cmp>, C::Error> {
+    ) -> MergeResult<KeyedRunMerge<T, C, KeyCmp, Cmp>, C::Error>
+    where
+        C: DeriveKey<T>,
+        for<'a> C::KeyedWriter<&'a mut std::fs::File>:
+            KeyedCodecWriter<T, C::Key, Error = C::Error>,
+    {
         let codec = self.codec;
         let fan_in = self.config.max_fan_in.get();
 
@@ -508,7 +542,12 @@ where
         &self,
         heap: &mut KeyedHeapMerge<T, C, KeyCmp, Cmp>,
         codec: C,
-    ) -> MergeResult<SortedRun, C::Error> {
+    ) -> MergeResult<SortedRun, C::Error>
+    where
+        C: DeriveKey<T>,
+        for<'a> C::KeyedWriter<&'a mut std::fs::File>:
+            KeyedCodecWriter<T, C::Key, Error = C::Error>,
+    {
         let named = self.create_temp_file()?;
         let mut file = named.reopen().map_err(MergeError::Io)?;
         let mut writer = codec.keyed_writer(&mut file);
@@ -1067,6 +1106,9 @@ mod tests {
     #[derive(Clone, Copy)]
     struct U64KeyedCodec;
 
+    #[derive(Clone, Copy)]
+    struct U64View(u64);
+
     struct U64Writer<W: Write> {
         inner: BufWriter<W>,
     }
@@ -1076,6 +1118,18 @@ mod tests {
 
         fn write(&mut self, item: &u64) -> Result<(), Self::Error> {
             self.inner.write_all(&item.to_le_bytes())
+        }
+
+        fn finish(mut self) -> Result<(), Self::Error> {
+            self.inner.flush()
+        }
+    }
+
+    impl<W: Write> CodecWriter<U64View> for U64Writer<W> {
+        type Error = std::io::Error;
+
+        fn write(&mut self, item: &U64View) -> Result<(), Self::Error> {
+            self.inner.write_all(&item.0.to_le_bytes())
         }
 
         fn finish(mut self) -> Result<(), Self::Error> {
@@ -1238,6 +1292,19 @@ mod tests {
         }
     }
 
+    impl<W: Write> KeyedCodecWriter<U64View, u8> for U64OnlyKeyedWriter<W> {
+        type Error = std::io::Error;
+
+        fn write_keyed(&mut self, item: &U64View, key: &u8) -> Result<(), Self::Error> {
+            self.inner.write_all(&[*key])?;
+            self.inner.write_all(&item.0.to_le_bytes())
+        }
+
+        fn finish(mut self) -> Result<(), Self::Error> {
+            self.inner.flush()
+        }
+    }
+
     struct U64OnlyKeyedReader<R: Read> {
         inner: R,
         current_key: Option<u8>,
@@ -1317,6 +1384,12 @@ mod tests {
         }
     }
 
+    impl DeriveKey<U64View> for U64KeyedCodec {
+        fn derive_key(&self, item: &U64View) -> u8 {
+            u8::try_from(item.0 / 10).expect("test values should fit in u8")
+        }
+    }
+
     fn default_merger() -> RunMerger<u64, U64Codec, Natural> {
         RunMerger::new(U64Codec, Natural, MergeConfig::default())
     }
@@ -1335,6 +1408,22 @@ mod tests {
             .collect();
 
         assert_eq!(results, vec![1, 3, 5, 7, 9]);
+    }
+
+    #[test]
+    fn spill_sorted_accepts_write_side_items_that_differ_from_read_items() {
+        let merger = default_merger();
+        let run = merger
+            .spill_sorted([U64View(1), U64View(3), U64View(5)])
+            .expect("spilling views should succeed");
+
+        let results: Vec<u64> = merger
+            .merge(vec![run])
+            .expect("merging should succeed")
+            .map(|r| r.expect("reading should succeed"))
+            .collect();
+
+        assert_eq!(results, vec![1, 3, 5]);
     }
 
     #[test]
@@ -1503,30 +1592,18 @@ mod tests {
         assert_eq!(results, vec![1, 2, 3]);
     }
 
-    fn spill_sorted_keyed(codec: U64KeyedCodec, items: impl IntoIterator<Item = u64>) -> SortedRun {
-        let named = tempfile::NamedTempFile::new().expect("create temp file");
-        let mut file = named.reopen().expect("reopen temp file");
-        let mut writer = codec.keyed_writer(&mut file);
-        for item in items {
-            let key = codec.derive_key(&item);
-            writer.write_keyed(&item, &key).expect("write keyed record");
-        }
-        writer.finish().expect("finish keyed writer");
-        drop(file);
-
-        SortedRun {
-            path: named.into_temp_path(),
-        }
-    }
-
     #[test]
     fn keyed_merge_falls_back_to_full_record_order_when_keys_tie() {
         let merger = RunMerger::new(U64KeyedCodec, Natural, MergeConfig::default());
 
         // Keys are item/10, so 11/12/18/19 all tie on key=1 across runs.
         // Correct output requires fallback comparison on the full record.
-        let run_a = spill_sorted_keyed(U64KeyedCodec, vec![11u64, 19, 25]);
-        let run_b = spill_sorted_keyed(U64KeyedCodec, vec![12u64, 18, 26]);
+        let run_a = merger
+            .spill_sorted_with_keys(vec![11u64, 19, 25])
+            .expect("spill A");
+        let run_b = merger
+            .spill_sorted_with_keys(vec![12u64, 18, 26])
+            .expect("spill B");
 
         let results: Vec<u64> = merger
             .merge_keyed(vec![run_a, run_b], Natural)
@@ -1535,6 +1612,22 @@ mod tests {
             .collect();
 
         assert_eq!(results, vec![11, 12, 18, 19, 25, 26]);
+    }
+
+    #[test]
+    fn spill_sorted_with_keys_accepts_write_side_items_that_differ_from_read_items() {
+        let merger = RunMerger::new(U64KeyedCodec, Natural, MergeConfig::default());
+        let run = merger
+            .spill_sorted_with_keys([U64View(11), U64View(19), U64View(25)])
+            .expect("spilling keyed views should succeed");
+
+        let results: Vec<u64> = merger
+            .merge_keyed(vec![run], Natural)
+            .expect("keyed merge should succeed")
+            .map(|r| r.expect("reading should succeed"))
+            .collect();
+
+        assert_eq!(results, vec![11, 19, 25]);
     }
 
     #[test]
