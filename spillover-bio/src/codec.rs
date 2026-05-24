@@ -27,15 +27,18 @@ use spillover::codec::{
     Codec, CodecCursor, CodecWriter, DeriveKey, KeyedCodec, KeyedCodecCursor, KeyedCodecWriter,
 };
 
-use crate::record::{SeqRecord, SeqRecordParts, SeqRecordView};
+use crate::{
+    record::{SeqRecord, SeqRecordParts, SeqRecordView},
+    sort::RecordKeyer,
+};
 
 /// Compile-time marker for dryice codec type parameters.
 /// Uses the fn pointer pattern so the params don't impose
 /// Copy/Send/etc bounds on the containing struct.
 type CodecMarker<S, Q, N> = PhantomData<fn() -> (S, Q, N)>;
 
-/// Same as [`CodecMarker`], with an additional record key type.
-type KeyedCodecMarker<S, Q, N, K> = PhantomData<fn() -> (S, Q, N, K)>;
+/// Same as [`CodecMarker`], with an additional record keyer type.
+type KeyedCodecMarker<S, Q, N, Kr> = PhantomData<fn() -> (S, Q, N, Kr)>;
 
 // ── Base path codec ──────────────────────────────────────────
 
@@ -159,16 +162,12 @@ impl<S, Q, N> DryIceCodec<S, Q, N> {
         self.name_codec::<dryice::OmittedNameCodec>()
     }
 
-    /// Transition to a keyed codec with the given record key type
-    /// and a function to derive keys from records.
+    /// Transition to a keyed codec with the given record keyer.
     #[must_use]
-    pub fn with_record_key<K: RecordKey>(
-        self,
-        derive_key: fn(&SeqRecord) -> K,
-    ) -> KeyedDryIceCodec<S, Q, N, K> {
+    pub fn with_record_keyer<Kr: RecordKeyer>(self, keyer: Kr) -> KeyedDryIceCodec<Kr, S, Q, N> {
         KeyedDryIceCodec {
             target_block_records: self.target_block_records,
-            derive_key,
+            keyer,
             _codecs: PhantomData,
         }
     }
@@ -176,28 +175,22 @@ impl<S, Q, N> DryIceCodec<S, Q, N> {
     /// Transition to a keyed codec with a 38-byte packed sequence
     /// key covering 152 bases (full Illumina 150bp reads).
     #[must_use]
-    pub fn with_illumina_key(self) -> KeyedDryIceCodec<S, Q, N, crate::key::IlluminaKey> {
-        self.with_record_key(|rec: &SeqRecord| {
-            crate::key::PackedSequenceKey::from_sequence(rec.sequence())
-        })
+    pub fn with_illumina_key(self) -> KeyedDryIceCodec<crate::sort::SequenceOrder<38>, S, Q, N> {
+        self.with_record_keyer(crate::sort::ILLUMINA_ORDER)
     }
 
     /// Transition to a keyed codec with a 64-byte packed sequence
     /// key covering 256 bases (full 250bp paired-end reads).
     #[must_use]
-    pub fn with_paired_end_key(self) -> KeyedDryIceCodec<S, Q, N, crate::key::PairedEndKey> {
-        self.with_record_key(|rec: &SeqRecord| {
-            crate::key::PackedSequenceKey::from_sequence(rec.sequence())
-        })
+    pub fn with_paired_end_key(self) -> KeyedDryIceCodec<crate::sort::SequenceOrder<64>, S, Q, N> {
+        self.with_record_keyer(crate::sort::PAIRED_END_ORDER)
     }
 
     /// Transition to a keyed codec with a 128-byte packed sequence
     /// key covering 512 bases (prefix for long reads).
     #[must_use]
-    pub fn with_long_read_key(self) -> KeyedDryIceCodec<S, Q, N, crate::key::LongReadPrefixKey> {
-        self.with_record_key(|rec: &SeqRecord| {
-            crate::key::PackedSequenceKey::from_sequence(rec.sequence())
-        })
+    pub fn with_long_read_key(self) -> KeyedDryIceCodec<crate::sort::SequenceOrder<128>, S, Q, N> {
+        self.with_record_keyer(crate::sort::LONG_READ_ORDER)
     }
 }
 
@@ -205,25 +198,25 @@ impl<S, Q, N> DryIceCodec<S, Q, N> {
 
 /// Dryice codec for the keyed merge path (with record keys).
 ///
-/// Created from [`DryIceCodec::with_record_key`]. Implements
+/// Created from [`DryIceCodec::with_record_keyer`]. Implements
 /// both [`Codec`] and [`KeyedCodec`] so it can be used with
 /// either `.codec()` or `.keyed_codec()` on the spillover
 /// builder.
-pub struct KeyedDryIceCodec<S = RawAsciiCodec, Q = RawQualityCodec, N = RawNameCodec, K = ()> {
+pub struct KeyedDryIceCodec<Kr, S = RawAsciiCodec, Q = RawQualityCodec, N = RawNameCodec> {
     target_block_records: usize,
-    derive_key: fn(&SeqRecord) -> K,
-    _codecs: KeyedCodecMarker<S, Q, N, K>,
+    keyer: Kr,
+    _codecs: KeyedCodecMarker<S, Q, N, Kr>,
 }
 
-impl<S, Q, N, K> Clone for KeyedDryIceCodec<S, Q, N, K> {
+impl<Kr: Copy, S, Q, N> Clone for KeyedDryIceCodec<Kr, S, Q, N> {
     fn clone(&self) -> Self {
         *self
     }
 }
 
-impl<S, Q, N, K> Copy for KeyedDryIceCodec<S, Q, N, K> {}
+impl<Kr: Copy, S, Q, N> Copy for KeyedDryIceCodec<Kr, S, Q, N> {}
 
-impl<S, Q, N, K> KeyedDryIceCodec<S, Q, N, K> {
+impl<Kr, S, Q, N> KeyedDryIceCodec<Kr, S, Q, N> {
     /// Set the target number of records per dryice block.
     #[must_use]
     pub fn with_block_records(mut self, n: usize) -> Self {
@@ -453,13 +446,13 @@ impl<S: SequenceCodec, Q: QualityCodec, N: NameCodec> Codec for DryIceCodec<S, Q
     }
 }
 
-impl<S: SequenceCodec, Q: QualityCodec, N: NameCodec, K: RecordKey + Clone> Codec
-    for KeyedDryIceCodec<S, Q, N, K>
+impl<Kr: RecordKeyer, S: SequenceCodec, Q: QualityCodec, N: NameCodec> Codec
+    for KeyedDryIceCodec<Kr, S, Q, N>
 {
     type Item = SeqRecord;
     type Error = DryIceError;
-    type Writer<W: Write> = KeyedWriterAdapter<W, S, Q, N, K>;
-    type Cursor<R: Read> = KeyedReaderAdapter<R, S, Q, N, K>;
+    type Writer<W: Write> = KeyedWriterAdapter<W, S, Q, N, Kr::RecordKey>;
+    type Cursor<R: Read> = KeyedReaderAdapter<R, S, Q, N, Kr::RecordKey>;
 
     fn writer<W: Write>(&self, dest: W) -> Self::Writer<W> {
         KeyedWriterAdapter(
@@ -468,7 +461,7 @@ impl<S: SequenceCodec, Q: QualityCodec, N: NameCodec, K: RecordKey + Clone> Code
                 .sequence_codec::<S>()
                 .quality_codec::<Q>()
                 .name_codec::<N>()
-                .record_key::<K>()
+                .record_key::<Kr::RecordKey>()
                 .target_block_records(self.target_block_records)
                 .build(),
         )
@@ -476,17 +469,18 @@ impl<S: SequenceCodec, Q: QualityCodec, N: NameCodec, K: RecordKey + Clone> Code
 
     fn cursor<R: Read>(&self, source: R) -> Self::Cursor<R> {
         KeyedReaderAdapter(
-            DryIceReader::open::<S, Q, N, K>(source).expect("dryice file header should be valid"),
+            DryIceReader::open::<S, Q, N, Kr::RecordKey>(source)
+                .expect("dryice file header should be valid"),
         )
     }
 }
 
-impl<S: SequenceCodec, Q: QualityCodec, N: NameCodec, K: RecordKey + Clone> KeyedCodec
-    for KeyedDryIceCodec<S, Q, N, K>
+impl<Kr: RecordKeyer, S: SequenceCodec, Q: QualityCodec, N: NameCodec> KeyedCodec
+    for KeyedDryIceCodec<Kr, S, Q, N>
 {
-    type Key = K;
-    type KeyedWriter<W: Write> = KeyedWriterAdapter<W, S, Q, N, K>;
-    type KeyedCursor<R: Read> = KeyedReaderAdapter<R, S, Q, N, K>;
+    type Key = Kr::RecordKey;
+    type KeyedWriter<W: Write> = KeyedWriterAdapter<W, S, Q, N, Kr::RecordKey>;
+    type KeyedCursor<R: Read> = KeyedReaderAdapter<R, S, Q, N, Kr::RecordKey>;
 
     fn keyed_writer<W: Write>(&self, dest: W) -> Self::KeyedWriter<W> {
         KeyedWriterAdapter(
@@ -495,7 +489,7 @@ impl<S: SequenceCodec, Q: QualityCodec, N: NameCodec, K: RecordKey + Clone> Keye
                 .sequence_codec::<S>()
                 .quality_codec::<Q>()
                 .name_codec::<N>()
-                .record_key::<K>()
+                .record_key::<Kr::RecordKey>()
                 .target_block_records(self.target_block_records)
                 .build(),
         )
@@ -503,16 +497,22 @@ impl<S: SequenceCodec, Q: QualityCodec, N: NameCodec, K: RecordKey + Clone> Keye
 
     fn keyed_cursor<R: Read>(&self, source: R) -> Self::KeyedCursor<R> {
         KeyedReaderAdapter(
-            DryIceReader::open::<S, Q, N, K>(source).expect("dryice file header should be valid"),
+            DryIceReader::open::<S, Q, N, Kr::RecordKey>(source)
+                .expect("dryice file header should be valid"),
         )
     }
 }
 
-impl<S: SequenceCodec, Q: QualityCodec, N: NameCodec, K: RecordKey + Clone> DeriveKey<SeqRecord>
-    for KeyedDryIceCodec<S, Q, N, K>
+impl<Kr, S, Q, N, R> DeriveKey<R> for KeyedDryIceCodec<Kr, S, Q, N>
+where
+    Kr: RecordKeyer,
+    S: SequenceCodec,
+    Q: QualityCodec,
+    N: NameCodec,
+    R: SeqRecordParts + ?Sized,
 {
-    fn derive_key(&self, item: &SeqRecord) -> K {
-        (self.derive_key)(item)
+    fn derive_key(&self, item: &R) -> Kr::RecordKey {
+        self.keyer.record_key(item)
     }
 }
 
@@ -583,9 +583,7 @@ mod tests {
     fn keyed_path_round_trips_records_and_keys() {
         use crate::key::PackedSequenceKey;
 
-        let codec = DryIceCodec::new().with_record_key(|rec: &SeqRecord| {
-            PackedSequenceKey::<2>::from_sequence(rec.sequence())
-        });
+        let codec = DryIceCodec::new().with_record_keyer(crate::sort::SequenceOrder::<2>);
         let records = test_records();
         let keys: Vec<_> = records
             .iter()
@@ -617,9 +615,7 @@ mod tests {
     fn keyed_path_writes_record_views() {
         use crate::key::PackedSequenceKey;
 
-        let codec = DryIceCodec::new().with_record_key(|rec: &SeqRecord| {
-            PackedSequenceKey::<2>::from_sequence(rec.sequence())
-        });
+        let codec = DryIceCodec::new().with_record_keyer(crate::sort::SequenceOrder::<2>);
         let records = test_records();
         let keys: Vec<_> = records
             .iter()
@@ -645,6 +641,20 @@ mod tests {
     }
 
     #[test]
+    fn keyed_codec_derives_keys_from_record_views() {
+        use crate::key::PackedSequenceKey;
+
+        let codec = DryIceCodec::new().with_record_keyer(crate::sort::SequenceOrder::<2>);
+        let record = SeqRecord::new(b"r1", b"ACGT", b"!!!!");
+
+        let owned_key = codec.derive_key(&record);
+        let view_key = codec.derive_key(&record.as_view());
+
+        assert_eq!(owned_key, PackedSequenceKey::<2>::from_sequence(b"ACGT"));
+        assert_eq!(view_key, owned_key);
+    }
+
+    #[test]
     fn empty_file_reads_nothing() {
         let codec = DryIceCodec::new();
 
@@ -667,12 +677,8 @@ mod tests {
 
     #[test]
     fn keyed_codec_is_copy() {
-        use crate::key::PackedSequenceKey;
-
         fn assert_copy<T: Copy>() {}
-        assert_copy::<
-            KeyedDryIceCodec<RawAsciiCodec, RawQualityCodec, RawNameCodec, PackedSequenceKey<2>>,
-        >();
+        assert_copy::<KeyedDryIceCodec<crate::sort::SequenceOrder<2>>>();
     }
 
     #[test]

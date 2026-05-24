@@ -1,6 +1,6 @@
 //! Genomics-specific sort keys, sort orders, and the sorter builder.
 //!
-//! Sort keys extract the value to sort by from a [`SeqRecord`].
+//! Sort keys extract the value to sort by from record-shaped values.
 //! Sort orders bundle a sort key with a compatible dryice record
 //! key and a merge strategy, preventing invalid combinations.
 //!
@@ -42,10 +42,13 @@ use crate::{
 #[derive(Debug, Clone, Copy, Default)]
 pub struct SequenceQualityKey;
 
-impl SortKey<SeqRecord> for SequenceQualityKey {
-    type Key<'a> = (&'a [u8], &'a [u8]);
+impl<R: SeqRecordParts> SortKey<R> for SequenceQualityKey {
+    type Key<'a>
+        = (&'a [u8], &'a [u8])
+    where
+        R: 'a;
 
-    fn key<'a>(&self, item: &'a SeqRecord) -> (&'a [u8], &'a [u8]) {
+    fn key<'a>(&self, item: &'a R) -> (&'a [u8], &'a [u8]) {
         (item.sequence(), item.quality())
     }
 }
@@ -54,10 +57,13 @@ impl SortKey<SeqRecord> for SequenceQualityKey {
 #[derive(Debug, Clone, Copy, Default)]
 pub struct NameKey;
 
-impl SortKey<SeqRecord> for NameKey {
-    type Key<'a> = &'a [u8];
+impl<R: SeqRecordParts> SortKey<R> for NameKey {
+    type Key<'a>
+        = &'a [u8]
+    where
+        R: 'a;
 
-    fn key<'a>(&self, item: &'a SeqRecord) -> &'a [u8] {
+    fn key<'a>(&self, item: &'a R) -> &'a [u8] {
         item.name()
     }
 }
@@ -66,11 +72,14 @@ impl SortKey<SeqRecord> for NameKey {
 #[derive(Debug, Clone, Copy, Default)]
 pub struct LengthKey;
 
-impl SortKey<SeqRecord> for LengthKey {
-    type Key<'a> = u64;
+impl<R: SeqRecordParts> SortKey<R> for LengthKey {
+    type Key<'a>
+        = u64
+    where
+        R: 'a;
 
     #[allow(clippy::cast_possible_truncation)]
-    fn key(&self, item: &SeqRecord) -> u64 {
+    fn key(&self, item: &R) -> u64 {
         item.sequence().len() as u64
     }
 }
@@ -120,19 +129,20 @@ pub trait SortOrder: sealed::Sealed + Copy {
     fn compare(&self) -> Self::Compare;
 }
 
-/// Extension for sort orders that use record keys for merge
-/// acceleration. Only available when `Strategy = Keyed`.
-pub trait KeyedSortOrder: SortOrder<Strategy = Keyed> {
+/// Derives dryice record keys from record-shaped values.
+pub trait RecordKeyer: Copy {
     /// The dryice record key type.
     type RecordKey: dryice::RecordKey + Clone + Copy;
 
-    /// Derive a record key from a record.
-    fn record_key(&self, record: &SeqRecord) -> Self::RecordKey;
-
-    /// A function pointer for key derivation, suitable for
-    /// embedding in the codec.
-    fn record_key_fn(&self) -> fn(&SeqRecord) -> Self::RecordKey;
+    /// Derive a record key from any record-shaped value.
+    fn record_key<R: SeqRecordParts + ?Sized>(&self, record: &R) -> Self::RecordKey;
 }
+
+/// Extension for sort orders that use record keys for merge
+/// acceleration. Only available when `Strategy = Keyed`.
+pub trait KeyedSortOrder: SortOrder<Strategy = Keyed> + RecordKeyer {}
+
+impl<O> KeyedSortOrder for O where O: SortOrder<Strategy = Keyed> + RecordKeyer {}
 
 /// Marker: base merge path (no record keys).
 pub struct Basic;
@@ -166,15 +176,11 @@ impl<const N: usize> SortOrder for SequenceOrder<N> {
     }
 }
 
-impl<const N: usize> KeyedSortOrder for SequenceOrder<N> {
+impl<const N: usize> RecordKeyer for SequenceOrder<N> {
     type RecordKey = PackedSequenceKey<N>;
 
-    fn record_key(&self, record: &SeqRecord) -> PackedSequenceKey<N> {
+    fn record_key<R: SeqRecordParts + ?Sized>(&self, record: &R) -> PackedSequenceKey<N> {
         PackedSequenceKey::from_sequence(record.sequence())
-    }
-
-    fn record_key_fn(&self) -> fn(&SeqRecord) -> PackedSequenceKey<N> {
-        |rec| PackedSequenceKey::from_sequence(rec.sequence())
     }
 }
 
@@ -208,22 +214,18 @@ impl SortOrder for NameOrder {
     }
 }
 
-fn derive_name_key(record: &SeqRecord) -> dryice::Bytes16Key {
+fn derive_name_key<R: SeqRecordParts + ?Sized>(record: &R) -> dryice::Bytes16Key {
     let mut key = [0u8; 16];
     let len = record.name().len().min(16);
     key[..len].copy_from_slice(&record.name()[..len]);
     dryice::Bytes16Key(key)
 }
 
-impl KeyedSortOrder for NameOrder {
+impl RecordKeyer for NameOrder {
     type RecordKey = dryice::Bytes16Key;
 
-    fn record_key(&self, record: &SeqRecord) -> dryice::Bytes16Key {
+    fn record_key<R: SeqRecordParts + ?Sized>(&self, record: &R) -> dryice::Bytes16Key {
         derive_name_key(record)
-    }
-
-    fn record_key_fn(&self) -> fn(&SeqRecord) -> dryice::Bytes16Key {
-        derive_name_key
     }
 }
 
@@ -257,19 +259,15 @@ impl SortOrder for LengthOrder {
 }
 
 #[allow(clippy::cast_possible_truncation)]
-fn derive_length_key(record: &SeqRecord) -> dryice::Bytes8Key {
+fn derive_length_key<R: SeqRecordParts + ?Sized>(record: &R) -> dryice::Bytes8Key {
     dryice::Bytes8Key((record.sequence().len() as u64).to_be_bytes())
 }
 
-impl KeyedSortOrder for LengthOrder {
+impl RecordKeyer for LengthOrder {
     type RecordKey = dryice::Bytes8Key;
 
-    fn record_key(&self, record: &SeqRecord) -> dryice::Bytes8Key {
+    fn record_key<R: SeqRecordParts + ?Sized>(&self, record: &R) -> dryice::Bytes8Key {
         derive_length_key(record)
-    }
-
-    fn record_key_fn(&self) -> fn(&SeqRecord) -> dryice::Bytes8Key {
-        derive_length_key
     }
 }
 
@@ -371,15 +369,11 @@ impl<O: SortOrder> SortOrder for Reverse<O> {
     }
 }
 
-impl<O: KeyedSortOrder> KeyedSortOrder for Reverse<O> {
+impl<O: RecordKeyer> RecordKeyer for Reverse<O> {
     type RecordKey = O::RecordKey;
 
-    fn record_key(&self, record: &SeqRecord) -> Self::RecordKey {
+    fn record_key<R: SeqRecordParts + ?Sized>(&self, record: &R) -> Self::RecordKey {
         self.0.record_key(record)
-    }
-
-    fn record_key_fn(&self) -> fn(&SeqRecord) -> Self::RecordKey {
-        self.0.record_key_fn()
     }
 }
 
@@ -1078,11 +1072,11 @@ where
     O: KeyedSortOrder,
     O::SortKey: Send + Sync + 'static,
     O::Compare: for<'a> Compare<<O::SortKey as SortKey<SeqRecord>>::Key<'a>>
-        + Compare<O::RecordKey>
+        + Compare<<O as RecordKeyer>::RecordKey>
         + Send
         + Sync
         + 'static,
-    O::RecordKey: RecordKey + Clone + 'static,
+    <O as RecordKeyer>::RecordKey: RecordKey + Clone + 'static,
     C: sealed::ResolveCodec,
     F: sealed::ResolveFlush,
     CS: ChunkSorter<SeqRecord>,
@@ -1098,14 +1092,14 @@ where
         self,
     ) -> Sorter<
         O::SortKey,
-        KeyedDryIceCodec<C::S, C::Q, C::N, O::RecordKey>,
+        KeyedDryIceCodec<O, C::S, C::Q, C::N>,
         O::Compare,
         CS,
         spillover::sorter::Keyed,
     > {
         let order = self.order.0;
         let codec = self.codec.resolve();
-        let keyed_codec = codec.with_record_key(order.record_key_fn());
+        let keyed_codec = codec.with_record_keyer(order);
         let flush = self.flush.resolve();
 
         let builder = spillover::sorter::Builder::new()
@@ -1207,6 +1201,17 @@ mod tests {
     }
 
     #[test]
+    fn sequence_quality_key_extracts_from_record_views() {
+        let rec = make_record(b"r1", b"ACGT", b"!!!!");
+        let view = rec.as_view();
+
+        let (seq, qual) = SequenceQualityKey.key(&view);
+
+        assert_eq!(seq, b"ACGT");
+        assert_eq!(qual, b"!!!!");
+    }
+
+    #[test]
     fn sequence_quality_key_sorts_by_sequence_first() {
         let a = make_record(b"r1", b"AAAA", b"IIII");
         let b = make_record(b"r2", b"CCCC", b"!!!!");
@@ -1268,6 +1273,12 @@ mod tests {
     }
 
     #[test]
+    fn name_key_extracts_from_record_views() {
+        let rec = make_record(b"read_001", b"ACGT", b"!!!!");
+        assert_eq!(NameKey.key(&rec.as_view()), b"read_001");
+    }
+
+    #[test]
     fn name_key_sorts_lexicographically() {
         let a = make_record(b"aaa", b"ACGT", b"!!!!");
         let b = make_record(b"bbb", b"ACGT", b"!!!!");
@@ -1280,6 +1291,12 @@ mod tests {
     fn length_key_extracts_length() {
         let rec = make_record(b"r1", b"ACGTACGT", b"!!!!!!!!");
         assert_eq!(LengthKey.key(&rec), 8);
+    }
+
+    #[test]
+    fn length_key_extracts_from_record_views() {
+        let rec = make_record(b"r1", b"ACGTACGT", b"!!!!!!!!");
+        assert_eq!(LengthKey.key(&rec.as_view()), 8);
     }
 
     #[test]
