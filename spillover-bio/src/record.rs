@@ -107,6 +107,43 @@ pub struct SeqRecord {
     sequence_len: usize,
 }
 
+/// Reusable byte storage for arena-backed sequence record buffering.
+///
+/// `SeqRecordArena` is storage, not a record type. It lets arena-backed sorter
+/// internals copy incoming record-shaped values into one reusable byte buffer for
+/// the current spill window, then resolve private handles back into
+/// [`SeqRecordView`] values while flushing that window.
+#[derive(Debug, Default)]
+pub struct SeqRecordArena {
+    bytes: Vec<u8>,
+    #[allow(
+        dead_code,
+        reason = "arena-backed sorter will use record boundaries in the next phase"
+    )]
+    records: Vec<ArenaRecord>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(
+    dead_code,
+    reason = "arena-backed sorter will store private handles in the next phase"
+)]
+pub(crate) struct SeqRecordHandle {
+    index: usize,
+}
+
+#[derive(Debug, Clone, Copy)]
+#[allow(
+    dead_code,
+    reason = "arena-backed sorter will resolve stored boundaries in the next phase"
+)]
+struct ArenaRecord {
+    start: usize,
+    name_len: usize,
+    sequence_len: usize,
+    quality_len: usize,
+}
+
 impl SeqRecord {
     /// Create a new record by copying field bytes into one
     /// contiguous backing allocation.
@@ -163,6 +200,101 @@ impl SeqRecord {
     #[must_use]
     pub fn as_view(&self) -> SeqRecordView<'_> {
         SeqRecordView::new(self.name(), self.sequence(), self.quality())
+    }
+}
+
+impl SeqRecordArena {
+    /// Create an empty arena.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Create an empty arena with space for at least `bytes` record bytes.
+    #[must_use]
+    pub fn with_capacity(bytes: usize) -> Self {
+        Self {
+            bytes: Vec::with_capacity(bytes),
+            records: Vec::new(),
+        }
+    }
+
+    /// Number of record bytes currently stored in the arena.
+    #[must_use]
+    pub fn byte_len(&self) -> usize {
+        self.bytes.len()
+    }
+
+    /// Current byte capacity retained by the arena.
+    #[must_use]
+    pub fn capacity(&self) -> usize {
+        self.bytes.capacity()
+    }
+
+    /// Whether the arena currently stores no record bytes.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.bytes.is_empty()
+    }
+
+    #[allow(
+        dead_code,
+        reason = "arena-backed sorter will use record counts for buffering in the next phase"
+    )]
+    pub(crate) fn record_count(&self) -> usize {
+        self.records.len()
+    }
+
+    #[allow(
+        dead_code,
+        reason = "arena-backed sorter will store pushed records in the next phase"
+    )]
+    pub(crate) fn store<R: SeqRecordParts + ?Sized>(&mut self, record: &R) -> SeqRecordHandle {
+        let start = self.bytes.len();
+        let name_len = record.name().len();
+        let sequence_len = record.sequence().len();
+        let quality_len = record.quality().len();
+
+        self.bytes.extend_from_slice(record.name());
+        self.bytes.extend_from_slice(record.sequence());
+        self.bytes.extend_from_slice(record.quality());
+
+        let index = self.records.len();
+        self.records.push(ArenaRecord {
+            start,
+            name_len,
+            sequence_len,
+            quality_len,
+        });
+
+        SeqRecordHandle { index }
+    }
+
+    #[allow(
+        dead_code,
+        reason = "arena-backed sorter will resolve handles during flush in the next phase"
+    )]
+    pub(crate) fn view(&self, handle: SeqRecordHandle) -> SeqRecordView<'_> {
+        let record = self.records[handle.index];
+        let name_start = record.start;
+        let sequence_start = name_start + record.name_len;
+        let quality_start = sequence_start + record.sequence_len;
+        let end = quality_start + record.quality_len;
+
+        SeqRecordView::new(
+            &self.bytes[name_start..sequence_start],
+            &self.bytes[sequence_start..quality_start],
+            &self.bytes[quality_start..end],
+        )
+    }
+
+    #[allow(
+        dead_code,
+        reason = "arena-backed sorter will reset storage after successful flush in the next phase"
+    )]
+    pub(crate) fn clear(&mut self) {
+        self.bytes.clear();
+        self.records.clear();
     }
 }
 
@@ -300,6 +432,51 @@ mod tests {
         assert_eq!(rec.name(), b"r1");
         assert_eq!(rec.sequence(), b"ACGT");
         assert_eq!(rec.quality(), b"!!!!");
+    }
+
+    #[test]
+    fn arena_stores_records_and_returns_views() {
+        let mut arena = SeqRecordArena::new();
+
+        let first = arena.store(&SeqRecordView::new(b"r1", b"ACGT", b"!!!!"));
+        let second = arena.store(&SeqRecordView::new(b"r2", b"TGCA", b"####"));
+
+        assert_eq!(arena.record_count(), 2);
+        assert_eq!(arena.byte_len(), 20);
+
+        let first_view = arena.view(first);
+        assert_eq!(first_view.name(), b"r1");
+        assert_eq!(first_view.sequence(), b"ACGT");
+        assert_eq!(first_view.quality(), b"!!!!");
+
+        let second_view = arena.view(second);
+        assert_eq!(second_view.name(), b"r2");
+        assert_eq!(second_view.sequence(), b"TGCA");
+        assert_eq!(second_view.quality(), b"####");
+    }
+
+    #[test]
+    fn arena_copies_input_bytes() {
+        let mut arena = SeqRecordArena::new();
+        let mut sequence = b"ACGT".to_vec();
+
+        let handle = arena.store(&SeqRecordView::new(b"r1", &sequence, b"!!!!"));
+        sequence.copy_from_slice(b"TGCA");
+
+        assert_eq!(arena.view(handle).sequence(), b"ACGT");
+    }
+
+    #[test]
+    fn arena_clear_reuses_capacity() {
+        let mut arena = SeqRecordArena::with_capacity(128);
+        let initial_capacity = arena.capacity();
+
+        arena.store(&SeqRecordView::new(b"r1", b"ACGT", b"!!!!"));
+        arena.clear();
+
+        assert!(arena.is_empty());
+        assert_eq!(arena.record_count(), 0);
+        assert_eq!(arena.capacity(), initial_capacity);
     }
 
     #[test]
