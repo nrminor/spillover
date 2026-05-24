@@ -31,7 +31,7 @@ use crate::{
     error::SortedRecordStreamError,
     key::PackedSequenceKey,
     radix::RadixThenRefine,
-    record::{SeqRecord, SeqRecordParts},
+    record::{SeqRecord, SeqRecordArena, SeqRecordParts},
 };
 
 /// Sort key that extracts sequence and quality as a tuple.
@@ -490,6 +490,18 @@ pub struct NeedsFlush;
 /// Builder marker: flush strategy has been chosen.
 pub struct HasFlush(FlushConfig);
 
+/// Builder marker: use the default owned-record buffer.
+pub struct OwnedStorage;
+
+/// Builder marker: use caller-provided arena storage for the spill window.
+pub struct ArenaStorage<'a> {
+    #[allow(
+        dead_code,
+        reason = "arena-backed build will consume the arena storage marker in the next phase"
+    )]
+    arena: &'a mut SeqRecordArena,
+}
+
 // pub visibility required because `sealed::ResolveFlush`
 // returns it. The sealed module prevents external impls.
 #[doc(hidden)]
@@ -584,12 +596,19 @@ impl sealed::ResolveFlush for HasFlush {
 ///     }
 /// }
 /// ```
-pub struct Builder<O = NeedsOrder, C = NeedsCodec, F = NeedsFlush, CS = Sequential> {
+pub struct Builder<
+    O = NeedsOrder,
+    C = NeedsCodec,
+    F = NeedsFlush,
+    CS = Sequential,
+    S = OwnedStorage,
+> {
     order: O,
     codec: C,
     flush: F,
     dedup: RecordDedup,
     chunk_sort: CS,
+    storage: S,
     merge_config: MergeConfig,
 }
 
@@ -759,6 +778,7 @@ impl Builder {
             flush: NeedsFlush,
             dedup: RecordDedup::None,
             chunk_sort: Sequential,
+            storage: OwnedStorage,
             merge_config: MergeConfig::default(),
         }
     }
@@ -853,16 +873,33 @@ where
 
 // Sort order selection.
 
-impl<C, F, CS> Builder<NeedsOrder, C, F, CS> {
+impl<O, C, F, CS> Builder<O, C, F, CS, OwnedStorage> {
+    /// Use caller-provided arena storage for the active spill window.
+    #[must_use]
+    pub fn arena(self, arena: &mut SeqRecordArena) -> Builder<O, C, F, CS, ArenaStorage<'_>> {
+        Builder {
+            order: self.order,
+            codec: self.codec,
+            flush: self.flush,
+            dedup: self.dedup,
+            chunk_sort: self.chunk_sort,
+            storage: ArenaStorage { arena },
+            merge_config: self.merge_config,
+        }
+    }
+}
+
+impl<C, F, CS, S> Builder<NeedsOrder, C, F, CS, S> {
     /// Set a keyed sort order (merge compares record keys).
     #[must_use]
-    pub fn sort_by<O: KeyedSortOrder>(self, order: O) -> Builder<HasKeyedOrder<O>, C, F, CS> {
+    pub fn sort_by<O: KeyedSortOrder>(self, order: O) -> Builder<HasKeyedOrder<O>, C, F, CS, S> {
         Builder {
             order: HasKeyedOrder(order),
             codec: self.codec,
             flush: self.flush,
             dedup: self.dedup,
             chunk_sort: self.chunk_sort,
+            storage: self.storage,
             merge_config: self.merge_config,
         }
     }
@@ -872,13 +909,14 @@ impl<C, F, CS> Builder<NeedsOrder, C, F, CS> {
     pub fn sort_by_unkeyed<O: SortOrder<Strategy = Basic>>(
         self,
         order: O,
-    ) -> Builder<HasUnkeyedOrder<O>, C, F, CS> {
+    ) -> Builder<HasUnkeyedOrder<O>, C, F, CS, S> {
         Builder {
             order: HasUnkeyedOrder(order),
             codec: self.codec,
             flush: self.flush,
             dedup: self.dedup,
             chunk_sort: self.chunk_sort,
+            storage: self.storage,
             merge_config: self.merge_config,
         }
     }
@@ -888,7 +926,7 @@ impl<C, F, CS> Builder<NeedsOrder, C, F, CS> {
     #[must_use]
     pub fn sort_by_illumina(
         self,
-    ) -> Builder<HasKeyedOrder<SequenceOrder<38>>, C, F, RadixThenRefine<38>> {
+    ) -> Builder<HasKeyedOrder<SequenceOrder<38>>, C, F, RadixThenRefine<38>, S> {
         self.sort_by(ILLUMINA_ORDER)
             .chunk_sort(RadixThenRefine::<38>)
     }
@@ -898,7 +936,7 @@ impl<C, F, CS> Builder<NeedsOrder, C, F, CS> {
     #[must_use]
     pub fn sort_by_paired_end(
         self,
-    ) -> Builder<HasKeyedOrder<SequenceOrder<64>>, C, F, RadixThenRefine<64>> {
+    ) -> Builder<HasKeyedOrder<SequenceOrder<64>>, C, F, RadixThenRefine<64>, S> {
         self.sort_by(PAIRED_END_ORDER)
             .chunk_sort(RadixThenRefine::<64>)
     }
@@ -908,39 +946,40 @@ impl<C, F, CS> Builder<NeedsOrder, C, F, CS> {
     #[must_use]
     pub fn sort_by_long_read(
         self,
-    ) -> Builder<HasKeyedOrder<SequenceOrder<128>>, C, F, RadixThenRefine<128>> {
+    ) -> Builder<HasKeyedOrder<SequenceOrder<128>>, C, F, RadixThenRefine<128>, S> {
         self.sort_by(LONG_READ_ORDER)
             .chunk_sort(RadixThenRefine::<128>)
     }
 
     /// Sort by record name.
     #[must_use]
-    pub fn sort_by_name(self) -> Builder<HasKeyedOrder<NameOrder>, C, F, CS> {
+    pub fn sort_by_name(self) -> Builder<HasKeyedOrder<NameOrder>, C, F, CS, S> {
         self.sort_by(NAME_ORDER)
     }
 
     /// Sort by sequence length.
     #[must_use]
-    pub fn sort_by_length(self) -> Builder<HasKeyedOrder<LengthOrder>, C, F, CS> {
+    pub fn sort_by_length(self) -> Builder<HasKeyedOrder<LengthOrder>, C, F, CS, S> {
         self.sort_by(LENGTH_ORDER)
     }
 }
 
 // Codec selection.
 
-impl<O, F, CS> Builder<O, NeedsCodec, F, CS> {
+impl<O, F, CS, St> Builder<O, NeedsCodec, F, CS, St> {
     /// Set the dryice codec for temporary file encoding.
     #[must_use]
     pub fn codec<S, Q, N>(
         self,
         codec: DryIceCodec<S, Q, N>,
-    ) -> Builder<O, HasCodec<S, Q, N>, F, CS> {
+    ) -> Builder<O, HasCodec<S, Q, N>, F, CS, St> {
         Builder {
             order: self.order,
             codec: HasCodec(codec),
             flush: self.flush,
             dedup: self.dedup,
             chunk_sort: self.chunk_sort,
+            storage: self.storage,
             merge_config: self.merge_config,
         }
     }
@@ -948,30 +987,32 @@ impl<O, F, CS> Builder<O, NeedsCodec, F, CS> {
 
 // Flush strategy selection.
 
-impl<O, C, CS> Builder<O, C, NeedsFlush, CS> {
+impl<O, C, CS, S> Builder<O, C, NeedsFlush, CS, S> {
     /// Flush when estimated memory usage exceeds `budget` bytes.
     /// Requires [`SeqRecord`] to implement `GetSize`.
     #[must_use]
-    pub fn measured_budget(self, budget: usize) -> Builder<O, C, HasFlush, CS> {
+    pub fn measured_budget(self, budget: usize) -> Builder<O, C, HasFlush, CS, S> {
         Builder {
             order: self.order,
             codec: self.codec,
             flush: HasFlush(FlushConfig::MeasuredBudget(budget)),
             dedup: self.dedup,
             chunk_sort: self.chunk_sort,
+            storage: self.storage,
             merge_config: self.merge_config,
         }
     }
 
     /// Flush when the buffer reaches `max_items` records.
     #[must_use]
-    pub fn max_buffer_items(self, max_items: usize) -> Builder<O, C, HasFlush, CS> {
+    pub fn max_buffer_items(self, max_items: usize) -> Builder<O, C, HasFlush, CS, S> {
         Builder {
             order: self.order,
             codec: self.codec,
             flush: HasFlush(FlushConfig::MaxItems(max_items)),
             dedup: self.dedup,
             chunk_sort: self.chunk_sort,
+            storage: self.storage,
             merge_config: self.merge_config,
         }
     }
@@ -979,17 +1020,18 @@ impl<O, C, CS> Builder<O, C, NeedsFlush, CS> {
 
 // Optional configuration.
 
-impl<O, C, F, CS> Builder<O, C, F, CS> {
+impl<O, C, F, CS, S> Builder<O, C, F, CS, S> {
     /// Set a custom chunk sorting strategy. Defaults to
     /// [`Sequential`].
     #[must_use]
-    pub fn chunk_sort<CS2>(self, chunk_sort: CS2) -> Builder<O, C, F, CS2> {
+    pub fn chunk_sort<CS2>(self, chunk_sort: CS2) -> Builder<O, C, F, CS2, S> {
         Builder {
             order: self.order,
             codec: self.codec,
             flush: self.flush,
             dedup: self.dedup,
             chunk_sort,
+            storage: self.storage,
             merge_config: self.merge_config,
         }
     }
@@ -1003,26 +1045,28 @@ impl<O, C, F, CS> Builder<O, C, F, CS> {
 
     /// Deduplicate adjacent records with identical names.
     #[must_use]
-    pub fn dedup_by_name(self) -> Builder<O, C, F, CS> {
+    pub fn dedup_by_name(self) -> Builder<O, C, F, CS, S> {
         Builder {
             order: self.order,
             codec: self.codec,
             flush: self.flush,
             dedup: RecordDedup::Name,
             chunk_sort: self.chunk_sort,
+            storage: self.storage,
             merge_config: self.merge_config,
         }
     }
 
     /// Deduplicate adjacent records with identical sequences.
     #[must_use]
-    pub fn dedup_by_sequence(self) -> Builder<O, C, F, CS> {
+    pub fn dedup_by_sequence(self) -> Builder<O, C, F, CS, S> {
         Builder {
             order: self.order,
             codec: self.codec,
             flush: self.flush,
             dedup: RecordDedup::Sequence,
             chunk_sort: self.chunk_sort,
+            storage: self.storage,
             merge_config: self.merge_config,
         }
     }
@@ -1030,13 +1074,14 @@ impl<O, C, F, CS> Builder<O, C, F, CS> {
     /// Deduplicate adjacent records with identical sequence and
     /// quality.
     #[must_use]
-    pub fn dedup_by_sequence_and_quality(self) -> Builder<O, C, F, CS> {
+    pub fn dedup_by_sequence_and_quality(self) -> Builder<O, C, F, CS, S> {
         Builder {
             order: self.order,
             codec: self.codec,
             flush: self.flush,
             dedup: RecordDedup::SequenceAndQuality,
             chunk_sort: self.chunk_sort,
+            storage: self.storage,
             merge_config: self.merge_config,
         }
     }
@@ -1046,7 +1091,7 @@ impl<O, C, F, CS> Builder<O, C, F, CS> {
     /// This overrides the default sort engine (which is radix sort
     /// for sequence orders, and sequential for everything else).
     #[must_use]
-    pub fn sort_with_sequential(self) -> Builder<O, C, F, Sequential> {
+    pub fn sort_with_sequential(self) -> Builder<O, C, F, Sequential, S> {
         self.chunk_sort(Sequential)
     }
 
@@ -1056,7 +1101,7 @@ impl<O, C, F, CS> Builder<O, C, F, CS> {
     /// feature to be enabled on spillover.
     #[cfg(feature = "rayon")]
     #[must_use]
-    pub fn sort_with_parallel(self) -> Builder<O, C, F, spillover::chunk::Parallel> {
+    pub fn sort_with_parallel(self) -> Builder<O, C, F, spillover::chunk::Parallel, S> {
         self.chunk_sort(spillover::chunk::Parallel)
     }
 }
@@ -1067,7 +1112,7 @@ impl<O, C, F, CS> Builder<O, C, F, CS> {
 // `NeedsCodec` → raw DryIceCodec, `NeedsFlush` → 1 GiB budget.
 // This single impl covers all four combinations of has/needs.
 
-impl<O, C, F, CS> Builder<HasKeyedOrder<O>, C, F, CS>
+impl<O, C, F, CS> Builder<HasKeyedOrder<O>, C, F, CS, OwnedStorage>
 where
     O: KeyedSortOrder,
     O::SortKey: Send + Sync + 'static,
@@ -1098,6 +1143,7 @@ where
         spillover::sorter::Keyed,
     > {
         let order = self.order.0;
+        let _storage = self.storage;
         let codec = self.codec.resolve();
         let keyed_codec = codec.with_record_keyer(order);
         let flush = self.flush.resolve();
@@ -1128,7 +1174,7 @@ where
 
 // build() for unkeyed sort orders.
 
-impl<O, C, F, CS> Builder<HasUnkeyedOrder<O>, C, F, CS>
+impl<O, C, F, CS> Builder<HasUnkeyedOrder<O>, C, F, CS, OwnedStorage>
 where
     O: SortOrder<Strategy = Basic>,
     O::SortKey: Send + Sync + 'static,
@@ -1150,6 +1196,7 @@ where
     ) -> Sorter<O::SortKey, DryIceCodec<C::S, C::Q, C::N>, O::Compare, CS, spillover::sorter::Basic>
     {
         let order = self.order.0;
+        let _storage = self.storage;
         let codec = self.codec.resolve();
         let flush = self.flush.resolve();
 
@@ -1320,6 +1367,13 @@ mod tests {
         assert_copy::<SequenceQualityKey>();
         assert_copy::<NameKey>();
         assert_copy::<LengthKey>();
+    }
+
+    #[test]
+    fn builder_accepts_arena_storage_mode() {
+        let mut arena = SeqRecordArena::new();
+
+        let _builder = Builder::new().sort_by_illumina().arena(&mut arena);
     }
 
     // ── Sort order tests ─────────────────────────────────
