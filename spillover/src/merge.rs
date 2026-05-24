@@ -17,7 +17,9 @@ use std::{cmp::Reverse, collections::BinaryHeap, num::NonZeroUsize, path::PathBu
 
 use crate::{
     SortedItemsError,
-    codec::{Codec, CodecCursor, CodecWriter, KeyedCodec, KeyedCodecCursor, KeyedCodecWriter},
+    codec::{
+        Codec, CodecCursor, CodecWriter, DeriveKey, KeyedCodec, KeyedCodecCursor, KeyedCodecWriter,
+    },
     compare::{Compare, WithOrd},
     sorter::{VisitSortedItems, sealed},
 };
@@ -242,8 +244,6 @@ pub struct RunMerger<T, C: Codec<Item = T>, Cmp: Compare<T> + Copy> {
 
 impl<T: 'static, C: Codec<Item = T> + Copy + 'static, Cmp: Compare<T> + Copy + 'static>
     RunMerger<T, C, Cmp>
-where
-    for<'a> C::Writer<&'a mut std::fs::File>: CodecWriter<T, Error = C::Error>,
 {
     /// Create a new merger.
     #[must_use]
@@ -256,6 +256,20 @@ where
         }
     }
 
+    fn create_temp_file(&self) -> MergeResult<tempfile::NamedTempFile, C::Error> {
+        let file = match self.config.temp_dir {
+            Some(ref dir) => tempfile::NamedTempFile::new_in(dir)?,
+            None => tempfile::NamedTempFile::new()?,
+        };
+        Ok(file)
+    }
+}
+
+impl<T: 'static, C: Codec<Item = T> + Copy + 'static, Cmp: Compare<T> + Copy + 'static>
+    RunMerger<T, C, Cmp>
+where
+    for<'a> C::Writer<&'a mut std::fs::File>: CodecWriter<T, Error = C::Error>,
+{
     /// Write a pre-sorted iterator of items to a temporary file.
     ///
     /// # Errors
@@ -348,21 +362,13 @@ where
             path: named.into_temp_path(),
         })
     }
-
-    fn create_temp_file(&self) -> MergeResult<tempfile::NamedTempFile, C::Error> {
-        let file = match self.config.temp_dir {
-            Some(ref dir) => tempfile::NamedTempFile::new_in(dir)?,
-            None => tempfile::NamedTempFile::new()?,
-        };
-        Ok(file)
-    }
 }
 
 // Keyed merge — only available when the codec supports keys.
 impl<T: 'static, C: KeyedCodec<Item = T> + Copy + 'static, Cmp: Compare<T> + Copy + 'static>
     RunMerger<T, C, Cmp>
 where
-    for<'a> C::Writer<&'a mut std::fs::File>: CodecWriter<T, Error = C::Error>,
+    C: DeriveKey<T>,
     for<'a> C::KeyedWriter<&'a mut std::fs::File>: KeyedCodecWriter<T, C::Key, Error = C::Error>,
 {
     /// Merge sorted runs using the keyed path (key-only
@@ -1194,11 +1200,6 @@ mod tests {
         type KeyedWriter<W: Write> = U64OnlyKeyedWriter<W>;
         type KeyedCursor<R: Read> = U64OnlyKeyedReader<R>;
 
-        fn derive_key(&self, item: &u64) -> u8 {
-            // coarse key: values in the same decade tie
-            u8::try_from(*item / 10).expect("test values should fit in u8")
-        }
-
         fn keyed_writer<W: Write>(&self, dest: W) -> Self::KeyedWriter<W> {
             U64OnlyKeyedWriter {
                 inner: BufWriter::new(dest),
@@ -1211,6 +1212,13 @@ mod tests {
                 current_key: None,
                 current: None,
             }
+        }
+    }
+
+    impl DeriveKey<u64> for U64KeyedCodec {
+        fn derive_key(&self, item: &u64) -> u8 {
+            // coarse key: values in the same decade tie
+            u8::try_from(*item / 10).expect("test values should fit in u8")
         }
     }
 

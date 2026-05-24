@@ -200,16 +200,11 @@ pub trait KeyedCodec: Codec {
     type Key: Clone;
 
     /// A stateful writer that encodes items with their keys.
-    type KeyedWriter<W: Write>: KeyedCodecWriter<Self::Item, Self::Key, Error = Self::Error>;
+    type KeyedWriter<W: Write>;
 
     /// A stateful cursor that can retrieve keys and records
     /// independently.
     type KeyedCursor<R: Read>: KeyedCodecCursor<Self::Item, Self::Key, Error = Self::Error>;
-
-    /// Derive the record key for an item. Called by the sorter
-    /// during flush to compute keys before writing them to disk
-    /// alongside the records.
-    fn derive_key(&self, item: &Self::Item) -> Self::Key;
 
     /// Create a keyed writer that encodes items with their keys
     /// into `dest`.
@@ -217,6 +212,17 @@ pub trait KeyedCodec: Codec {
 
     /// Create a keyed cursor over a byte source.
     fn keyed_cursor<R: Read>(&self, source: R) -> Self::KeyedCursor<R>;
+}
+
+/// Capability for deriving a keyed codec's stored key from a write-side item.
+///
+/// This is separate from [`KeyedCodec`] because the item written into a run need
+/// not be the same representation that the codec materializes when reading the
+/// run back. Owned sorters typically implement this for `Codec::Item`, while
+/// allocation-conscious writers may implement it for borrowed current views.
+pub trait DeriveKey<I: ?Sized>: KeyedCodec {
+    /// Derive the stored key for `item`.
+    fn derive_key(&self, item: &I) -> Self::Key;
 }
 
 #[cfg(test)]

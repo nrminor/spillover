@@ -1,7 +1,9 @@
 use std::io::{BufReader, BufWriter, Read, Write};
 
 use spillover::{
-    codec::{Codec, CodecCursor, CodecWriter, KeyedCodec, KeyedCodecCursor, KeyedCodecWriter},
+    codec::{
+        Codec, CodecCursor, CodecWriter, DeriveKey, KeyedCodec, KeyedCodecCursor, KeyedCodecWriter,
+    },
     key::Owned,
     sorter::Builder,
 };
@@ -127,16 +129,18 @@ impl KeyedCodec for DecadeKeyedCodec {
     type KeyedWriter<W: Write> = Writer<W>;
     type KeyedCursor<R: Read> = Reader<R>;
 
-    fn derive_key(&self, item: &u64) -> Self::Key {
-        u8::try_from(*item / 10).expect("example values fit in u8 decade key")
-    }
-
     fn keyed_writer<W: Write>(&self, dest: W) -> Self::KeyedWriter<W> {
         self.writer(dest)
     }
 
     fn keyed_cursor<R: Read>(&self, source: R) -> Self::KeyedCursor<R> {
         self.cursor(source)
+    }
+}
+
+impl DeriveKey<u64> for DecadeKeyedCodec {
+    fn derive_key(&self, item: &u64) -> Self::Key {
+        u8::try_from(*item / 10).expect("example values fit in u8 decade key")
     }
 }
 

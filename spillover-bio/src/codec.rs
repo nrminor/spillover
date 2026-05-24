@@ -24,7 +24,7 @@ use dryice::{
     RawQualityCodec, RecordKey, SeqRecordLike, SequenceCodec,
 };
 use spillover::codec::{
-    Codec, CodecCursor, CodecWriter, KeyedCodec, KeyedCodecCursor, KeyedCodecWriter,
+    Codec, CodecCursor, CodecWriter, DeriveKey, KeyedCodec, KeyedCodecCursor, KeyedCodecWriter,
 };
 
 use crate::record::{SeqRecord, SeqRecordParts, SeqRecordView};
@@ -488,10 +488,6 @@ impl<S: SequenceCodec, Q: QualityCodec, N: NameCodec, K: RecordKey + Clone> Keye
     type KeyedWriter<W: Write> = KeyedWriterAdapter<W, S, Q, N, K>;
     type KeyedCursor<R: Read> = KeyedReaderAdapter<R, S, Q, N, K>;
 
-    fn derive_key(&self, item: &SeqRecord) -> K {
-        (self.derive_key)(item)
-    }
-
     fn keyed_writer<W: Write>(&self, dest: W) -> Self::KeyedWriter<W> {
         KeyedWriterAdapter(
             DryIceWriter::builder()
@@ -509,6 +505,14 @@ impl<S: SequenceCodec, Q: QualityCodec, N: NameCodec, K: RecordKey + Clone> Keye
         KeyedReaderAdapter(
             DryIceReader::open::<S, Q, N, K>(source).expect("dryice file header should be valid"),
         )
+    }
+}
+
+impl<S: SequenceCodec, Q: QualityCodec, N: NameCodec, K: RecordKey + Clone> DeriveKey<SeqRecord>
+    for KeyedDryIceCodec<S, Q, N, K>
+{
+    fn derive_key(&self, item: &SeqRecord) -> K {
+        (self.derive_key)(item)
     }
 }
 

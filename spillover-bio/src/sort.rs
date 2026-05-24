@@ -18,7 +18,7 @@ use dryice::{
 use spillover::{
     SortedItemsError,
     chunk::{ChunkSorter, Sequential},
-    codec::{Codec, CodecWriter, KeyedCodec, KeyedCodecWriter},
+    codec::{Codec, CodecWriter, DeriveKey, KeyedCodec, KeyedCodecWriter},
     compare::{Compare, Natural},
     dedup::Identity,
     key::{KeyCompare, SortKey},
@@ -821,8 +821,7 @@ where
 impl<SK, Cod, Cmp, CS> Sorter<SK, Cod, Cmp, CS, spillover::sorter::Keyed>
 where
     SK: SortKey<SeqRecord> + Copy + Send + Sync + 'static,
-    Cod: KeyedCodec<Item = SeqRecord> + Copy + 'static,
-    for<'a> Cod::Writer<&'a mut std::fs::File>: CodecWriter<SeqRecord, Error = Cod::Error>,
+    Cod: KeyedCodec<Item = SeqRecord> + DeriveKey<SeqRecord> + Copy + 'static,
     for<'a> Cod::KeyedWriter<&'a mut std::fs::File>:
         KeyedCodecWriter<SeqRecord, Cod::Key, Error = Cod::Error>,
     Cmp: for<'a> Compare<SK::Key<'a>> + Compare<Cod::Key> + Copy + Send + Sync + 'static,

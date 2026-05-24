@@ -19,7 +19,7 @@ use get_size2::GetSize;
 use crate::{
     SortedItemsError,
     chunk::{ChunkSorter, Sequential},
-    codec::{Codec, CodecWriter, KeyedCodec, KeyedCodecWriter},
+    codec::{Codec, CodecWriter, DeriveKey, KeyedCodec, KeyedCodecWriter},
     compare::{Compare, Natural},
     dedup::{Dedup, Identity},
     key::{KeyCompare, SortKey},
@@ -563,8 +563,7 @@ impl<T, SK, Cod, Cmp, D, CS> Sorter<T, SK, Cod, Cmp, D, CS, Keyed>
 where
     T: 'static,
     SK: SortKey<T> + Copy + Send + Sync + 'static,
-    Cod: KeyedCodec<Item = T> + Copy + 'static,
-    for<'a> Cod::Writer<&'a mut std::fs::File>: CodecWriter<T, Error = Cod::Error>,
+    Cod: KeyedCodec<Item = T> + DeriveKey<T> + Copy + 'static,
     for<'a> Cod::KeyedWriter<&'a mut std::fs::File>:
         KeyedCodecWriter<T, Cod::Key, Error = Cod::Error>,
     Cmp: for<'a> Compare<SK::Key<'a>> + Compare<Cod::Key> + Copy + Send + Sync + 'static,
