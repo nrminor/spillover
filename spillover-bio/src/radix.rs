@@ -6,14 +6,14 @@
 //! refinement pass for tiebreaking within equal-key groups.
 //!
 //! The radix sort operates via swaps (`slice::swap`), not copies,
-//! so it works on non-`Copy` types like [`SeqRecord`] without
-//! extra allocation.
+//! so it works on non-`Copy` record-shaped values without extra
+//! allocation.
 
 use std::cmp::Ordering;
 
 use spillover::chunk::ChunkSorter;
 
-use crate::record::SeqRecord;
+use crate::record::SeqRecordParts;
 
 /// In-place MSD radix sort on packed sequence keys, with
 /// comparison-based refinement for tiebreaking.
@@ -35,22 +35,18 @@ pub struct RadixThenRefine<const N: usize>;
 /// a 256-bucket counting pass vs. a short comparison sort.
 const INSERTION_THRESHOLD: usize = 64;
 
-impl<const N: usize> ChunkSorter<SeqRecord> for RadixThenRefine<N> {
-    fn sort(
-        &self,
-        chunk: &mut [SeqRecord],
-        cmp: impl Fn(&SeqRecord, &SeqRecord) -> Ordering + Send + Sync,
-    ) {
+impl<const N: usize, R: SeqRecordParts> ChunkSorter<R> for RadixThenRefine<N> {
+    fn sort(&self, chunk: &mut [R], cmp: impl Fn(&R, &R) -> Ordering + Send + Sync) {
         Self::sort_impl(chunk, &cmp);
     }
 }
 
 /// Inner radix sort with const generic key width.
-fn msd_radix_sort_inner<const N: usize>(
-    records: &mut [SeqRecord],
+fn msd_radix_sort_inner<const N: usize, R: SeqRecordParts>(
+    records: &mut [R],
     keys: &mut [[u8; N]],
     byte_pos: usize,
-    cmp: &impl Fn(&SeqRecord, &SeqRecord) -> Ordering,
+    cmp: &impl Fn(&R, &R) -> Ordering,
 ) {
     if records.len() <= INSERTION_THRESHOLD || byte_pos >= N {
         // Small group or exhausted key bytes: comparison sort
@@ -110,7 +106,7 @@ fn msd_radix_sort_inner<const N: usize>(
 
 // Fix the ChunkSorter impl to call msd_radix_sort_inner directly.
 impl<const N: usize> RadixThenRefine<N> {
-    fn sort_impl(chunk: &mut [SeqRecord], cmp: &impl Fn(&SeqRecord, &SeqRecord) -> Ordering) {
+    fn sort_impl<R: SeqRecordParts>(chunk: &mut [R], cmp: &impl Fn(&R, &R) -> Ordering) {
         let mut keys: Vec<[u8; N]> = chunk
             .iter()
             .map(|rec| crate::key::PackedSequenceKey::<N>::from_sequence(rec.sequence()).0)
@@ -123,12 +119,19 @@ impl<const N: usize> RadixThenRefine<N> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::record::{SeqRecord, SeqRecordView};
 
     fn make_record(name: &[u8], seq: &[u8], qual: &[u8]) -> SeqRecord {
         SeqRecord::new(name, seq, qual)
     }
 
     fn seq_qual_cmp(a: &SeqRecord, b: &SeqRecord) -> Ordering {
+        a.sequence()
+            .cmp(b.sequence())
+            .then_with(|| a.quality().cmp(b.quality()))
+    }
+
+    fn view_seq_qual_cmp(a: &SeqRecordView<'_>, b: &SeqRecordView<'_>) -> Ordering {
         a.sequence()
             .cmp(b.sequence())
             .then_with(|| a.quality().cmp(b.quality()))
@@ -147,6 +150,22 @@ mod tests {
         assert_eq!(records[0].sequence(), b"AAAAAAAA");
         assert_eq!(records[1].sequence(), b"CCCCCCCC");
         assert_eq!(records[2].sequence(), b"TTTTTTTT");
+    }
+
+    #[test]
+    fn sorts_record_views() {
+        let records = [
+            make_record(b"r3", b"TTTTTTTT", b"!!!!!!!!"),
+            make_record(b"r1", b"AAAAAAAA", b"!!!!!!!!"),
+            make_record(b"r2", b"CCCCCCCC", b"!!!!!!!!"),
+        ];
+        let mut views: Vec<_> = records.iter().map(SeqRecord::as_view).collect();
+
+        RadixThenRefine::<2>.sort(&mut views, view_seq_qual_cmp);
+
+        assert_eq!(views[0].sequence(), b"AAAAAAAA");
+        assert_eq!(views[1].sequence(), b"CCCCCCCC");
+        assert_eq!(views[2].sequence(), b"TTTTTTTT");
     }
 
     #[test]
