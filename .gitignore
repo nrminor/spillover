@@ -61,6 +61,7 @@
 !/spillover-bio/examples/04_dedup_sequence.rs
 !/spillover-bio/examples/05_codec_compaction.rs
 !/spillover-bio/examples/06_alternate_orders.rs
+!/spillover-bio/examples/07_arena_backed_ingest.rs
 
 # === Allowed: GitHub workflows ===
 !/.github
