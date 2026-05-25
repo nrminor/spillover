@@ -11,6 +11,8 @@
 //!
 //! The [`Builder`] is the main entry point for creating a sorter.
 
+use std::mem::size_of;
+
 use dryice::{
     DryIceWriter, NameCodec, QualityCodec, RawAsciiCodec, RawNameCodec, RawQualityCodec, RecordKey,
     SequenceCodec,
@@ -606,6 +608,23 @@ pub enum FlushConfig {
 /// 1 GiB.
 const DEFAULT_BUDGET: usize = 1 << 30;
 
+/// Conservative per-record reserve for temporary sort scratch used while
+/// flushing an arena-backed spill window.
+///
+/// The built-in radix sorter allocates packed-key scratch during sorting. The
+/// sorter remains generic over `ChunkSorter`, so G4 intentionally avoids adding a
+/// public scratch-accounting API and instead reserves enough per record for the
+/// current built-in arena sorters.
+const SORT_SCRATCH_BYTES_PER_RECORD: usize = 128;
+
+fn record_byte_len<R: SeqRecordParts + ?Sized>(record: &R) -> usize {
+    record
+        .name()
+        .len()
+        .saturating_add(record.sequence().len())
+        .saturating_add(record.quality().len())
+}
+
 // ── Sealed trait impls for default resolution ────────────
 
 impl sealed::ResolveCodec for NeedsCodec {
@@ -795,10 +814,52 @@ where
 }
 
 impl<SK, Cod, KeyCmp, RecCmp, CS, M> ArenaBackend<'_, SK, Cod, KeyCmp, RecCmp, CS, M> {
+    fn estimated_non_arena_flush_bytes(&self, record_count: usize) -> usize {
+        record_count
+            .saturating_mul(size_of::<SeqRecordHandle>())
+            .saturating_add(record_count.saturating_mul(size_of::<SeqRecordView<'static>>()))
+            .saturating_add(record_count.saturating_mul(SORT_SCRATCH_BYTES_PER_RECORD))
+            .saturating_add(self.merge_config.write_buffer_bytes)
+    }
+
+    fn estimated_flush_peak_for(&self, record_bytes: usize, record_count: usize) -> usize {
+        SeqRecordArena::live_byte_len_for(record_bytes, record_count)
+            .saturating_add(self.estimated_non_arena_flush_bytes(record_count))
+    }
+
+    fn estimated_flush_peak(&self) -> usize {
+        self.arena
+            .live_byte_len()
+            .saturating_add(self.estimated_non_arena_flush_bytes(self.handles.len()))
+    }
+
+    fn estimated_flush_peak_after_push(&self, incoming_record_bytes: usize) -> usize {
+        self.estimated_flush_peak_for(
+            self.arena.byte_len().saturating_add(incoming_record_bytes),
+            self.handles.len().saturating_add(1),
+        )
+    }
+
+    fn should_flush_before_push(&self, incoming_record_bytes: usize) -> bool {
+        match self.flush {
+            FlushConfig::MeasuredBudget(budget) => {
+                !self.handles.is_empty()
+                    && self.estimated_flush_peak_after_push(incoming_record_bytes) >= budget
+            }
+            FlushConfig::MaxItems(max_items) => {
+                !self.handles.is_empty() && self.handles.len() >= max_items
+            }
+        }
+    }
+
     fn should_flush(&self) -> bool {
         match self.flush {
-            FlushConfig::MeasuredBudget(budget) => self.arena.byte_len() >= budget,
-            FlushConfig::MaxItems(max_items) => self.handles.len() >= max_items,
+            FlushConfig::MeasuredBudget(budget) => {
+                !self.handles.is_empty() && self.estimated_flush_peak() >= budget
+            }
+            FlushConfig::MaxItems(max_items) => {
+                !self.handles.is_empty() && self.handles.len() >= max_items
+            }
         }
     }
 
@@ -1084,6 +1145,11 @@ where
         &mut self,
         record: &R,
     ) -> Result<(), MergeError<Cod::Error>> {
+        let incoming_record_bytes = record_byte_len(record);
+        if self.inner.should_flush_before_push(incoming_record_bytes) {
+            self.inner.flush_basic()?;
+        }
+
         let handle = self.inner.arena.store(record);
         self.inner.handles.push(handle);
 
@@ -1158,6 +1224,11 @@ where
         &mut self,
         record: &R,
     ) -> Result<(), MergeError<Cod::Error>> {
+        let incoming_record_bytes = record_byte_len(record);
+        if self.inner.should_flush_before_push(incoming_record_bytes) {
+            self.inner.flush_keyed()?;
+        }
+
         let handle = self.inner.arena.store(record);
         self.inner.handles.push(handle);
 
@@ -1735,6 +1806,19 @@ mod tests {
         SeqRecord::new(name, seq, qual)
     }
 
+    fn merge_config_without_write_buffer() -> MergeConfig {
+        let mut config = MergeConfig::default();
+        config.write_buffer_bytes = 0;
+        config
+    }
+
+    fn tiny_record_peak(record_count: usize) -> usize {
+        SeqRecordArena::live_byte_len_for(3 * record_count, record_count)
+            .saturating_add(record_count.saturating_mul(size_of::<SeqRecordHandle>()))
+            .saturating_add(record_count.saturating_mul(size_of::<SeqRecordView<'static>>()))
+            .saturating_add(record_count.saturating_mul(SORT_SCRATCH_BYTES_PER_RECORD))
+    }
+
     // ── Sort key tests ───────────────────────────────────
 
     #[test]
@@ -1872,6 +1956,87 @@ mod tests {
         let mut arena = SeqRecordArena::new();
 
         let _builder = Builder::new().sort_by_illumina().arena(&mut arena);
+    }
+
+    #[test]
+    fn arena_budget_flushes_before_projected_overflow() {
+        let budget = tiny_record_peak(1) + 1;
+        assert!(
+            tiny_record_peak(2) >= budget,
+            "test budget should fit one tiny record but not two"
+        );
+
+        let mut arena = SeqRecordArena::new();
+        let mut sorter = Builder::new()
+            .sort_by_illumina()
+            .sort_with_sequential()
+            .arena(&mut arena)
+            .measured_budget(budget)
+            .merge_config(merge_config_without_write_buffer())
+            .build();
+
+        sorter
+            .push(&SeqRecordView::new(b"a", b"A", b"!"))
+            .expect("first push should not flush");
+        assert_eq!(sorter.inner.spilled_runs.len(), 0);
+        assert_eq!(sorter.inner.handles.len(), 1);
+
+        sorter
+            .push(&SeqRecordView::new(b"b", b"C", b"!"))
+            .expect("second push should pre-flush the first record");
+
+        assert_eq!(sorter.inner.spilled_runs.len(), 1);
+        assert_eq!(sorter.inner.handles.len(), 1);
+        assert_eq!(sorter.inner.arena.byte_len(), 3);
+    }
+
+    #[test]
+    fn arena_budget_allows_oversized_single_record_then_flushes_it() {
+        let mut arena = SeqRecordArena::new();
+        let mut sorter = Builder::new()
+            .sort_by_illumina()
+            .sort_with_sequential()
+            .arena(&mut arena)
+            .measured_budget(1)
+            .merge_config(merge_config_without_write_buffer())
+            .build();
+
+        sorter
+            .push(&SeqRecordView::new(b"oversized", b"ACGT", b"!!!!"))
+            .expect("oversized single record should be accepted and flushed");
+
+        assert_eq!(sorter.inner.spilled_runs.len(), 1);
+        assert!(sorter.inner.handles.is_empty());
+        assert!(sorter.inner.arena.is_empty());
+    }
+
+    #[test]
+    fn arena_budget_ignores_retained_capacity_after_clear() {
+        let budget = tiny_record_peak(1) + 1;
+        let mut arena = SeqRecordArena::new();
+        let mut sorter = Builder::new()
+            .sort_by_illumina()
+            .sort_with_sequential()
+            .arena(&mut arena)
+            .measured_budget(budget)
+            .merge_config(merge_config_without_write_buffer())
+            .build();
+
+        sorter
+            .push(&SeqRecordView::new(b"large", &[b'A'; 1024], &[b'!'; 1024]))
+            .expect("large record should flush after push");
+        let retained_capacity = sorter.inner.arena.capacity();
+        assert!(retained_capacity >= 2048);
+        assert_eq!(sorter.inner.spilled_runs.len(), 1);
+        assert!(sorter.inner.handles.is_empty());
+
+        sorter
+            .push(&SeqRecordView::new(b"s", b"A", b"!"))
+            .expect("small record should not flush because of retained capacity");
+
+        assert_eq!(sorter.inner.spilled_runs.len(), 1);
+        assert_eq!(sorter.inner.handles.len(), 1);
+        assert_eq!(sorter.inner.arena.byte_len(), 3);
     }
 
     // ── Sort order tests ─────────────────────────────────

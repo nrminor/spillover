@@ -116,27 +116,15 @@ pub struct SeqRecord {
 #[derive(Debug, Default)]
 pub struct SeqRecordArena {
     bytes: Vec<u8>,
-    #[allow(
-        dead_code,
-        reason = "arena-backed sorter will use record boundaries in the next phase"
-    )]
     records: Vec<ArenaRecord>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[allow(
-    dead_code,
-    reason = "arena-backed sorter will store private handles in the next phase"
-)]
 pub(crate) struct SeqRecordHandle {
     index: usize,
 }
 
 #[derive(Debug, Clone, Copy)]
-#[allow(
-    dead_code,
-    reason = "arena-backed sorter will resolve stored boundaries in the next phase"
-)]
 struct ArenaRecord {
     start: usize,
     name_len: usize,
@@ -237,18 +225,25 @@ impl SeqRecordArena {
         self.bytes.is_empty()
     }
 
-    #[allow(
-        dead_code,
-        reason = "arena-backed sorter will use record counts for buffering in the next phase"
-    )]
+    /// Estimated live bytes owned by the arena for the current spill window.
+    pub(crate) fn live_byte_len(&self) -> usize {
+        Self::live_byte_len_for(self.byte_len(), self.record_count())
+    }
+
+    /// Estimated live arena bytes for a projected spill window.
+    pub(crate) fn live_byte_len_for(record_bytes: usize, record_count: usize) -> usize {
+        record_bytes.saturating_add(Self::metadata_bytes_for(record_count))
+    }
+
+    /// Estimated live bytes used for private per-record boundary metadata.
+    pub(crate) fn metadata_bytes_for(record_count: usize) -> usize {
+        record_count.saturating_mul(std::mem::size_of::<ArenaRecord>())
+    }
+
     pub(crate) fn record_count(&self) -> usize {
         self.records.len()
     }
 
-    #[allow(
-        dead_code,
-        reason = "arena-backed sorter will store pushed records in the next phase"
-    )]
     pub(crate) fn store<R: SeqRecordParts + ?Sized>(&mut self, record: &R) -> SeqRecordHandle {
         let start = self.bytes.len();
         let name_len = record.name().len();
@@ -270,10 +265,6 @@ impl SeqRecordArena {
         SeqRecordHandle { index }
     }
 
-    #[allow(
-        dead_code,
-        reason = "arena-backed sorter will resolve handles during flush in the next phase"
-    )]
     pub(crate) fn view(&self, handle: SeqRecordHandle) -> SeqRecordView<'_> {
         let record = self.records[handle.index];
         let name_start = record.start;
@@ -288,10 +279,6 @@ impl SeqRecordArena {
         )
     }
 
-    #[allow(
-        dead_code,
-        reason = "arena-backed sorter will reset storage after successful flush in the next phase"
-    )]
     pub(crate) fn clear(&mut self) {
         self.bytes.clear();
         self.records.clear();
