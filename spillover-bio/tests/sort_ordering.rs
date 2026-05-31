@@ -4,11 +4,17 @@ use proptest::prelude::*;
 use spillover::compare::Compare;
 use spillover_bio::{
     record::{SeqRecord, SeqRecordParts, SeqRecordView},
-    sort::{ILLUMINA_ORDER, RecordKeyer, SequenceOrder, SortOrder},
+    sort::{
+        ILLUMINA_ORDER, LengthOrder, NameOrder, RecordKeyer, Reverse, SequenceOrder, SortOrder,
+    },
 };
 
 fn rec(sequence: &[u8], quality: &[u8]) -> SeqRecord {
     SeqRecord::new(b"record", sequence, quality)
+}
+
+fn named_rec(name: &[u8], sequence: &[u8], quality: &[u8]) -> SeqRecord {
+    SeqRecord::new(name, sequence, quality)
 }
 
 fn assert_record_order<O, R>(order: O, left: &R, right: &R, expected: Ordering)
@@ -85,6 +91,53 @@ where
     }
 }
 
+fn assert_record_comparator_is_consistent<O, R>(order: O, records: &[R])
+where
+    O: SortOrder,
+    R: SeqRecordParts,
+    O::Comparator: Compare<R>,
+{
+    let cmp = order.comparator();
+
+    assert_comparator_is_consistent(&cmp, records);
+}
+
+fn assert_key_comparator_is_consistent<O>(order: O, keys: &[O::RecordKey])
+where
+    O: SortOrder + RecordKeyer,
+    O::KeyComparator: Compare<O::RecordKey>,
+{
+    let cmp = order.key_comparator();
+
+    assert_comparator_is_consistent(&cmp, keys);
+}
+
+fn assert_comparator_is_consistent<C, T>(cmp: &C, values: &[T])
+where
+    C: Compare<T>,
+{
+    for a in values {
+        assert_eq!(cmp.compare(a, a), Ordering::Equal);
+    }
+
+    for a in values {
+        for b in values {
+            assert_eq!(cmp.compare(a, b), cmp.compare(b, a).reverse());
+        }
+    }
+
+    for a in values {
+        for b in values {
+            for c in values {
+                if cmp.compare(a, b) != Ordering::Greater && cmp.compare(b, c) != Ordering::Greater
+                {
+                    assert_ne!(cmp.compare(a, c), Ordering::Greater);
+                }
+            }
+        }
+    }
+}
+
 #[test]
 fn ordinary_bases_follow_packed_primary_order() {
     let order = SequenceOrder::<1>;
@@ -153,6 +206,30 @@ fn sequence_order_examples() -> Vec<SeqRecord> {
     ]
 }
 
+fn comparator_consistency_examples() -> Vec<SeqRecord> {
+    vec![
+        named_rec(b"read_000", b"", b""),
+        named_rec(b"read_001", b"A", b"!"),
+        named_rec(b"read_002", b"C", b"!"),
+        named_rec(b"read_003", b"G", b"!"),
+        named_rec(b"read_004", b"T", b"!"),
+        named_rec(b"read_005", b"a", b"!"),
+        named_rec(b"read_006", b"N", b"!"),
+        named_rec(b"read_007", b"-", b"!"),
+        named_rec(b"read_008", b"AA", b"!!"),
+        named_rec(b"read_009", b"AAAA", b"!!!!"),
+        named_rec(b"read_010", b"AAAAA", b"!!!!!"),
+        named_rec(b"read_011", b"ACGT", b"!!!!"),
+        named_rec(b"read_012", b"ACGT", b"IIII"),
+        named_rec(b"same_len_a", b"AA", b"!!"),
+        named_rec(b"same_len_b", b"TT", b"II"),
+        named_rec(b"same_name", b"A", b"!"),
+        named_rec(b"same_name", b"T", b"I"),
+        named_rec(b"aaaaaaaaaaaaaaaaY", b"A", b"!"),
+        named_rec(b"aaaaaaaaaaaaaaaaZ", b"C", b"!"),
+    ]
+}
+
 #[test]
 fn owned_records_have_compatible_key_and_record_order() {
     let order = SequenceOrder::<1>;
@@ -206,6 +283,170 @@ fn illumina_record() -> impl Strategy<Value = SeqRecord> {
         .prop_map(|(sequence, quality)| SeqRecord::new(b"record", sequence, quality))
 }
 
+fn small_record() -> impl Strategy<Value = SeqRecord> {
+    (
+        prop::collection::vec(any::<u8>(), 0..=8),
+        prop::collection::vec(any::<u8>(), 0..=8),
+    )
+        .prop_flat_map(|(name, sequence)| {
+            let quality_len = sequence.len();
+
+            (
+                Just(name),
+                Just(sequence),
+                prop::collection::vec(any::<u8>(), quality_len),
+            )
+        })
+        .prop_map(|(name, sequence, quality)| SeqRecord::new(name, sequence, quality))
+}
+
+fn small_record_triple() -> impl Strategy<Value = (SeqRecord, SeqRecord, SeqRecord)> {
+    (small_record(), small_record(), small_record())
+}
+
+macro_rules! record_comparator_consistency_test {
+    ($test_name:ident, $order:expr, owned) => {
+        #[test]
+        fn $test_name() {
+            let records = comparator_consistency_examples();
+
+            assert_record_comparator_is_consistent($order, &records);
+        }
+    };
+
+    ($test_name:ident, $order:expr, borrowed) => {
+        #[test]
+        fn $test_name() {
+            let records = comparator_consistency_examples();
+            let views: Vec<SeqRecordView<'_>> = records.iter().map(SeqRecord::as_view).collect();
+
+            assert_record_comparator_is_consistent($order, &views);
+        }
+    };
+}
+
+macro_rules! key_comparator_consistency_test {
+    ($test_name:ident, $order:expr) => {
+        #[test]
+        fn $test_name() {
+            let order = $order;
+            let records = comparator_consistency_examples();
+            let keys: Vec<_> = records
+                .iter()
+                .map(|record| order.record_key(record))
+                .collect();
+
+            assert_key_comparator_is_consistent(order, &keys);
+        }
+    };
+}
+
+record_comparator_consistency_test!(
+    sequence_order_record_comparator_is_consistent_for_owned_records,
+    SequenceOrder::<1>,
+    owned
+);
+record_comparator_consistency_test!(
+    illumina_order_record_comparator_is_consistent_for_owned_records,
+    ILLUMINA_ORDER,
+    owned
+);
+record_comparator_consistency_test!(
+    name_order_record_comparator_is_consistent_for_owned_records,
+    NameOrder,
+    owned
+);
+record_comparator_consistency_test!(
+    length_order_record_comparator_is_consistent_for_owned_records,
+    LengthOrder,
+    owned
+);
+record_comparator_consistency_test!(
+    reverse_sequence_order_record_comparator_is_consistent_for_owned_records,
+    Reverse(SequenceOrder::<1>),
+    owned
+);
+record_comparator_consistency_test!(
+    reverse_illumina_order_record_comparator_is_consistent_for_owned_records,
+    Reverse(ILLUMINA_ORDER),
+    owned
+);
+record_comparator_consistency_test!(
+    reverse_name_order_record_comparator_is_consistent_for_owned_records,
+    Reverse(NameOrder),
+    owned
+);
+record_comparator_consistency_test!(
+    reverse_length_order_record_comparator_is_consistent_for_owned_records,
+    Reverse(LengthOrder),
+    owned
+);
+
+record_comparator_consistency_test!(
+    sequence_order_record_comparator_is_consistent_for_borrowed_records,
+    SequenceOrder::<1>,
+    borrowed
+);
+record_comparator_consistency_test!(
+    illumina_order_record_comparator_is_consistent_for_borrowed_records,
+    ILLUMINA_ORDER,
+    borrowed
+);
+record_comparator_consistency_test!(
+    name_order_record_comparator_is_consistent_for_borrowed_records,
+    NameOrder,
+    borrowed
+);
+record_comparator_consistency_test!(
+    length_order_record_comparator_is_consistent_for_borrowed_records,
+    LengthOrder,
+    borrowed
+);
+record_comparator_consistency_test!(
+    reverse_sequence_order_record_comparator_is_consistent_for_borrowed_records,
+    Reverse(SequenceOrder::<1>),
+    borrowed
+);
+record_comparator_consistency_test!(
+    reverse_illumina_order_record_comparator_is_consistent_for_borrowed_records,
+    Reverse(ILLUMINA_ORDER),
+    borrowed
+);
+record_comparator_consistency_test!(
+    reverse_name_order_record_comparator_is_consistent_for_borrowed_records,
+    Reverse(NameOrder),
+    borrowed
+);
+record_comparator_consistency_test!(
+    reverse_length_order_record_comparator_is_consistent_for_borrowed_records,
+    Reverse(LengthOrder),
+    borrowed
+);
+
+key_comparator_consistency_test!(
+    sequence_order_key_comparator_is_consistent,
+    SequenceOrder::<1>
+);
+key_comparator_consistency_test!(illumina_order_key_comparator_is_consistent, ILLUMINA_ORDER);
+key_comparator_consistency_test!(name_order_key_comparator_is_consistent, NameOrder);
+key_comparator_consistency_test!(length_order_key_comparator_is_consistent, LengthOrder);
+key_comparator_consistency_test!(
+    reverse_sequence_order_key_comparator_is_consistent,
+    Reverse(SequenceOrder::<1>)
+);
+key_comparator_consistency_test!(
+    reverse_illumina_order_key_comparator_is_consistent,
+    Reverse(ILLUMINA_ORDER)
+);
+key_comparator_consistency_test!(
+    reverse_name_order_key_comparator_is_consistent,
+    Reverse(NameOrder)
+);
+key_comparator_consistency_test!(
+    reverse_length_order_key_comparator_is_consistent,
+    Reverse(LengthOrder)
+);
+
 proptest! {
     #[test]
     fn generated_illumina_records_have_compatible_key_and_record_order(
@@ -217,5 +458,41 @@ proptest! {
         assert_record_comparator_is_pairwise_consistent(ILLUMINA_ORDER, &records);
         assert_key_comparator_is_pairwise_consistent(ILLUMINA_ORDER, &records);
         assert_key_and_record_order_are_compatible(ILLUMINA_ORDER, &records);
+    }
+
+    #[test]
+    fn sequence_order_record_comparator_is_consistent_for_generated_records(
+        (a, b, c) in small_record_triple(),
+    ) {
+        let records = [a, b, c];
+
+        assert_record_comparator_is_consistent(SequenceOrder::<1>, &records);
+    }
+
+    #[test]
+    fn illumina_order_record_comparator_is_consistent_for_generated_records(
+        (a, b, c) in small_record_triple(),
+    ) {
+        let records = [a, b, c];
+
+        assert_record_comparator_is_consistent(ILLUMINA_ORDER, &records);
+    }
+
+    #[test]
+    fn name_order_record_comparator_is_consistent_for_generated_records(
+        (a, b, c) in small_record_triple(),
+    ) {
+        let records = [a, b, c];
+
+        assert_record_comparator_is_consistent(NameOrder, &records);
+    }
+
+    #[test]
+    fn length_order_record_comparator_is_consistent_for_generated_records(
+        (a, b, c) in small_record_triple(),
+    ) {
+        let records = [a, b, c];
+
+        assert_record_comparator_is_consistent(LengthOrder, &records);
     }
 }
