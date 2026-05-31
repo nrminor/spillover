@@ -196,8 +196,9 @@ impl<const N: usize> SortOrder for SequenceOrder<N> {
 
 impl<const N: usize, R: SeqRecordParts + ?Sized> Compare<R> for SequenceOrder<N> {
     fn compare(&self, a: &R, b: &R) -> std::cmp::Ordering {
-        a.sequence()
-            .cmp(b.sequence())
+        PackedSequenceKey::<N>::from_sequence(a.sequence())
+            .cmp(&PackedSequenceKey::<N>::from_sequence(b.sequence()))
+            .then_with(|| a.sequence().cmp(b.sequence()))
             .then_with(|| a.quality().cmp(b.quality()))
     }
 }

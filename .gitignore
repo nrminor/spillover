@@ -52,6 +52,7 @@
 !/spillover-bio/src/sort.rs
 !/spillover-bio/src/radix.rs
 !/spillover-bio/tests
+!/spillover-bio/tests/sort_ordering.rs
 !/spillover-bio/tests/sort_pipeline.rs
 !/spillover-bio/examples
 !/spillover-bio/examples/README.md
