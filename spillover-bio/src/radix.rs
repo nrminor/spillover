@@ -24,6 +24,17 @@ use crate::record::SeqRecordParts;
 /// with the full comparator (quality tiebreaking) via
 /// comparison sort.
 ///
+/// This is not a general-purpose comparator sort. It imposes
+/// ascending [`PackedSequenceKey`](crate::key::PackedSequenceKey)
+/// bucket order before calling the supplied comparator, and the
+/// comparator is used only to refine records whose packed keys tie.
+/// Use it only when ascending `PackedSequenceKey<N>` is the primary
+/// ordering component of the comparator, such as with
+/// [`SequenceOrder<N>`](crate::sort::SequenceOrder). It is not
+/// compatible with exact raw sequence ordering, reverse sequence
+/// ordering, name or length ordering, or arbitrary custom
+/// comparators.
+///
 /// For small groups (below the insertion threshold), the radix
 /// sort falls through to comparison sort directly, avoiding
 /// the overhead of counting and partitioning for tiny slices.
@@ -120,6 +131,8 @@ impl<const N: usize> RadixThenRefine<N> {
 mod tests {
     use super::*;
     use crate::record::{SeqRecord, SeqRecordView};
+    use crate::sort::SequenceOrder;
+    use spillover::compare::Compare;
 
     fn make_record(name: &[u8], seq: &[u8], qual: &[u8]) -> SeqRecord {
         SeqRecord::new(name, seq, qual)
@@ -245,6 +258,42 @@ mod tests {
         expected.sort_by(seq_qual_cmp);
 
         RadixThenRefine::<4>::sort_impl(&mut records, &seq_qual_cmp);
+
+        for (i, (got, exp)) in records.iter().zip(expected.iter()).enumerate() {
+            assert_eq!(
+                got.sequence(),
+                exp.sequence(),
+                "sequence mismatch at position {i}"
+            );
+            assert_eq!(
+                got.quality(),
+                exp.quality(),
+                "quality mismatch at position {i}"
+            );
+        }
+    }
+
+    #[test]
+    fn matches_sequence_order_above_threshold() {
+        let bases = [b'A', b'C', b'G', b'T', b'N', b'a', b'c', b'x'];
+        let mut records: Vec<SeqRecord> = (0..200)
+            .map(|i| {
+                let seq: Vec<u8> = (0..12)
+                    .map(|j| bases[(i * 11 + j * 5 + i / 3) % bases.len()])
+                    .collect();
+                let qual = vec![b'!' + u8::try_from(i % 40).expect("fits"); 12];
+                make_record(format!("r{i:03}").as_bytes(), &seq, &qual)
+            })
+            .collect();
+
+        let mut expected = records.clone();
+        let order = SequenceOrder::<3>;
+        let cmp = |a: &SeqRecord, b: &SeqRecord| order.compare(a, b);
+
+        // Use more than INSERTION_THRESHOLD records so this exercises radix
+        // buckets rather than only the comparison-sort fallback.
+        expected.sort_unstable_by(cmp);
+        RadixThenRefine::<3>.sort(&mut records, cmp);
 
         for (i, (got, exp)) in records.iter().zip(expected.iter()).enumerate() {
             assert_eq!(

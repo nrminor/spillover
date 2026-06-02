@@ -91,6 +91,8 @@ impl<R: SeqRecordParts> SortKey<R> for LengthKey {
 mod sealed {
     pub trait Sealed {}
 
+    pub trait CompatibleChunkSorter<O> {}
+
     /// Resolves codec type-state to a concrete [`crate::codec::DryIceCodec`].
     /// `NeedsCodec` yields the raw (no-encoding) default;
     /// `HasCodec` passes through the user's choice.
@@ -156,6 +158,13 @@ pub trait RecordKeyer: Copy {
 pub trait KeyedSortOrder: SortOrder<Strategy = Keyed> + RecordKeyer {}
 
 impl<O> KeyedSortOrder for O where O: SortOrder<Strategy = Keyed> + RecordKeyer {}
+
+impl<O> sealed::CompatibleChunkSorter<O> for Sequential {}
+
+#[cfg(feature = "rayon")]
+impl<O> sealed::CompatibleChunkSorter<O> for spillover::chunk::Parallel {}
+
+impl<const N: usize> sealed::CompatibleChunkSorter<SequenceOrder<N>> for RadixThenRefine<N> {}
 
 /// Marker: base merge path (no record keys).
 pub struct Basic;
@@ -680,8 +689,9 @@ impl sealed::ResolveFlush for HasFlush {
 /// ```
 ///
 /// Defaults: raw (uncompressed) dryice codec, 1 GiB memory budget,
-/// radix sort for sequence orders, sequential comparison sort for
-/// name/length orders.
+/// and sequential comparison sorting. The Illumina, paired-end,
+/// and long-read convenience methods select radix chunk sorting for
+/// their compatible accelerated sequence orders.
 ///
 /// Override any default with the corresponding builder method:
 ///
@@ -1490,6 +1500,12 @@ impl<O, C, CS, S> Builder<O, C, NeedsFlush, CS, S> {
 impl<O, C, F, CS, S> Builder<O, C, F, CS, S> {
     /// Set a custom chunk sorting strategy. Defaults to
     /// [`Sequential`].
+    ///
+    /// The selected chunk sorter must be compatible with the selected sort order
+    /// when [`build`](Self::build) is called. Comparator-based sorters such as
+    /// [`Sequential`] are compatible with every built-in order. Specialized
+    /// sorters such as [`RadixThenRefine`] are accepted only for the matching
+    /// accelerated sequence order.
     #[must_use]
     pub fn chunk_sort<CS2>(self, chunk_sort: CS2) -> Builder<O, C, F, CS2, S> {
         Builder {
@@ -1555,8 +1571,11 @@ impl<O, C, F, CS, S> Builder<O, C, F, CS, S> {
 
     /// Use single-threaded comparison sort for in-memory chunks.
     ///
-    /// This overrides the default sort engine (which is radix sort
-    /// for sequence orders, and sequential for everything else).
+    /// This overrides the current chunk sorting strategy. The
+    /// Illumina, paired-end, and long-read convenience methods select
+    /// radix chunk sorting; most other builder paths keep the default
+    /// sequential comparison sorter unless [`Self::chunk_sort`] is
+    /// called explicitly.
     #[must_use]
     pub fn sort_with_sequential(self) -> Builder<O, C, F, Sequential, S> {
         self.chunk_sort(Sequential)
@@ -1564,8 +1583,8 @@ impl<O, C, F, CS, S> Builder<O, C, F, CS, S> {
 
     /// Use rayon parallel sort for in-memory chunks.
     ///
-    /// This overrides the default sort engine. Requires the `rayon`
-    /// feature to be enabled on spillover.
+    /// This overrides the current chunk sorting strategy. Requires the
+    /// `rayon` feature to be enabled on spillover.
     #[cfg(feature = "rayon")]
     #[must_use]
     pub fn sort_with_parallel(self) -> Builder<O, C, F, spillover::chunk::Parallel, S> {
@@ -1591,7 +1610,7 @@ where
     <O as RecordKeyer>::RecordKey: RecordKey + Clone + 'static,
     C: sealed::ResolveCodec,
     F: sealed::ResolveFlush,
-    CS: ChunkSorter<SeqRecord>,
+    CS: ChunkSorter<SeqRecord> + sealed::CompatibleChunkSorter<O>,
 {
     /// Build the sorter (keyed merge path).
     ///
@@ -1652,6 +1671,7 @@ where
     <O as RecordKeyer>::RecordKey: RecordKey + Clone + 'static,
     C: sealed::ResolveCodec,
     F: sealed::ResolveFlush,
+    CS: sealed::CompatibleChunkSorter<O>,
     for<'v> CS: ChunkSorter<SeqRecordView<'v>>,
     for<'v> O::Comparator: Compare<SeqRecordView<'v>>,
 {
@@ -1710,7 +1730,7 @@ where
         for<'a> Compare<<O::SortKey as SortKey<SeqRecord>>::Key<'a>> + Send + Sync + 'static,
     C: sealed::ResolveCodec,
     F: sealed::ResolveFlush,
-    CS: ChunkSorter<SeqRecord>,
+    CS: ChunkSorter<SeqRecord> + sealed::CompatibleChunkSorter<O>,
 {
     /// Build the sorter (basic merge path, no record keys).
     ///
@@ -1766,6 +1786,7 @@ where
         for<'r> Compare<<O::SortKey as SortKey<SeqRecord>>::Key<'r>> + Send + Sync + 'static,
     C: sealed::ResolveCodec,
     F: sealed::ResolveFlush,
+    CS: sealed::CompatibleChunkSorter<O>,
     for<'v> CS: ChunkSorter<SeqRecordView<'v>>,
     for<'v> O::Comparator: Compare<SeqRecordView<'v>>,
 {
@@ -2090,6 +2111,38 @@ mod tests {
         assert_builder_type::<
             Builder<HasUnkeyedOrder<UnkeyedSequenceOrder>, NeedsCodec, NeedsFlush, Sequential>,
         >(&builder);
+    }
+
+    #[test]
+    fn reverse_sequence_order_uses_sequential_by_default() {
+        fn assert_builder_type<T>(_: &T) {}
+
+        let builder = Builder::new().sort_by(Reverse(ILLUMINA_ORDER));
+
+        assert_builder_type::<
+            Builder<HasKeyedOrder<Reverse<SequenceOrder<38>>>, NeedsCodec, NeedsFlush, Sequential>,
+        >(&builder);
+    }
+
+    #[test]
+    fn compatible_chunk_sorters_build() {
+        let _illumina = Builder::new()
+            .sort_by_illumina()
+            .codec(DryIceCodec::new())
+            .max_buffer_items(1)
+            .build();
+
+        let _exact = Builder::new()
+            .sort_by_sequence_exact()
+            .codec(DryIceCodec::new())
+            .max_buffer_items(1)
+            .build();
+
+        let _reverse = Builder::new()
+            .sort_by(Reverse(ILLUMINA_ORDER))
+            .codec(DryIceCodec::new())
+            .max_buffer_items(1)
+            .build();
     }
 
     #[test]

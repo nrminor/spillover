@@ -1,11 +1,13 @@
 //! End-to-end integration tests for the spillover-bio sort pipeline.
 
 use dryice::SeqRecordLike;
+use spillover::compare::Compare;
 use spillover_bio::{
     codec::DryIceCodec,
     error::SortedRecordStreamError,
+    radix::RadixThenRefine,
     record::{SeqRecord, SeqRecordArena, SeqRecordParts, SeqRecordView},
-    sort::{Builder, ILLUMINA_ORDER, SeqRecordSink},
+    sort::{Builder, ILLUMINA_ORDER, LENGTH_ORDER, Reverse, SeqRecordSink, SequenceOrder},
 };
 
 fn make_record(name: &[u8], seq: &[u8], qual: &[u8]) -> SeqRecord {
@@ -480,8 +482,6 @@ fn sort_by_name_orders_lexicographically() {
 
 #[test]
 fn reverse_sequence_order_produces_descending_output() {
-    use spillover_bio::sort::{ILLUMINA_ORDER, Reverse};
-
     let mut sorter = Builder::new()
         .sort_by(Reverse(ILLUMINA_ORDER))
         .codec(DryIceCodec::new())
@@ -512,8 +512,6 @@ fn reverse_sequence_order_produces_descending_output() {
 
 #[test]
 fn sort_by_length_orders_shortest_first() {
-    use spillover_bio::sort::LENGTH_ORDER;
-
     let mut sorter = Builder::new()
         .sort_by(LENGTH_ORDER)
         .codec(DryIceCodec::new())
@@ -791,8 +789,6 @@ fn realistic_150bp_reads_sort_correctly() {
 
 #[test]
 fn radix_sort_through_pipeline() {
-    use spillover_bio::radix::RadixThenRefine;
-
     let bases = [b'A', b'C', b'G', b'T'];
     let mut input: Vec<SeqRecord> = (0..200)
         .map(|i| {
@@ -805,7 +801,7 @@ fn radix_sort_through_pipeline() {
         .collect();
 
     let mut sorter = Builder::new()
-        .sort_by_illumina()
+        .sort_by(SequenceOrder::<4>)
         .codec(DryIceCodec::new())
         .chunk_sort(RadixThenRefine::<4>)
         .max_buffer_items(50)
@@ -821,7 +817,7 @@ fn radix_sort_through_pipeline() {
         .map(|r| r.expect("decode"))
         .collect();
 
-    input.sort_by(|a, b| a.sequence().cmp(b.sequence()));
+    input.sort_by(|a, b| SequenceOrder::<4>.compare(a, b));
 
     assert_eq!(results.len(), input.len());
     for (i, (got, expected)) in results.iter().zip(input.iter()).enumerate() {
@@ -968,8 +964,6 @@ fn dedup_with_spilling_removes_cross_chunk_duplicates() {
 
 #[test]
 fn unkeyed_sort_preserves_exact_sequence_and_quality_ordering() {
-    use spillover_bio::sort::ILLUMINA_ORDER;
-
     // The unkeyed path uses full (sequence, quality) comparison
     // during merge, so sequence+quality ordering is exact across
     // run boundaries.
@@ -1036,8 +1030,6 @@ fn exact_sequence_sort_uses_raw_sequence_order() {
 
 #[test]
 fn unkeyed_sort_with_variable_length_sequences() {
-    use spillover_bio::sort::ILLUMINA_ORDER;
-
     // The unkeyed path doesn't have the packed key padding
     // ambiguity, so variable-length sequences sort correctly.
     let mut sorter = Builder::new()
