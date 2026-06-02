@@ -230,6 +230,20 @@ fn comparator_consistency_examples() -> Vec<SeqRecord> {
     ]
 }
 
+fn name_order_examples() -> Vec<SeqRecord> {
+    vec![
+        named_rec(b"", b"A", b"!"),
+        named_rec(b"A", b"A", b"!"),
+        named_rec(b"AA", b"A", b"!"),
+        named_rec(b"AB", b"A", b"!"),
+        named_rec(b"B", b"A", b"!"),
+        named_rec(b"A\0", b"A", b"!"),
+        named_rec(b"A\0Z", b"A", b"!"),
+        named_rec(b"aaaaaaaaaaaaaaaaY", b"A", b"!"),
+        named_rec(b"aaaaaaaaaaaaaaaaZ", b"A", b"!"),
+    ]
+}
+
 #[test]
 fn owned_records_have_compatible_key_and_record_order() {
     let order = SequenceOrder::<1>;
@@ -302,6 +316,10 @@ fn small_record() -> impl Strategy<Value = SeqRecord> {
 
 fn small_record_triple() -> impl Strategy<Value = (SeqRecord, SeqRecord, SeqRecord)> {
     (small_record(), small_record(), small_record())
+}
+
+fn named_record() -> impl Strategy<Value = SeqRecord> {
+    prop::collection::vec(any::<u8>(), 0..=40).prop_map(|name| SeqRecord::new(name, b"A", b"!"))
 }
 
 macro_rules! record_comparator_consistency_test {
@@ -447,6 +465,36 @@ key_comparator_consistency_test!(
     Reverse(LengthOrder)
 );
 
+#[test]
+fn name_order_key_and_record_order_are_compatible_for_owned_records() {
+    let records = name_order_examples();
+
+    assert_key_and_record_order_are_compatible(NameOrder, &records);
+}
+
+#[test]
+fn name_order_key_and_record_order_are_compatible_for_borrowed_records() {
+    let records = name_order_examples();
+    let views: Vec<SeqRecordView<'_>> = records.iter().map(SeqRecord::as_view).collect();
+
+    assert_key_and_record_order_are_compatible(NameOrder, &views);
+}
+
+#[test]
+fn reverse_name_order_key_and_record_order_are_compatible_for_owned_records() {
+    let records = name_order_examples();
+
+    assert_key_and_record_order_are_compatible(Reverse(NameOrder), &records);
+}
+
+#[test]
+fn reverse_name_order_key_and_record_order_are_compatible_for_borrowed_records() {
+    let records = name_order_examples();
+    let views: Vec<SeqRecordView<'_>> = records.iter().map(SeqRecord::as_view).collect();
+
+    assert_key_and_record_order_are_compatible(Reverse(NameOrder), &views);
+}
+
 proptest! {
     #[test]
     fn generated_illumina_records_have_compatible_key_and_record_order(
@@ -494,5 +542,15 @@ proptest! {
         let records = [a, b, c];
 
         assert_record_comparator_is_consistent(LengthOrder, &records);
+    }
+
+    #[test]
+    fn generated_name_records_have_compatible_key_and_record_order(
+        left in named_record(),
+        right in named_record(),
+    ) {
+        let records = [left, right];
+
+        assert_key_and_record_order_are_compatible(NameOrder, &records);
     }
 }
