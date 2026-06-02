@@ -244,6 +244,17 @@ fn name_order_examples() -> Vec<SeqRecord> {
     ]
 }
 
+fn length_order_examples() -> Vec<SeqRecord> {
+    vec![
+        named_rec(b"empty", b"", b""),
+        named_rec(b"one_a", b"A", b"!"),
+        named_rec(b"two_a", b"AA", b"!!"),
+        named_rec(b"two_t", b"TT", b"II"),
+        named_rec(b"four", b"ACGT", b"!!!!"),
+        named_rec(b"eight", b"ACGTACGT", b"!!!!!!!!"),
+    ]
+}
+
 #[test]
 fn owned_records_have_compatible_key_and_record_order() {
     let order = SequenceOrder::<1>;
@@ -320,6 +331,23 @@ fn small_record_triple() -> impl Strategy<Value = (SeqRecord, SeqRecord, SeqReco
 
 fn named_record() -> impl Strategy<Value = SeqRecord> {
     prop::collection::vec(any::<u8>(), 0..=40).prop_map(|name| SeqRecord::new(name, b"A", b"!"))
+}
+
+fn length_record() -> impl Strategy<Value = SeqRecord> {
+    (
+        prop::collection::vec(any::<u8>(), 0..=8),
+        prop::collection::vec(any::<u8>(), 0..=64),
+    )
+        .prop_flat_map(|(name, sequence)| {
+            let quality_len = sequence.len();
+
+            (
+                Just(name),
+                Just(sequence),
+                prop::collection::vec(any::<u8>(), quality_len),
+            )
+        })
+        .prop_map(|(name, sequence, quality)| SeqRecord::new(name, sequence, quality))
 }
 
 macro_rules! record_comparator_consistency_test {
@@ -495,6 +523,51 @@ fn reverse_name_order_key_and_record_order_are_compatible_for_borrowed_records()
     assert_key_and_record_order_are_compatible(Reverse(NameOrder), &views);
 }
 
+#[test]
+fn length_order_key_and_record_order_are_compatible_for_owned_records() {
+    let records = length_order_examples();
+
+    assert_key_and_record_order_are_compatible(LengthOrder, &records);
+}
+
+#[test]
+fn length_order_key_and_record_order_are_compatible_for_borrowed_records() {
+    let records = length_order_examples();
+    let views: Vec<SeqRecordView<'_>> = records.iter().map(SeqRecord::as_view).collect();
+
+    assert_key_and_record_order_are_compatible(LengthOrder, &views);
+}
+
+#[test]
+fn reverse_length_order_key_and_record_order_are_compatible_for_owned_records() {
+    let records = length_order_examples();
+
+    assert_key_and_record_order_are_compatible(Reverse(LengthOrder), &records);
+}
+
+#[test]
+fn reverse_length_order_key_and_record_order_are_compatible_for_borrowed_records() {
+    let records = length_order_examples();
+    let views: Vec<SeqRecordView<'_>> = records.iter().map(SeqRecord::as_view).collect();
+
+    assert_key_and_record_order_are_compatible(Reverse(LengthOrder), &views);
+}
+
+#[test]
+fn length_order_ties_distinct_equal_length_records() {
+    let left = named_rec(b"same_len_a", b"AA", b"!!");
+    let right = named_rec(b"same_len_b", b"TT", b"II");
+
+    assert_eq!(
+        LengthOrder.comparator().compare(&left, &right),
+        Ordering::Equal
+    );
+    assert_eq!(
+        LengthOrder.record_key(&left),
+        LengthOrder.record_key(&right)
+    );
+}
+
 proptest! {
     #[test]
     fn generated_illumina_records_have_compatible_key_and_record_order(
@@ -552,5 +625,15 @@ proptest! {
         let records = [left, right];
 
         assert_key_and_record_order_are_compatible(NameOrder, &records);
+    }
+
+    #[test]
+    fn generated_length_records_have_compatible_key_and_record_order(
+        left in length_record(),
+        right in length_record(),
+    ) {
+        let records = [left, right];
+
+        assert_key_and_record_order_are_compatible(LengthOrder, &records);
     }
 }

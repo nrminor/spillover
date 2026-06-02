@@ -277,6 +277,9 @@ impl NameOrder {
 
 /// Sort by sequence length, using an 8-byte big-endian u64
 /// as the record key.
+///
+/// Records with the same sequence length compare equal under this order; their
+/// relative order is not specified by `LengthOrder`.
 #[derive(Debug, Clone, Copy)]
 pub struct LengthOrder;
 
