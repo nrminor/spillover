@@ -7,7 +7,9 @@ use spillover_bio::{
     error::SortedRecordStreamError,
     radix::RadixThenRefine,
     record::{SeqRecord, SeqRecordArena, SeqRecordParts, SeqRecordView},
-    sort::{Builder, ILLUMINA_ORDER, LENGTH_ORDER, Reverse, SeqRecordSink, SequenceOrder},
+    sort::{
+        Builder, ILLUMINA_ORDER, LENGTH_ORDER, NAME_ORDER, Reverse, SeqRecordSink, SequenceOrder,
+    },
 };
 
 fn make_record(name: &[u8], seq: &[u8], qual: &[u8]) -> SeqRecord {
@@ -452,21 +454,24 @@ fn keyed_merge_preserves_quality_tiebreak_across_run_boundaries() {
 
 #[test]
 fn sort_by_name_orders_lexicographically() {
+    let mut input = vec![
+        make_record(b"charlie", b"ACGT", b"!!!!"),
+        make_record(b"alice", b"TGCA", b"!!!!"),
+        make_record(b"bob", b"GGGG", b"!!!!"),
+        make_record(b"read_010", b"AAAA", b"!!!!"),
+        make_record(b"read_002", b"CCCC", b"!!!!"),
+        make_record(b"read_001", b"TTTT", b"!!!!"),
+    ];
+
     let mut sorter = Builder::new()
         .sort_by_name()
         .codec(DryIceCodec::new())
-        .max_buffer_items(100)
+        .max_buffer_items(2)
         .build();
 
-    sorter
-        .push(make_record(b"charlie", b"ACGT", b"!!!!"))
-        .expect("push");
-    sorter
-        .push(make_record(b"alice", b"TGCA", b"!!!!"))
-        .expect("push");
-    sorter
-        .push(make_record(b"bob", b"GGGG", b"!!!!"))
-        .expect("push");
+    for rec in &input {
+        sorter.push(rec.clone()).expect("push");
+    }
 
     let results: Vec<SeqRecord> = sorter
         .finish()
@@ -474,29 +479,33 @@ fn sort_by_name_orders_lexicographically() {
         .map(|r| r.expect("decode"))
         .collect();
 
-    assert_eq!(results.len(), 3);
-    assert_eq!(results[0].name(), b"alice");
-    assert_eq!(results[1].name(), b"bob");
-    assert_eq!(results[2].name(), b"charlie");
+    input.sort_by(|a, b| NAME_ORDER.compare(a, b));
+
+    assert_eq!(results.len(), input.len());
+    for (i, (got, expected)) in results.iter().zip(input.iter()).enumerate() {
+        assert_eq!(got.name(), expected.name(), "name mismatch at position {i}");
+    }
 }
 
 #[test]
 fn reverse_sequence_order_produces_descending_output() {
+    let mut input = vec![
+        make_record(b"r1", b"AAAAAAAA", b"!!!!!!!!"),
+        make_record(b"r2", b"TTTTTTTT", b"!!!!!!!!"),
+        make_record(b"r3", b"CCCCCCCC", b"!!!!!!!!"),
+        make_record(b"r4", b"ACGTACGT", b"IIIIIIII"),
+        make_record(b"r5", b"ACGTACGT", b"########"),
+    ];
+
     let mut sorter = Builder::new()
         .sort_by(Reverse(ILLUMINA_ORDER))
         .codec(DryIceCodec::new())
-        .max_buffer_items(100)
+        .max_buffer_items(2)
         .build();
 
-    sorter
-        .push(make_record(b"r1", b"AAAAAAAA", b"!!!!!!!!"))
-        .expect("push");
-    sorter
-        .push(make_record(b"r2", b"TTTTTTTT", b"!!!!!!!!"))
-        .expect("push");
-    sorter
-        .push(make_record(b"r3", b"CCCCCCCC", b"!!!!!!!!"))
-        .expect("push");
+    for rec in &input {
+        sorter.push(rec.clone()).expect("push");
+    }
 
     let results: Vec<SeqRecord> = sorter
         .finish()
@@ -504,29 +513,43 @@ fn reverse_sequence_order_produces_descending_output() {
         .map(|r| r.expect("decode"))
         .collect();
 
-    assert_eq!(results.len(), 3);
-    assert_eq!(results[0].sequence(), b"TTTTTTTT");
-    assert_eq!(results[1].sequence(), b"CCCCCCCC");
-    assert_eq!(results[2].sequence(), b"AAAAAAAA");
+    input.sort_by(|a, b| Reverse(ILLUMINA_ORDER).compare(a, b));
+
+    assert_eq!(results.len(), input.len());
+    for (i, (got, expected)) in results.iter().zip(input.iter()).enumerate() {
+        assert_eq!(
+            got.sequence(),
+            expected.sequence(),
+            "sequence mismatch at position {i}"
+        );
+        assert_eq!(
+            got.quality(),
+            expected.quality(),
+            "quality mismatch at position {i}"
+        );
+    }
 }
 
 #[test]
 fn sort_by_length_orders_shortest_first() {
+    let input = vec![
+        make_record(b"len12_a", b"ACGTACGTACGT", b"!!!!!!!!!!!!"),
+        make_record(b"len4_a", b"ACGT", b"!!!!"),
+        make_record(b"len8", b"ACGTACGT", b"!!!!!!!!"),
+        make_record(b"len1", b"A", b"!"),
+        make_record(b"len4_b", b"TGCA", b"!!!!"),
+        make_record(b"len12_b", b"TGCATGCATGCA", b"!!!!!!!!!!!!"),
+    ];
+
     let mut sorter = Builder::new()
         .sort_by(LENGTH_ORDER)
         .codec(DryIceCodec::new())
-        .max_buffer_items(100)
+        .max_buffer_items(2)
         .build();
 
-    sorter
-        .push(make_record(b"r1", b"ACGTACGTACGT", b"!!!!!!!!!!!!"))
-        .expect("push");
-    sorter
-        .push(make_record(b"r2", b"ACGT", b"!!!!"))
-        .expect("push");
-    sorter
-        .push(make_record(b"r3", b"ACGTACGT", b"!!!!!!!!"))
-        .expect("push");
+    for rec in &input {
+        sorter.push(rec.clone()).expect("push");
+    }
 
     let results: Vec<SeqRecord> = sorter
         .finish()
@@ -534,10 +557,11 @@ fn sort_by_length_orders_shortest_first() {
         .map(|r| r.expect("decode"))
         .collect();
 
-    assert_eq!(results.len(), 3);
-    assert_eq!(results[0].sequence().len(), 4);
-    assert_eq!(results[1].sequence().len(), 8);
-    assert_eq!(results[2].sequence().len(), 12);
+    let result_lengths: Vec<_> = results.iter().map(|r| r.sequence().len()).collect();
+    let mut expected_lengths: Vec<_> = input.iter().map(|r| r.sequence().len()).collect();
+    expected_lengths.sort_unstable();
+
+    assert_eq!(result_lengths, expected_lengths);
 }
 
 #[test]
@@ -627,12 +651,7 @@ fn large_dataset_matches_reference_sort() {
         .map(|r| r.expect("decode"))
         .collect();
 
-    // Build reference using the full sort order.
-    input.sort_by(|a, b| {
-        a.sequence()
-            .cmp(b.sequence())
-            .then_with(|| a.quality().cmp(b.quality()))
-    });
+    input.sort_by(|a, b| ILLUMINA_ORDER.compare(a, b));
 
     assert_eq!(results.len(), input.len());
     for (i, (got, expected)) in results.iter().zip(input.iter()).enumerate() {
@@ -831,24 +850,22 @@ fn radix_sort_through_pipeline() {
 
 #[test]
 fn sequences_with_ambiguous_bases_sort_correctly() {
+    let mut input = vec![
+        make_record(b"n", b"NNNNNNNN", b"IIIIIIII"),
+        make_record(b"a", b"AAAAAAAA", b"!!!!!!!!"),
+        make_record(b"t", b"TTTTTTTT", b"!!!!!!!!"),
+        make_record(b"c", b"CCCCCCCC", b"########"),
+    ];
+
     let mut sorter = Builder::new()
         .sort_by_illumina()
         .codec(DryIceCodec::new())
-        .max_buffer_items(100)
+        .max_buffer_items(2)
         .build();
 
-    // N maps to A in packed keys, so NNNNNNNN and AAAAAAAA
-    // have the same packed key. Quality tiebreaker should
-    // differentiate them.
-    sorter
-        .push(make_record(b"r1", b"NNNNNNNN", b"IIIIIIII"))
-        .expect("push");
-    sorter
-        .push(make_record(b"r2", b"AAAAAAAA", b"!!!!!!!!"))
-        .expect("push");
-    sorter
-        .push(make_record(b"r3", b"TTTTTTTT", b"!!!!!!!!"))
-        .expect("push");
+    for rec in &input {
+        sorter.push(rec.clone()).expect("push");
+    }
 
     let results: Vec<SeqRecord> = sorter
         .finish()
@@ -856,12 +873,21 @@ fn sequences_with_ambiguous_bases_sort_correctly() {
         .map(|r| r.expect("decode"))
         .collect();
 
-    assert_eq!(results.len(), 3);
-    // AAAAAAAA and NNNNNNNN both sort before TTTTTTTT.
-    // Between them, quality tiebreaker: ! < I
-    assert_eq!(results[0].quality(), b"!!!!!!!!");
-    assert_eq!(results[1].quality(), b"IIIIIIII");
-    assert_eq!(results[2].sequence(), b"TTTTTTTT");
+    input.sort_by(|a, b| ILLUMINA_ORDER.compare(a, b));
+
+    assert_eq!(results.len(), input.len());
+    for (i, (got, expected)) in results.iter().zip(input.iter()).enumerate() {
+        assert_eq!(
+            got.sequence(),
+            expected.sequence(),
+            "sequence mismatch at position {i}"
+        );
+        assert_eq!(
+            got.quality(),
+            expected.quality(),
+            "quality mismatch at position {i}"
+        );
+    }
 }
 
 #[test]
@@ -1026,6 +1052,54 @@ fn exact_sequence_sort_uses_raw_sequence_order() {
 
     assert_eq!(results[0].sequence(), b"C");
     assert_eq!(results[1].sequence(), b"N");
+}
+
+#[test]
+fn exact_sequence_sort_matches_reference_across_runs() {
+    let mut input = vec![
+        make_record(b"n", b"N", b"!"),
+        make_record(b"c", b"C", b"!"),
+        make_record(b"a_long", b"AAAA", b"####"),
+        make_record(b"a_short", b"A", b"I"),
+        make_record(b"same_hi", b"ACGT", b"IIII"),
+        make_record(b"same_lo", b"ACGT", b"!!!!"),
+    ];
+
+    let mut sorter = Builder::new()
+        .sort_by_sequence_exact()
+        .codec(DryIceCodec::new())
+        .max_buffer_items(2)
+        .build();
+
+    for rec in &input {
+        sorter.push(rec.clone()).expect("push");
+    }
+
+    let results: Vec<SeqRecord> = sorter
+        .finish()
+        .expect("finish")
+        .map(|r| r.expect("decode"))
+        .collect();
+
+    input.sort_by(|a, b| {
+        a.sequence()
+            .cmp(b.sequence())
+            .then_with(|| a.quality().cmp(b.quality()))
+    });
+
+    assert_eq!(results.len(), input.len());
+    for (i, (got, expected)) in results.iter().zip(input.iter()).enumerate() {
+        assert_eq!(
+            got.sequence(),
+            expected.sequence(),
+            "sequence mismatch at position {i}"
+        );
+        assert_eq!(
+            got.quality(),
+            expected.quality(),
+            "quality mismatch at position {i}"
+        );
+    }
 }
 
 #[test]
