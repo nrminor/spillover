@@ -1,10 +1,6 @@
 use std::time::Instant;
 
-use spillover_bio::{
-    codec::DryIceCodec,
-    record::SeqRecord,
-    sort::{Builder, ILLUMINA_ORDER},
-};
+use spillover_bio::{codec::DryIceCodec, record::SeqRecord, sort::Builder};
 
 fn generate_records(count: usize, len: usize) -> Vec<SeqRecord> {
     let mut seed: u64 = 0xD0E5_F17E_CAFE_BABE;
@@ -41,37 +37,45 @@ fn generate_records(count: usize, len: usize) -> Vec<SeqRecord> {
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let records = generate_records(4_000, 150);
 
-    let keyed_start = Instant::now();
-    let mut keyed = Builder::new()
+    // `sort_by_illumina()` is the high-throughput path for ordinary Illumina
+    // reads. It uses a compact packed sequence key and radix chunk sorting, then
+    // refines ties with the full sequence/quality comparator.
+    let illumina_start = Instant::now();
+    let mut illumina = Builder::new()
         .sort_by_illumina()
         .codec(DryIceCodec::new())
         .max_buffer_items(256)
         .build();
     for rec in &records {
-        keyed.push(rec.clone())?;
+        illumina.push(rec.clone())?;
     }
-    let keyed_out: Vec<SeqRecord> = keyed.finish()?.collect::<Result<Vec<_>, _>>()?;
-    let keyed_elapsed = keyed_start.elapsed();
+    let illumina_out: Vec<SeqRecord> = illumina.finish()?.collect::<Result<Vec<_>, _>>()?;
+    let illumina_elapsed = illumina_start.elapsed();
 
-    let unkeyed_start = Instant::now();
-    let mut unkeyed = Builder::new()
-        .sort_by_unkeyed(ILLUMINA_ORDER.unkeyed())
+    // `sort_by_sequence_exact()` is the boring, literal order: raw sequence bytes
+    // followed by raw quality bytes. It is the right choice when exact byte
+    // lexicographic ordering matters, but it uses the full-record unkeyed path and
+    // sequential comparison sorting, so it may be slower on large spill-heavy
+    // Illumina datasets than the compact keyed path above.
+    let exact_start = Instant::now();
+    let mut exact = Builder::new()
+        .sort_by_sequence_exact()
         .codec(DryIceCodec::new())
         .max_buffer_items(256)
         .build();
     for rec in &records {
-        unkeyed.push(rec.clone())?;
+        exact.push(rec.clone())?;
     }
-    let unkeyed_out: Vec<SeqRecord> = unkeyed.finish()?.collect::<Result<Vec<_>, _>>()?;
-    let unkeyed_elapsed = unkeyed_start.elapsed();
+    let exact_out: Vec<SeqRecord> = exact.finish()?.collect::<Result<Vec<_>, _>>()?;
+    let exact_elapsed = exact_start.elapsed();
 
-    assert_eq!(keyed_out.len(), unkeyed_out.len());
-    println!("records: {}", keyed_out.len());
-    println!("keyed elapsed:   {keyed_elapsed:?}");
-    println!("unkeyed elapsed: {unkeyed_elapsed:?}");
+    assert_eq!(illumina_out.len(), exact_out.len());
+    println!("records: {}", illumina_out.len());
+    println!("illumina elapsed: {illumina_elapsed:?}");
+    println!("exact elapsed:    {exact_elapsed:?}");
     println!(
         "same first sequence: {}",
-        keyed_out.first().map(SeqRecord::sequence) == unkeyed_out.first().map(SeqRecord::sequence)
+        illumina_out.first().map(SeqRecord::sequence) == exact_out.first().map(SeqRecord::sequence)
     );
 
     Ok(())

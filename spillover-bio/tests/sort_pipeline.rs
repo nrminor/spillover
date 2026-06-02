@@ -1014,6 +1014,27 @@ fn unkeyed_sort_preserves_exact_sequence_and_quality_ordering() {
 }
 
 #[test]
+fn exact_sequence_sort_uses_raw_sequence_order() {
+    let mut sorter = Builder::new()
+        .sort_by_sequence_exact()
+        .codec(DryIceCodec::new())
+        .max_buffer_items(100)
+        .build();
+
+    sorter.push(make_record(b"n", b"N", b"!")).expect("push");
+    sorter.push(make_record(b"c", b"C", b"!")).expect("push");
+
+    let results: Vec<SeqRecord> = sorter
+        .finish()
+        .expect("finish")
+        .map(|r| r.expect("decode"))
+        .collect();
+
+    assert_eq!(results[0].sequence(), b"C");
+    assert_eq!(results[1].sequence(), b"N");
+}
+
+#[test]
 fn unkeyed_sort_with_variable_length_sequences() {
     use spillover_bio::sort::ILLUMINA_ORDER;
 

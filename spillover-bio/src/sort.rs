@@ -1383,6 +1383,21 @@ impl<C, F, CS, S> Builder<NeedsOrder, C, F, CS, S> {
             .chunk_sort(RadixThenRefine::<38>)
     }
 
+    /// Sort by exact raw sequence bytes, then raw quality bytes.
+    ///
+    /// This uses the basic unkeyed sequence order rather than the accelerated
+    /// packed-key order used by [`Self::sort_by_illumina`]. It also selects the
+    /// sequential comparator-based chunk sorter, even if a chunk sorter was
+    /// configured earlier on the builder, because packed-key radix sorting is not
+    /// compatible with exact raw sequence ordering.
+    #[must_use]
+    pub fn sort_by_sequence_exact(
+        self,
+    ) -> Builder<HasUnkeyedOrder<UnkeyedSequenceOrder>, C, F, Sequential, S> {
+        self.sort_by_unkeyed(UnkeyedSequenceOrder)
+            .sort_with_sequential()
+    }
+
     /// Sort by sequence (250bp paired-end, 64-byte packed key).
     /// Defaults to radix sort for the chunk sorting engine.
     #[must_use]
@@ -2051,6 +2066,30 @@ mod tests {
         let key = ILLUMINA_ORDER.record_key(&rec);
         let expected = crate::key::PackedSequenceKey::<38>::from_sequence(b"ACGT");
         assert_eq!(key, expected);
+    }
+
+    #[test]
+    fn sort_by_sequence_exact_selects_unkeyed_sequence_order() {
+        fn assert_builder_type<T>(_: &T) {}
+
+        let builder = Builder::new().sort_by_sequence_exact();
+
+        assert_builder_type::<
+            Builder<HasUnkeyedOrder<UnkeyedSequenceOrder>, NeedsCodec, NeedsFlush, Sequential>,
+        >(&builder);
+    }
+
+    #[test]
+    fn sort_by_sequence_exact_overrides_chunk_sorter_to_sequential() {
+        fn assert_builder_type<T>(_: &T) {}
+
+        let builder = Builder::new()
+            .chunk_sort(RadixThenRefine::<38>)
+            .sort_by_sequence_exact();
+
+        assert_builder_type::<
+            Builder<HasUnkeyedOrder<UnkeyedSequenceOrder>, NeedsCodec, NeedsFlush, Sequential>,
+        >(&builder);
     }
 
     #[test]
