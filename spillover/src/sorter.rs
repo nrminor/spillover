@@ -300,7 +300,7 @@ where
             sort_key: self.sort_key.0,
             codec: self.codec.0,
             compare: self.compare,
-            dedup: Some(self.dedup),
+            dedup: self.dedup,
             chunk_sort: self.chunk_sort,
             flush: self.flush.0,
             buffer: Vec::new(),
@@ -328,7 +328,7 @@ where
             sort_key: self.sort_key.0,
             codec: self.codec.0,
             compare: self.compare,
-            dedup: Some(self.dedup),
+            dedup: self.dedup,
             chunk_sort: self.chunk_sort,
             flush: self.flush.0,
             buffer: Vec::new(),
@@ -366,7 +366,7 @@ pub struct Sorter<T, SK, Cod, Cmp, D, CS, M = Basic> {
     sort_key: SK,
     codec: Cod,
     compare: Cmp,
-    dedup: Option<D>,
+    dedup: D,
     chunk_sort: CS,
     flush: FlushStrategy<T>,
     buffer: Vec<T>,
@@ -549,9 +549,6 @@ where
     ///
     /// Returns an error if flushing or merging fails.
     ///
-    /// # Panics
-    ///
-    /// Panics if called more than once.
     #[allow(clippy::type_complexity)]
     pub fn finish(
         mut self,
@@ -570,10 +567,7 @@ where
         let run_merger = RunMerger::new(self.codec, item_cmp, self.config.merge.clone());
         let merged = run_merger.merge(std::mem::take(&mut self.spilled_runs))?;
 
-        let dedup = self
-            .dedup
-            .take()
-            .expect("dedup is always Some until finish() consumes it");
+        let dedup = self.dedup;
 
         Ok(Sorted::new(dedup.dedup(merged)))
     }
@@ -637,9 +631,6 @@ where
     ///
     /// Returns an error if flushing or merging fails.
     ///
-    /// # Panics
-    ///
-    /// Panics if called more than once.
     #[allow(clippy::type_complexity)]
     pub fn finish(
         mut self,
@@ -659,10 +650,7 @@ where
         let merged =
             run_merger.merge_keyed(std::mem::take(&mut self.spilled_runs), self.compare)?;
 
-        let dedup = self
-            .dedup
-            .take()
-            .expect("dedup is always Some until finish() consumes it");
+        let dedup = self.dedup;
 
         Ok(Sorted::new(dedup.dedup(merged)))
     }
