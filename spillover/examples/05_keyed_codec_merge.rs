@@ -2,7 +2,8 @@ use std::io::{BufReader, BufWriter, Read, Write};
 
 use spillover::{
     codec::{
-        Codec, CodecCursor, CodecWriter, DeriveKey, KeyedCodec, KeyedCodecCursor, KeyedCodecWriter,
+        Codec, CodecCursor, DeriveKey, EncodeKeyedRun, KeyedCodec, KeyedCodecCursor,
+        KeyedCodecWriter,
     },
     key::Owned,
     sorter::Builder,
@@ -15,25 +16,6 @@ struct Writer<W: Write> {
     inner: BufWriter<W>,
 }
 
-impl<W: Write> CodecWriter<u64> for Writer<W> {
-    type Error = std::io::Error;
-
-    fn write(&mut self, item: &u64) -> Result<(), Self::Error> {
-        let key = u8::try_from(*item / 10).map_err(|e| {
-            std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                format!("decade key overflow: {e}"),
-            )
-        })?;
-        self.inner.write_all(&[key])?;
-        self.inner.write_all(&item.to_le_bytes())
-    }
-
-    fn finish(mut self) -> Result<(), Self::Error> {
-        self.inner.flush()
-    }
-}
-
 impl<W: Write> KeyedCodecWriter<u64, u8> for Writer<W> {
     type Error = std::io::Error;
 
@@ -42,8 +24,8 @@ impl<W: Write> KeyedCodecWriter<u64, u8> for Writer<W> {
         self.inner.write_all(&item.to_le_bytes())
     }
 
-    fn finish(self) -> Result<(), Self::Error> {
-        CodecWriter::finish(self)
+    fn finish(mut self) -> Result<(), Self::Error> {
+        self.inner.flush()
     }
 }
 
@@ -106,14 +88,7 @@ impl<R: Read> KeyedCodecCursor<u64, u8> for Reader<R> {
 impl Codec for DecadeKeyedCodec {
     type Item = u64;
     type Error = std::io::Error;
-    type Writer<W: Write> = Writer<W>;
     type Cursor<R: Read> = Reader<R>;
-
-    fn writer<W: Write>(&self, dest: W) -> Self::Writer<W> {
-        Writer {
-            inner: BufWriter::new(dest),
-        }
-    }
 
     fn cursor<R: Read>(&self, source: R) -> Self::Cursor<R> {
         Reader {
@@ -126,15 +101,20 @@ impl Codec for DecadeKeyedCodec {
 
 impl KeyedCodec for DecadeKeyedCodec {
     type Key = u8;
-    type KeyedWriter<W: Write> = Writer<W>;
     type KeyedCursor<R: Read> = Reader<R>;
-
-    fn keyed_writer<W: Write>(&self, dest: W) -> Self::KeyedWriter<W> {
-        self.writer(dest)
-    }
 
     fn keyed_cursor<R: Read>(&self, source: R) -> Self::KeyedCursor<R> {
         self.cursor(source)
+    }
+}
+
+impl EncodeKeyedRun<u64> for DecadeKeyedCodec {
+    type KeyedWriter<W: Write> = Writer<W>;
+
+    fn keyed_writer<W: Write>(&self, dest: W) -> Self::KeyedWriter<W> {
+        Writer {
+            inner: BufWriter::new(dest),
+        }
     }
 }
 

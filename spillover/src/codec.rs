@@ -1,12 +1,13 @@
 //! Serialization traits for reading and writing items to disk.
 //!
-//! [`Codec`] defines how items are written to and read from
-//! temporary files during the sort. The codec itself is a
-//! stateless `Copy` configuration object — it spawns stateful
-//! [`CodecWriter`] and [`CodecCursor`] instances that handle
-//! the actual I/O. This separation allows block-oriented
-//! formats (like dryice) to manage internal buffering in the
-//! writer while keeping the codec trivially duplicatable.
+//! [`Codec`] defines how items are read back from temporary files during the
+//! sort. [`EncodeRun`] and [`EncodeKeyedRun`] define which write-side item shapes
+//! a format can encode into temporary runs. Core owns temporary-run transport
+//! concerns such as opening run files and applying the outer read/write buffers
+//! configured by [`MergeConfig`](crate::merge::MergeConfig). Codecs own record
+//! encoding and decoding, and may still keep format-specific buffers such as
+//! compression blocks or reusable decode storage while keeping the codec itself a
+//! trivially duplicatable `Copy` configuration object.
 //!
 //! [`KeyedCodec`] is an optional extension for formats that
 //! can store a precomputed sort key alongside each record,
@@ -15,7 +16,7 @@
 
 use std::io::{Read, Write};
 
-/// A stateful writer created by a [`Codec`] for writing items
+/// A stateful writer created by [`EncodeRun`] for writing items
 /// to a single sorted run.
 ///
 /// The writer may hold internal state (e.g., a partially filled
@@ -96,12 +97,14 @@ pub trait CodecCursor<T> {
     ) -> Result<R, Self::Error>;
 }
 
-/// Defines the on-disk format for sorted runs.
+/// Defines the read side of an on-disk format for sorted runs.
 ///
 /// A codec is a stateless, `Copy` configuration object that
-/// knows how to create writers and cursors for its format.
-/// The writers and cursors hold whatever state the format
-/// needs (I/O buffers, block accumulators, etc.).
+/// knows how to create cursors for its format. Cursors hold whatever read-side
+/// state the format needs, such as reusable decode buffers.
+///
+/// Writing is modeled by [`EncodeRun`] because a run format may be readable as
+/// one owned item type while accepting several write-side item shapes.
 ///
 /// The core crate provides no built-in codecs — implementations
 /// live in domain crates (e.g., `spillover-bio` provides a
@@ -113,22 +116,34 @@ pub trait Codec: Copy {
     /// The error type for encode/decode failures.
     type Error: std::error::Error + Send + Sync + 'static;
 
-    /// A stateful writer for encoding items into a sorted run.
-    type Writer<W: Write>;
-
     /// A stateful cursor for decoding items from a sorted run.
     type Cursor<R: Read>: CodecCursor<Self::Item, Error = Self::Error>;
-
-    /// Create a writer that encodes items into `dest`.
-    fn writer<W: Write>(&self, dest: W) -> Self::Writer<W>;
 
     /// Create a cursor that decodes items from `source`.
     fn cursor<R: Read>(&self, source: R) -> Self::Cursor<R>;
 }
 
+/// Capability for encoding write-side items into an unkeyed sorted run.
+///
+/// Core owns temporary-run transport: opening files and applying the outer
+/// buffers configured by [`MergeConfig`](crate::merge::MergeConfig). The codec
+/// owns the run format and may keep format-specific writer state such as
+/// compression blocks.
+///
+/// `I` is the write-side item shape. It may differ from [`Codec::Item`]; for
+/// example, a codec may read owned records back from disk while writing borrowed
+/// record views during spill.
+pub trait EncodeRun<I: ?Sized>: Codec {
+    /// A stateful writer for encoding `I` values into a sorted run.
+    type Writer<W: Write>: CodecWriter<I, Error = Self::Error>;
+
+    /// Create a writer that encodes items into `dest`.
+    fn writer<W: Write>(&self, dest: W) -> Self::Writer<W>;
+}
+
 /// A stateful writer that stores items alongside precomputed keys.
 ///
-/// Created by [`KeyedCodec::keyed_writer`]. Like [`CodecWriter`],
+/// Created by [`EncodeKeyedRun::keyed_writer`]. Like [`CodecWriter`],
 /// [`finish`](Self::finish) must be called after the last item.
 pub trait KeyedCodecWriter<I: ?Sized, K> {
     /// The error type for write failures.
@@ -170,7 +185,7 @@ pub trait KeyedCodecCursor<T, K>: CodecCursor<T> {
     fn current_key(&self) -> Result<K, Self::Error>;
 }
 
-/// Extension trait for codecs that store a compact *record key*
+/// Read-side extension for codecs that store a compact *record key*
 /// alongside each record on disk.
 ///
 /// The record key is a compact, owned representation derived from
@@ -187,9 +202,10 @@ pub trait KeyedCodecCursor<T, K>: CodecCursor<T> {
 /// handle both types — sorting behaviour cannot be assumed to
 /// transfer between encodings.
 ///
-/// The merge engine selects between the base [`Codec`] path and
-/// the `KeyedCodec` fast path at compile time based on whether
-/// the user calls `.codec()` or `.keyed_codec()` on the builder.
+/// The merge engine selects between ordinary [`Codec`] cursors and keyed cursors
+/// at compile time based on whether the user calls `.codec()` or
+/// `.keyed_codec()` on the builder. Writing keyed runs is modeled separately by
+/// [`EncodeKeyedRun`].
 pub trait KeyedCodec: Codec {
     /// The compact record key stored alongside each record on
     /// disk for merge acceleration. This is distinct from the
@@ -199,16 +215,9 @@ pub trait KeyedCodec: Codec {
     /// keys independently of reader state.
     type Key: Clone;
 
-    /// A stateful writer that encodes items with their keys.
-    type KeyedWriter<W: Write>;
-
     /// A stateful cursor that can retrieve keys and records
     /// independently.
     type KeyedCursor<R: Read>: KeyedCodecCursor<Self::Item, Self::Key, Error = Self::Error>;
-
-    /// Create a keyed writer that encodes items with their keys
-    /// into `dest`.
-    fn keyed_writer<W: Write>(&self, dest: W) -> Self::KeyedWriter<W>;
 
     /// Create a keyed cursor over a byte source.
     fn keyed_cursor<R: Read>(&self, source: R) -> Self::KeyedCursor<R>;
@@ -223,6 +232,19 @@ pub trait KeyedCodec: Codec {
 pub trait DeriveKey<I: ?Sized>: KeyedCodec {
     /// Derive the stored key for `item`.
     fn derive_key(&self, item: &I) -> Self::Key;
+}
+
+/// Capability for encoding write-side items into a keyed sorted run.
+///
+/// This capability includes key derivation because writing a keyed run requires
+/// both serializing the item and storing the compact record key used during
+/// keyed merge.
+pub trait EncodeKeyedRun<I: ?Sized>: KeyedCodec + DeriveKey<I> {
+    /// A stateful writer that encodes `I` values with stored keys.
+    type KeyedWriter<W: Write>: KeyedCodecWriter<I, Self::Key, Error = Self::Error>;
+
+    /// Create a keyed writer that encodes items with their keys into `dest`.
+    fn keyed_writer<W: Write>(&self, dest: W) -> Self::KeyedWriter<W>;
 }
 
 #[cfg(test)]
@@ -296,19 +318,22 @@ mod tests {
     impl Codec for U64Codec {
         type Item = u64;
         type Error = std::io::Error;
-        type Writer<W: Write> = U64Writer<W>;
         type Cursor<R: Read> = U64Reader<R>;
-
-        fn writer<W: Write>(&self, dest: W) -> U64Writer<W> {
-            U64Writer {
-                inner: BufWriter::new(dest),
-            }
-        }
 
         fn cursor<R: Read>(&self, source: R) -> U64Reader<R> {
             U64Reader {
                 inner: source,
                 current: None,
+            }
+        }
+    }
+
+    impl EncodeRun<u64> for U64Codec {
+        type Writer<W: Write> = U64Writer<W>;
+
+        fn writer<W: Write>(&self, dest: W) -> U64Writer<W> {
+            U64Writer {
+                inner: BufWriter::new(dest),
             }
         }
     }

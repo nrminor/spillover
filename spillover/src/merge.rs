@@ -7,18 +7,25 @@
 //! to temporary files automatically.
 //!
 //! The merge engine supports two paths:
-//! - base path: heap holds full records
+//! - record path: heap holds full records
 //! - keyed path: heap holds compact keys and falls back to
 //!   full-record comparison when keys tie
 //!
 //! Both paths share fan-in recursion and intermediate spilling.
 
-use std::{cmp::Reverse, collections::BinaryHeap, num::NonZeroUsize, path::PathBuf};
+use std::{
+    cmp::Reverse,
+    collections::BinaryHeap,
+    io::{BufReader, BufWriter},
+    num::NonZeroUsize,
+    path::PathBuf,
+};
 
 use crate::{
     SortedItemsError,
     codec::{
-        Codec, CodecCursor, CodecWriter, DeriveKey, KeyedCodec, KeyedCodecCursor, KeyedCodecWriter,
+        Codec, CodecCursor, CodecWriter, EncodeKeyedRun, EncodeRun, KeyedCodec, KeyedCodecCursor,
+        KeyedCodecWriter,
     },
     compare::{Compare, WithOrd},
     sorter::{VisitSortedItems, sealed},
@@ -73,14 +80,35 @@ pub struct MergeConfig {
     /// Maximum number of sorted runs to merge in a single pass.
     pub max_fan_in: NonZeroUsize,
 
-    /// Size of the read buffer (in bytes) for each run being merged.
+    /// Size of the outer read buffer (in bytes) for each temporary run being
+    /// merged.
+    ///
+    /// This configures core-owned transport buffering for temporary run files.
+    /// Codecs may still maintain additional format-specific buffers internally.
     pub read_buffer_bytes: usize,
 
-    /// Size of the write buffer (in bytes) when spilling.
+    /// Size of the outer write buffer (in bytes) when spilling temporary runs.
+    ///
+    /// This configures core-owned transport buffering for temporary run files.
+    /// Codecs may still maintain additional format-specific buffers internally.
     pub write_buffer_bytes: usize,
 
     /// Directory for temporary files. `None` uses the OS default.
     pub temp_dir: Option<PathBuf>,
+}
+
+type RunReader = BufReader<std::fs::File>;
+pub(crate) type RunWriterStream = BufWriter<std::fs::File>;
+
+impl MergeConfig {
+    fn run_reader<CE>(&self, run: &SortedRun) -> MergeResult<RunReader, CE> {
+        let file = run.reopen().map_err(MergeError::Io)?;
+        Ok(BufReader::with_capacity(self.read_buffer_bytes, file))
+    }
+
+    fn run_writer(&self, file: std::fs::File) -> RunWriterStream {
+        BufWriter::with_capacity(self.write_buffer_bytes, file)
+    }
 }
 
 impl Default for MergeConfig {
@@ -110,16 +138,16 @@ impl SortedRun {
     }
 }
 
-// ── MergeReader trait ────────────────────────────────────
+// ── MergeSource trait ────────────────────────────────────
 
-/// Abstracts how the merge engine reads from sorted runs.
+/// Abstracts one sorted run as a source for heap merge.
 ///
-/// For the basic path, the heap holds full records and
+/// For the record path, the heap holds full records and
 /// [`output`](Self::output) returns the record directly.
 /// For the keyed path, the heap holds compact keys and
 /// `output` fetches the full record from the reader only
 /// for the merge winner.
-pub(crate) trait MergeReader {
+pub(crate) trait MergeSource {
     /// What goes in the merge heap (full record or compact key).
     type HeapItem;
 
@@ -138,7 +166,7 @@ pub(crate) trait MergeReader {
     fn next(&mut self) -> Result<Option<Self::HeapItem>, Self::Error>;
 
     /// Convert a popped heap item into the output value.
-    /// For the basic path this returns the item itself.
+    /// For the record path this returns the item itself.
     /// For the keyed path this fetches the full record
     /// from the reader.
     ///
@@ -148,22 +176,22 @@ pub(crate) trait MergeReader {
     fn output(&mut self, heap_item: Self::HeapItem) -> Result<Self::Output, Self::Error>;
 }
 
-/// Basic merge reader: heap holds full records.
-pub(crate) struct BasicMergeReader<T, C: Codec<Item = T>> {
-    reader: C::Cursor<std::fs::File>,
+/// Merge reader whose heap entries are full records.
+pub(crate) struct MergeReader<T, C: Codec<Item = T>> {
+    reader: C::Cursor<RunReader>,
     _item: std::marker::PhantomData<fn() -> T>,
 }
 
-impl<T, C: Codec<Item = T>> BasicMergeReader<T, C> {
-    pub fn new(codec: C, file: std::fs::File) -> Self {
+impl<T, C: Codec<Item = T>> MergeReader<T, C> {
+    pub fn new(codec: C, reader: RunReader) -> Self {
         Self {
-            reader: codec.cursor(file),
+            reader: codec.cursor(reader),
             _item: std::marker::PhantomData,
         }
     }
 }
 
-impl<T, C> MergeReader for BasicMergeReader<T, C>
+impl<T, C> MergeSource for MergeReader<T, C>
 where
     C: Codec<Item = T>,
 {
@@ -187,14 +215,14 @@ where
 /// Keyed merge reader: heap holds compact keys, records
 /// fetched on demand for the winner only.
 pub(crate) struct KeyedMergeReader<T, C: KeyedCodec<Item = T>> {
-    reader: C::KeyedCursor<std::fs::File>,
+    reader: C::KeyedCursor<RunReader>,
     _item: std::marker::PhantomData<fn() -> T>,
 }
 
 impl<T, C: KeyedCodec<Item = T>> KeyedMergeReader<T, C> {
-    pub fn new(codec: C, file: std::fs::File) -> Self {
+    pub fn new(codec: C, reader: RunReader) -> Self {
         Self {
-            reader: codec.keyed_cursor(file),
+            reader: codec.keyed_cursor(reader),
             _item: std::marker::PhantomData,
         }
     }
@@ -205,13 +233,13 @@ impl<T, C: KeyedCodec<Item = T>> KeyedMergeReader<T, C> {
 
     fn with_current<'a, R>(
         &'a mut self,
-        f: impl FnOnce(<C::KeyedCursor<std::fs::File> as CodecCursor<T>>::Current<'a>) -> R,
+        f: impl FnOnce(<C::KeyedCursor<RunReader> as CodecCursor<T>>::Current<'a>) -> R,
     ) -> Result<R, C::Error> {
         self.reader.with_current(f)
     }
 }
 
-impl<T, C> MergeReader for KeyedMergeReader<T, C>
+impl<T, C> MergeSource for KeyedMergeReader<T, C>
 where
     C: KeyedCodec<Item = T>,
 {
@@ -289,19 +317,19 @@ where
 {
     pub(crate) fn write_sorted<T>(&self, items: &[T]) -> MergeResult<SortedRun, C::Error>
     where
-        C: Codec<Item = T>,
-        for<'a> C::Writer<&'a mut std::fs::File>: CodecWriter<T, Error = C::Error>,
+        C: Codec<Item = T> + EncodeRun<T>,
     {
         let named = self.create_temp_file()?;
-        let mut file = named.reopen().map_err(MergeError::Io)?;
-        let mut writer = self.codec.writer(&mut file);
+        let file = named.reopen().map_err(MergeError::Io)?;
+        let mut run_writer = self.config.run_writer(file);
+        let mut writer = self.codec.writer(&mut run_writer);
 
         for item in items {
             writer.write(item).map_err(MergeError::Codec)?;
         }
 
         CodecWriter::<T>::finish(writer).map_err(MergeError::Codec)?;
-        drop(file);
+        std::io::Write::flush(&mut run_writer).map_err(MergeError::Io)?;
 
         Ok(SortedRun {
             path: named.into_temp_path(),
@@ -315,13 +343,12 @@ where
 {
     pub(crate) fn write_sorted<T>(&self, items: &[T]) -> MergeResult<SortedRun, C::Error>
     where
-        C: KeyedCodec<Item = T> + DeriveKey<T>,
-        for<'a> C::KeyedWriter<&'a mut std::fs::File>:
-            KeyedCodecWriter<T, C::Key, Error = C::Error>,
+        C: KeyedCodec<Item = T> + EncodeKeyedRun<T>,
     {
         let named = self.create_temp_file()?;
-        let mut file = named.reopen().map_err(MergeError::Io)?;
-        let mut writer = self.codec.keyed_writer(&mut file);
+        let file = named.reopen().map_err(MergeError::Io)?;
+        let mut run_writer = self.config.run_writer(file);
+        let mut writer = self.codec.keyed_writer(&mut run_writer);
 
         for item in items {
             let key = self.codec.derive_key(item);
@@ -329,7 +356,7 @@ where
         }
 
         writer.finish().map_err(MergeError::Codec)?;
-        drop(file);
+        std::io::Write::flush(&mut run_writer).map_err(MergeError::Io)?;
 
         Ok(SortedRun {
             path: named.into_temp_path(),
@@ -378,25 +405,26 @@ impl<T: 'static, C: Codec<Item = T> + Copy + 'static, Cmp: Compare<T> + Copy + '
         items: impl IntoIterator<Item = I>,
     ) -> Result<SortedRun, MergeError<C::Error>>
     where
-        for<'a> C::Writer<&'a mut std::fs::File>: CodecWriter<I, Error = C::Error>,
+        C: EncodeRun<I>,
     {
         let named = self.create_temp_file()?;
-        let mut file = named.reopen().map_err(MergeError::Io)?;
-        let mut writer = self.codec.writer(&mut file);
+        let file = named.reopen().map_err(MergeError::Io)?;
+        let mut run_writer = self.config.run_writer(file);
+        let mut writer = self.codec.writer(&mut run_writer);
 
         for item in items {
             writer.write(&item).map_err(MergeError::Codec)?;
         }
 
         writer.finish().map_err(MergeError::Codec)?;
-        drop(file); // close the write handle
+        std::io::Write::flush(&mut run_writer).map_err(MergeError::Io)?;
 
         Ok(SortedRun {
             path: named.into_temp_path(),
         })
     }
 
-    /// Merge sorted runs using the basic path (full record
+    /// Merge sorted runs using the record path (full record
     /// deserialization for comparison).
     ///
     /// When there are more runs than [`MergeConfig::max_fan_in`],
@@ -407,7 +435,7 @@ impl<T: 'static, C: Codec<Item = T> + Copy + 'static, Cmp: Compare<T> + Copy + '
     /// Returns an error if reading or merging fails.
     pub fn merge(&self, mut runs: Vec<SortedRun>) -> MergeResult<RunMerge<T, C, Cmp>, C::Error>
     where
-        for<'a> C::Writer<&'a mut std::fs::File>: CodecWriter<T, Error = C::Error>,
+        C: EncodeRun<T>,
     {
         let codec = self.codec;
         let cmp = self.cmp;
@@ -418,7 +446,7 @@ impl<T: 'static, C: Codec<Item = T> + Copy + 'static, Cmp: Compare<T> + Copy + '
             while !runs.is_empty() {
                 let chunk_end = runs.len().min(fan_in);
                 let group: Vec<SortedRun> = runs.drain(..chunk_end).collect();
-                let readers = open_basic_readers(group, codec)?;
+                let readers = open_basic_readers(group, codec, &self.config)?;
                 let mut heap = HeapMerge::new(readers, cmp)?;
                 let run = self.spill_heap_to_disk(&mut heap, codec)?;
                 intermediate.push(run);
@@ -426,12 +454,12 @@ impl<T: 'static, C: Codec<Item = T> + Copy + 'static, Cmp: Compare<T> + Copy + '
             runs = intermediate;
         }
 
-        Ok(RunMerge::new(runs, codec, cmp))
+        Ok(RunMerge::new(runs, codec, cmp, self.config.clone()))
     }
 
     /// Drain a heap merge into a temp file via the base codec writer.
     fn spill_heap_to_disk<
-        MR: MergeReader<Output = T, Error = C::Error>,
+        MR: MergeSource<Output = T, Error = C::Error>,
         HCmp: Compare<MR::HeapItem> + Copy,
     >(
         &self,
@@ -439,16 +467,17 @@ impl<T: 'static, C: Codec<Item = T> + Copy + 'static, Cmp: Compare<T> + Copy + '
         codec: C,
     ) -> MergeResult<SortedRun, C::Error>
     where
-        for<'a> C::Writer<&'a mut std::fs::File>: CodecWriter<T, Error = C::Error>,
+        C: EncodeRun<T>,
     {
         let named = self.create_temp_file()?;
-        let mut file = named.reopen().map_err(MergeError::Io)?;
-        let mut writer = codec.writer(&mut file);
+        let file = named.reopen().map_err(MergeError::Io)?;
+        let mut run_writer = self.config.run_writer(file);
+        let mut writer = codec.writer(&mut run_writer);
         while let Some(item) = heap.next_output()? {
             writer.write(&item).map_err(MergeError::Codec)?;
         }
         CodecWriter::<T>::finish(writer).map_err(MergeError::Codec)?;
-        drop(file);
+        std::io::Write::flush(&mut run_writer).map_err(MergeError::Io)?;
         Ok(SortedRun {
             path: named.into_temp_path(),
         })
@@ -474,13 +503,12 @@ impl<T: 'static, C: KeyedCodec<Item = T> + Copy + 'static, Cmp: Compare<T> + Cop
         items: impl IntoIterator<Item = I>,
     ) -> MergeResult<SortedRun, C::Error>
     where
-        C: DeriveKey<I>,
-        for<'a> C::KeyedWriter<&'a mut std::fs::File>:
-            KeyedCodecWriter<I, C::Key, Error = C::Error>,
+        C: EncodeKeyedRun<I>,
     {
         let named = self.create_temp_file()?;
-        let mut file = named.reopen().map_err(MergeError::Io)?;
-        let mut writer = self.codec.keyed_writer(&mut file);
+        let file = named.reopen().map_err(MergeError::Io)?;
+        let mut run_writer = self.config.run_writer(file);
+        let mut writer = self.codec.keyed_writer(&mut run_writer);
 
         for item in items {
             let key = self.codec.derive_key(&item);
@@ -488,7 +516,7 @@ impl<T: 'static, C: KeyedCodec<Item = T> + Copy + 'static, Cmp: Compare<T> + Cop
         }
 
         KeyedCodecWriter::<I, C::Key>::finish(writer).map_err(MergeError::Codec)?;
-        drop(file);
+        std::io::Write::flush(&mut run_writer).map_err(MergeError::Io)?;
 
         Ok(SortedRun {
             path: named.into_temp_path(),
@@ -512,9 +540,7 @@ impl<T: 'static, C: KeyedCodec<Item = T> + Copy + 'static, Cmp: Compare<T> + Cop
         key_cmp: KeyCmp,
     ) -> MergeResult<KeyedRunMerge<T, C, KeyCmp, Cmp>, C::Error>
     where
-        C: DeriveKey<T>,
-        for<'a> C::KeyedWriter<&'a mut std::fs::File>:
-            KeyedCodecWriter<T, C::Key, Error = C::Error>,
+        C: EncodeKeyedRun<T>,
     {
         let codec = self.codec;
         let fan_in = self.config.max_fan_in.get();
@@ -525,7 +551,7 @@ impl<T: 'static, C: KeyedCodec<Item = T> + Copy + 'static, Cmp: Compare<T> + Cop
                 let chunk_end = runs.len().min(fan_in);
                 let group: Vec<SortedRun> = runs.drain(..chunk_end).collect();
 
-                let readers = open_keyed_readers(group, codec)?;
+                let readers = open_keyed_readers(group, codec, &self.config)?;
                 let mut heap = KeyedHeapMerge::new(readers, key_cmp, self.cmp)?;
                 let run = self.spill_keyed_heap_to_disk(&mut heap, codec)?;
                 intermediate.push(run);
@@ -533,7 +559,13 @@ impl<T: 'static, C: KeyedCodec<Item = T> + Copy + 'static, Cmp: Compare<T> + Cop
             runs = intermediate;
         }
 
-        Ok(KeyedRunMerge::new(runs, codec, key_cmp, self.cmp))
+        Ok(KeyedRunMerge::new(
+            runs,
+            codec,
+            key_cmp,
+            self.cmp,
+            self.config.clone(),
+        ))
     }
 
     /// Drain a keyed heap merge into a temp file, re-deriving
@@ -544,19 +576,18 @@ impl<T: 'static, C: KeyedCodec<Item = T> + Copy + 'static, Cmp: Compare<T> + Cop
         codec: C,
     ) -> MergeResult<SortedRun, C::Error>
     where
-        C: DeriveKey<T>,
-        for<'a> C::KeyedWriter<&'a mut std::fs::File>:
-            KeyedCodecWriter<T, C::Key, Error = C::Error>,
+        C: EncodeKeyedRun<T>,
     {
         let named = self.create_temp_file()?;
-        let mut file = named.reopen().map_err(MergeError::Io)?;
-        let mut writer = codec.keyed_writer(&mut file);
+        let file = named.reopen().map_err(MergeError::Io)?;
+        let mut run_writer = self.config.run_writer(file);
+        let mut writer = codec.keyed_writer(&mut run_writer);
         while let Some(item) = heap.next_output()? {
             let key = codec.derive_key(&item);
             writer.write_keyed(&item, &key).map_err(MergeError::Codec)?;
         }
         writer.finish().map_err(MergeError::Codec)?;
-        drop(file);
+        std::io::Write::flush(&mut run_writer).map_err(MergeError::Io)?;
         Ok(SortedRun {
             path: named.into_temp_path(),
         })
@@ -568,11 +599,12 @@ impl<T: 'static, C: KeyedCodec<Item = T> + Copy + 'static, Cmp: Compare<T> + Cop
 fn open_basic_readers<T, C: Codec<Item = T> + Copy>(
     runs: Vec<SortedRun>,
     codec: C,
-) -> MergeResult<Vec<BasicMergeReader<T, C>>, C::Error> {
+    config: &MergeConfig,
+) -> MergeResult<Vec<MergeReader<T, C>>, C::Error> {
     runs.into_iter()
         .map(|run| {
-            let file = run.reopen().map_err(MergeError::Io)?;
-            Ok(BasicMergeReader::new(codec, file))
+            let reader = config.run_reader(&run)?;
+            Ok(MergeReader::new(codec, reader))
         })
         .collect()
 }
@@ -580,31 +612,32 @@ fn open_basic_readers<T, C: Codec<Item = T> + Copy>(
 fn open_keyed_readers<T, C: KeyedCodec<Item = T> + Copy>(
     runs: Vec<SortedRun>,
     codec: C,
+    config: &MergeConfig,
 ) -> MergeResult<Vec<KeyedMergeReader<T, C>>, C::Error> {
     runs.into_iter()
         .map(|run| {
-            let file = run.reopen().map_err(MergeError::Io)?;
-            Ok(KeyedMergeReader::new(codec, file))
+            let reader = config.run_reader(&run)?;
+            Ok(KeyedMergeReader::new(codec, reader))
         })
         .collect()
 }
 
 // ── Heap merge engine ────────────────────────────────────
 
-struct HeapEntry<MR: MergeReader, Cmp: Compare<MR::HeapItem> + Copy> {
+struct HeapEntry<MR: MergeSource, Cmp: Compare<MR::HeapItem> + Copy> {
     item: WithOrd<MR::HeapItem, Cmp>,
     source_idx: usize,
 }
 
-impl<MR: MergeReader, Cmp: Compare<MR::HeapItem> + Copy> Eq for HeapEntry<MR, Cmp> {}
+impl<MR: MergeSource, Cmp: Compare<MR::HeapItem> + Copy> Eq for HeapEntry<MR, Cmp> {}
 
-impl<MR: MergeReader, Cmp: Compare<MR::HeapItem> + Copy> PartialEq for HeapEntry<MR, Cmp> {
+impl<MR: MergeSource, Cmp: Compare<MR::HeapItem> + Copy> PartialEq for HeapEntry<MR, Cmp> {
     fn eq(&self, other: &Self) -> bool {
         self.item == other.item && self.source_idx == other.source_idx
     }
 }
 
-impl<MR: MergeReader, Cmp: Compare<MR::HeapItem> + Copy> Ord for HeapEntry<MR, Cmp> {
+impl<MR: MergeSource, Cmp: Compare<MR::HeapItem> + Copy> Ord for HeapEntry<MR, Cmp> {
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
         self.item
             .cmp(&other.item)
@@ -612,7 +645,7 @@ impl<MR: MergeReader, Cmp: Compare<MR::HeapItem> + Copy> Ord for HeapEntry<MR, C
     }
 }
 
-impl<MR: MergeReader, Cmp: Compare<MR::HeapItem> + Copy> PartialOrd for HeapEntry<MR, Cmp> {
+impl<MR: MergeSource, Cmp: Compare<MR::HeapItem> + Copy> PartialOrd for HeapEntry<MR, Cmp> {
     fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
         Some(self.cmp(other))
     }
@@ -620,13 +653,13 @@ impl<MR: MergeReader, Cmp: Compare<MR::HeapItem> + Copy> PartialOrd for HeapEntr
 
 /// The k-way merge engine. Holds N readers and a min-heap
 /// with at most one entry per reader.
-struct HeapMerge<MR: MergeReader, Cmp: Compare<MR::HeapItem> + Copy> {
+struct HeapMerge<MR: MergeSource, Cmp: Compare<MR::HeapItem> + Copy> {
     readers: Vec<MR>,
     heap: BinaryHeap<Reverse<HeapEntry<MR, Cmp>>>,
     cmp: Cmp,
 }
 
-impl<MR: MergeReader, Cmp: Compare<MR::HeapItem> + Copy> HeapMerge<MR, Cmp> {
+impl<MR: MergeSource, Cmp: Compare<MR::HeapItem> + Copy> HeapMerge<MR, Cmp> {
     /// Seed the heap by reading one item from each reader.
     fn new(mut readers: Vec<MR>, cmp: Cmp) -> Result<Self, MergeError<MR::Error>> {
         let mut heap = BinaryHeap::with_capacity(readers.len());
@@ -817,7 +850,7 @@ where
     ) -> Result<bool, SortedItemsError<MergeError<C::Error>, FE>>
     where
         F: for<'a> FnMut(
-            <C::KeyedCursor<std::fs::File> as CodecCursor<T>>::Current<'a>,
+            <C::KeyedCursor<RunReader> as CodecCursor<T>>::Current<'a>,
         ) -> Result<(), FE>,
     {
         let Some(Reverse(first)) = self.heap.pop() else {
@@ -867,33 +900,35 @@ where
 /// consumed. Owned iteration materializes items through the codec.
 pub struct RunMerge<T, C: Codec<Item = T>, Cmp: Compare<T> + Copy> {
     runs: Option<Vec<SortedRun>>,
-    heap: Option<BasicHeap<T, C, Cmp>>,
+    heap: Option<RecordHeap<T, C, Cmp>>,
     codec: C,
     cmp: Cmp,
+    config: MergeConfig,
     failed: bool,
 }
 
-type BasicHeap<T, C, Cmp> = HeapMerge<BasicMergeReader<T, C>, Cmp>;
+type RecordHeap<T, C, Cmp> = HeapMerge<MergeReader<T, C>, Cmp>;
 
 impl<T, C, Cmp> RunMerge<T, C, Cmp>
 where
     C: Codec<Item = T> + Copy,
     Cmp: Compare<T> + Copy,
 {
-    fn new(runs: Vec<SortedRun>, codec: C, cmp: Cmp) -> Self {
+    fn new(runs: Vec<SortedRun>, codec: C, cmp: Cmp, config: MergeConfig) -> Self {
         Self {
             runs: Some(runs),
             heap: None,
             codec,
             cmp,
+            config,
             failed: false,
         }
     }
 
-    fn heap(&mut self) -> Result<&mut BasicHeap<T, C, Cmp>, MergeError<C::Error>> {
+    fn heap(&mut self) -> Result<&mut RecordHeap<T, C, Cmp>, MergeError<C::Error>> {
         if self.heap.is_none() {
             let runs = self.runs.take().expect("runs are initialized at most once");
-            let readers = open_basic_readers(runs, self.codec)?;
+            let readers = open_basic_readers(runs, self.codec, &self.config)?;
             self.heap = Some(HeapMerge::new(readers, self.cmp)?);
         }
 
@@ -983,6 +1018,7 @@ pub struct KeyedRunMerge<
     codec: C,
     key_cmp: KeyCmp,
     item_cmp: ItemCmp,
+    config: MergeConfig,
     failed: bool,
 }
 
@@ -992,13 +1028,20 @@ where
     KeyCmp: Compare<C::Key> + Copy,
     ItemCmp: Compare<T> + Copy,
 {
-    fn new(runs: Vec<SortedRun>, codec: C, key_cmp: KeyCmp, item_cmp: ItemCmp) -> Self {
+    fn new(
+        runs: Vec<SortedRun>,
+        codec: C,
+        key_cmp: KeyCmp,
+        item_cmp: ItemCmp,
+        config: MergeConfig,
+    ) -> Self {
         Self {
             runs: Some(runs),
             heap: None,
             codec,
             key_cmp,
             item_cmp,
+            config,
             failed: false,
         }
     }
@@ -1009,7 +1052,7 @@ where
                 .runs
                 .take()
                 .expect("keyed runs are initialized at most once");
-            let readers = open_keyed_readers(runs, self.codec)?;
+            let readers = open_keyed_readers(runs, self.codec, &self.config)?;
             self.heap = Some(KeyedHeapMerge::new(readers, self.key_cmp, self.item_cmp)?);
         }
 
@@ -1070,7 +1113,7 @@ where
     ItemCmp: Compare<T> + Copy + 'static,
 {
     type Item<'a>
-        = <C::KeyedCursor<std::fs::File> as CodecCursor<T>>::Current<'a>
+        = <C::KeyedCursor<RunReader> as CodecCursor<T>>::Current<'a>
     where
         Self: 'a;
 
@@ -1098,7 +1141,7 @@ mod tests {
     use std::io::{BufWriter, Read, Write};
 
     use super::*;
-    use crate::compare::Natural;
+    use crate::{codec::DeriveKey, compare::Natural};
 
     #[derive(Clone, Copy)]
     struct U64Codec;
@@ -1181,14 +1224,7 @@ mod tests {
     impl Codec for U64Codec {
         type Item = u64;
         type Error = std::io::Error;
-        type Writer<W: Write> = U64Writer<W>;
         type Cursor<R: Read> = U64Reader<R>;
-
-        fn writer<W: Write>(&self, dest: W) -> U64Writer<W> {
-            U64Writer {
-                inner: BufWriter::new(dest),
-            }
-        }
 
         fn cursor<R: Read>(&self, source: R) -> U64Reader<R> {
             U64Reader {
@@ -1198,19 +1234,23 @@ mod tests {
         }
     }
 
-    struct U64KeyedWriter<W: Write> {
-        inner: BufWriter<W>,
+    impl EncodeRun<u64> for U64Codec {
+        type Writer<W: Write> = U64Writer<W>;
+
+        fn writer<W: Write>(&self, dest: W) -> U64Writer<W> {
+            U64Writer {
+                inner: BufWriter::new(dest),
+            }
+        }
     }
 
-    impl<W: Write> CodecWriter<u64> for U64KeyedWriter<W> {
-        type Error = std::io::Error;
+    impl EncodeRun<U64View> for U64Codec {
+        type Writer<W: Write> = U64Writer<W>;
 
-        fn write(&mut self, item: &u64) -> Result<(), Self::Error> {
-            self.inner.write_all(&item.to_le_bytes())
-        }
-
-        fn finish(mut self) -> Result<(), Self::Error> {
-            self.inner.flush()
+        fn writer<W: Write>(&self, dest: W) -> U64Writer<W> {
+            U64Writer {
+                inner: BufWriter::new(dest),
+            }
         }
     }
 
@@ -1258,14 +1298,7 @@ mod tests {
     impl Codec for U64KeyedCodec {
         type Item = u64;
         type Error = std::io::Error;
-        type Writer<W: Write> = U64KeyedWriter<W>;
         type Cursor<R: Read> = U64KeyedReader<R>;
-
-        fn writer<W: Write>(&self, dest: W) -> U64KeyedWriter<W> {
-            U64KeyedWriter {
-                inner: BufWriter::new(dest),
-            }
-        }
 
         fn cursor<R: Read>(&self, source: R) -> U64KeyedReader<R> {
             U64KeyedReader {
@@ -1359,20 +1392,33 @@ mod tests {
 
     impl KeyedCodec for U64KeyedCodec {
         type Key = u8;
-        type KeyedWriter<W: Write> = U64OnlyKeyedWriter<W>;
         type KeyedCursor<R: Read> = U64OnlyKeyedReader<R>;
-
-        fn keyed_writer<W: Write>(&self, dest: W) -> Self::KeyedWriter<W> {
-            U64OnlyKeyedWriter {
-                inner: BufWriter::new(dest),
-            }
-        }
 
         fn keyed_cursor<R: Read>(&self, source: R) -> Self::KeyedCursor<R> {
             U64OnlyKeyedReader {
                 inner: source,
                 current_key: None,
                 current: None,
+            }
+        }
+    }
+
+    impl EncodeKeyedRun<u64> for U64KeyedCodec {
+        type KeyedWriter<W: Write> = U64OnlyKeyedWriter<W>;
+
+        fn keyed_writer<W: Write>(&self, dest: W) -> Self::KeyedWriter<W> {
+            U64OnlyKeyedWriter {
+                inner: BufWriter::new(dest),
+            }
+        }
+    }
+
+    impl EncodeKeyedRun<U64View> for U64KeyedCodec {
+        type KeyedWriter<W: Write> = U64OnlyKeyedWriter<W>;
+
+        fn keyed_writer<W: Write>(&self, dest: W) -> Self::KeyedWriter<W> {
+            U64OnlyKeyedWriter {
+                inner: BufWriter::new(dest),
             }
         }
     }

@@ -2,7 +2,7 @@ use std::cmp::Ordering;
 use std::io::{BufRead, BufReader, BufWriter, Write};
 
 use spillover::{
-    codec::{Codec, CodecCursor, CodecWriter},
+    codec::{Codec, CodecCursor, CodecWriter, EncodeRun},
     compare::{Compare, Reverse},
     key::SortKey,
     sorter::Builder,
@@ -71,20 +71,23 @@ impl<R: std::io::Read> CodecCursor<String> for LineReader<R> {
 impl Codec for LineCodec {
     type Item = String;
     type Error = std::io::Error;
-    type Writer<W: Write> = LineWriter<W>;
     type Cursor<R: std::io::Read> = LineReader<R>;
-
-    fn writer<W: Write>(&self, dest: W) -> Self::Writer<W> {
-        LineWriter {
-            inner: BufWriter::new(dest),
-        }
-    }
 
     fn cursor<R: std::io::Read>(&self, source: R) -> Self::Cursor<R> {
         LineReader {
             inner: BufReader::new(source),
             line: String::new(),
             current: None,
+        }
+    }
+}
+
+impl EncodeRun<String> for LineCodec {
+    type Writer<W: Write> = LineWriter<W>;
+
+    fn writer<W: Write>(&self, dest: W) -> Self::Writer<W> {
+        LineWriter {
+            inner: BufWriter::new(dest),
         }
     }
 }

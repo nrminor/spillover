@@ -20,7 +20,7 @@ use dryice::{
 use spillover::{
     SortedItemsError,
     chunk::{ChunkSorter, Sequential},
-    codec::{Codec, CodecWriter, DeriveKey, KeyedCodec, KeyedCodecWriter},
+    codec::{Codec, EncodeKeyedRun, EncodeRun, KeyedCodec},
     compare::{Compare, Natural},
     dedup::Identity,
     key::{KeyCompare, SortKey},
@@ -895,8 +895,7 @@ impl<SK, Cod, KeyCmp, RecCmp, CS>
 where
     SK: SortKey<SeqRecord> + Copy + Send + Sync + 'static,
     Cod: Codec<Item = SeqRecord> + Copy + 'static,
-    for<'r, 'v> Cod::Writer<&'r mut std::fs::File>:
-        CodecWriter<SeqRecordView<'v>, Error = Cod::Error>,
+    for<'v> Cod: EncodeRun<SeqRecordView<'v>>,
     KeyCmp: for<'r> Compare<<SK as SortKey<SeqRecord>>::Key<'r>> + Copy + Send + Sync + 'static,
     for<'v> RecCmp: Compare<SeqRecordView<'v>>,
     RecCmp: Copy + Send + Sync + 'static,
@@ -929,12 +928,8 @@ impl<SK, Cod, KeyCmp, RecCmp, CS>
     ArenaBackend<'_, SK, Cod, KeyCmp, RecCmp, CS, spillover::sorter::Keyed>
 where
     SK: SortKey<SeqRecord> + Copy + Send + Sync + 'static,
-    Cod: KeyedCodec<Item = SeqRecord> + DeriveKey<SeqRecord> + Copy + 'static,
-    for<'v> Cod: DeriveKey<SeqRecordView<'v>>,
-    for<'r> Cod::KeyedWriter<&'r mut std::fs::File>:
-        KeyedCodecWriter<SeqRecord, Cod::Key, Error = Cod::Error>,
-    for<'r, 'v> Cod::KeyedWriter<&'r mut std::fs::File>:
-        KeyedCodecWriter<SeqRecordView<'v>, Cod::Key, Error = Cod::Error>,
+    Cod: KeyedCodec<Item = SeqRecord> + EncodeKeyedRun<SeqRecord> + Copy + 'static,
+    for<'v> Cod: EncodeKeyedRun<SeqRecordView<'v>>,
     KeyCmp: for<'r> Compare<<SK as SortKey<SeqRecord>>::Key<'r>>
         + Compare<Cod::Key>
         + Copy
@@ -1080,7 +1075,7 @@ impl Default for Builder {
     }
 }
 
-// These bounds intentionally mirror the core sorter's basic and keyed
+// These bounds intentionally mirror the core sorter's record and keyed
 // push/finish implementations. The bio wrapper owns the public lifecycle
 // vocabulary; core owns the sorting mechanics.
 
@@ -1096,7 +1091,7 @@ impl<SK, Cod, Cmp, CS>
 where
     SK: SortKey<SeqRecord> + Copy + Send + Sync + 'static,
     Cod: Codec<Item = SeqRecord> + Copy + 'static,
-    for<'a> Cod::Writer<&'a mut std::fs::File>: CodecWriter<SeqRecord, Error = Cod::Error>,
+    Cod: EncodeRun<SeqRecord>,
     Cmp: for<'a> Compare<SK::Key<'a>> + Copy + Send + Sync + 'static,
     CS: ChunkSorter<SeqRecord>,
 {
@@ -1142,9 +1137,8 @@ impl<SK, Cod, Cmp, RecCmp, CS>
 where
     SK: SortKey<SeqRecord> + Copy + Send + Sync + 'static,
     Cod: Codec<Item = SeqRecord> + Copy + 'static,
-    for<'r> Cod::Writer<&'r mut std::fs::File>: CodecWriter<SeqRecord, Error = Cod::Error>,
-    for<'r, 'v> Cod::Writer<&'r mut std::fs::File>:
-        CodecWriter<SeqRecordView<'v>, Error = Cod::Error>,
+    Cod: EncodeRun<SeqRecord>,
+    for<'v> Cod: EncodeRun<SeqRecordView<'v>>,
     Cmp: for<'r> Compare<<SK as SortKey<SeqRecord>>::Key<'r>> + Copy + Send + Sync + 'static,
     for<'v> RecCmp: Compare<SeqRecordView<'v>>,
     RecCmp: Copy + Send + Sync + 'static,
@@ -1213,12 +1207,8 @@ impl<SK, Cod, Cmp, RecCmp, CS>
     >
 where
     SK: SortKey<SeqRecord> + Copy + Send + Sync + 'static,
-    Cod: KeyedCodec<Item = SeqRecord> + DeriveKey<SeqRecord> + Copy + 'static,
-    for<'v> Cod: DeriveKey<SeqRecordView<'v>>,
-    for<'r> Cod::KeyedWriter<&'r mut std::fs::File>:
-        KeyedCodecWriter<SeqRecord, Cod::Key, Error = Cod::Error>,
-    for<'r, 'v> Cod::KeyedWriter<&'r mut std::fs::File>:
-        KeyedCodecWriter<SeqRecordView<'v>, Cod::Key, Error = Cod::Error>,
+    Cod: KeyedCodec<Item = SeqRecord> + EncodeKeyedRun<SeqRecord> + Copy + 'static,
+    for<'v> Cod: EncodeKeyedRun<SeqRecordView<'v>>,
     Cmp: for<'r> Compare<<SK as SortKey<SeqRecord>>::Key<'r>>
         + Compare<Cod::Key>
         + Copy
@@ -1295,9 +1285,7 @@ impl<SK, Cod, Cmp, CS>
     >
 where
     SK: SortKey<SeqRecord> + Copy + Send + Sync + 'static,
-    Cod: KeyedCodec<Item = SeqRecord> + DeriveKey<SeqRecord> + Copy + 'static,
-    for<'a> Cod::KeyedWriter<&'a mut std::fs::File>:
-        KeyedCodecWriter<SeqRecord, Cod::Key, Error = Cod::Error>,
+    Cod: KeyedCodec<Item = SeqRecord> + EncodeKeyedRun<SeqRecord> + Copy + 'static,
     Cmp: for<'a> Compare<SK::Key<'a>> + Compare<Cod::Key> + Copy + Send + Sync + 'static,
     CS: ChunkSorter<SeqRecord>,
 {
@@ -1732,7 +1720,7 @@ where
     F: sealed::ResolveFlush,
     CS: ChunkSorter<SeqRecord> + sealed::CompatibleChunkSorter<O>,
 {
-    /// Build the sorter (basic merge path, no record keys).
+    /// Build the sorter (record merge path, no stored record keys).
     ///
     /// If `.codec()` was not called, defaults to raw (uncompressed)
     /// dryice encoding. If `.measured_budget()` / `.max_buffer_items()`
@@ -1790,7 +1778,7 @@ where
     for<'v> CS: ChunkSorter<SeqRecordView<'v>>,
     for<'v> O::Comparator: Compare<SeqRecordView<'v>>,
 {
-    /// Build an arena-backed sorter (basic merge path, no record keys).
+    /// Build an arena-backed sorter (record merge path, no stored record keys).
     #[allow(clippy::type_complexity)]
     #[must_use]
     pub fn build(

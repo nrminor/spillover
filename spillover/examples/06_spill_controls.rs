@@ -4,7 +4,7 @@ use std::{
 };
 
 use spillover::{
-    codec::{Codec, CodecCursor, CodecWriter},
+    codec::{Codec, CodecCursor, CodecWriter, EncodeRun},
     key::Owned,
     merge::MergeConfig,
     sorter::Builder,
@@ -73,19 +73,22 @@ impl<R: Read> CodecCursor<u64> for U64Reader<R> {
 impl Codec for U64Codec {
     type Item = u64;
     type Error = std::io::Error;
-    type Writer<W: Write> = U64Writer<W>;
     type Cursor<R: Read> = U64Reader<R>;
-
-    fn writer<W: Write>(&self, dest: W) -> Self::Writer<W> {
-        U64Writer {
-            inner: BufWriter::new(dest),
-        }
-    }
 
     fn cursor<R: Read>(&self, source: R) -> Self::Cursor<R> {
         U64Reader {
             inner: BufReader::new(source),
             current: None,
+        }
+    }
+}
+
+impl EncodeRun<u64> for U64Codec {
+    type Writer<W: Write> = U64Writer<W>;
+
+    fn writer<W: Write>(&self, dest: W) -> Self::Writer<W> {
+        U64Writer {
+            inner: BufWriter::new(dest),
         }
     }
 }

@@ -19,7 +19,7 @@ use get_size2::GetSize;
 use crate::{
     SortedItemsError,
     chunk::{ChunkSorter, Sequential},
-    codec::{Codec, CodecWriter, DeriveKey, KeyedCodec, KeyedCodecWriter},
+    codec::{Codec, EncodeKeyedRun, EncodeRun, KeyedCodec},
     compare::{Compare, Natural},
     dedup::{Dedup, Identity},
     key::{KeyCompare, SortKey},
@@ -57,7 +57,7 @@ pub struct HasSortKey<SK>(SK);
 
 /// Marker: no codec provided yet.
 pub struct NeedsCodec;
-/// Marker: codec has been provided (base path).
+/// Marker: codec has been provided for the ordinary record merge path.
 pub struct HasCodec<Cod>(Cod);
 /// Marker: keyed codec has been provided (keyed merge path).
 pub struct HasKeyedCodec<Cod>(Cod);
@@ -285,7 +285,7 @@ impl<SK, Cod, Cmp, D, CS> Builder<SK, Cod, NeedsFlushStrategy, Cmp, D, CS> {
     }
 }
 
-// build() for basic path.
+// build() for ordinary record merge path.
 impl<T, SK, Cod, Cmp, D, CS> Builder<HasSortKey<SK>, HasCodec<Cod>, HasFlushStrategy<T>, Cmp, D, CS>
 where
     SK: SortKey<T> + Copy,
@@ -492,14 +492,13 @@ where
     }
 }
 
-// ── Basic path: push + flush + finish ────────────────────
+// ── Ordinary record path: push + flush + finish ───────────
 
 impl<T, SK, Cod, Cmp, D, CS> Sorter<T, SK, Cod, Cmp, D, CS, Basic>
 where
     T: 'static,
     SK: SortKey<T> + Copy + Send + Sync + 'static,
-    Cod: Codec<Item = T> + Copy + 'static,
-    for<'a> Cod::Writer<&'a mut std::fs::File>: CodecWriter<T, Error = Cod::Error>,
+    Cod: Codec<Item = T> + EncodeRun<T> + Copy + 'static,
     Cmp: for<'a> Compare<SK::Key<'a>> + Copy + Send + Sync + 'static,
     CS: ChunkSorter<T>,
 {
@@ -579,9 +578,7 @@ impl<T, SK, Cod, Cmp, D, CS> Sorter<T, SK, Cod, Cmp, D, CS, Keyed>
 where
     T: 'static,
     SK: SortKey<T> + Copy + Send + Sync + 'static,
-    Cod: KeyedCodec<Item = T> + DeriveKey<T> + Copy + 'static,
-    for<'a> Cod::KeyedWriter<&'a mut std::fs::File>:
-        KeyedCodecWriter<T, Cod::Key, Error = Cod::Error>,
+    Cod: KeyedCodec<Item = T> + EncodeKeyedRun<T> + Copy + 'static,
     Cmp: for<'a> Compare<SK::Key<'a>> + Compare<Cod::Key> + Copy + Send + Sync + 'static,
     CS: ChunkSorter<T>,
 {
@@ -662,7 +659,7 @@ mod tests {
 
     use super::*;
     use crate::{
-        codec::{CodecCursor, CodecWriter},
+        codec::{CodecCursor, CodecWriter, EncodeRun},
         compare::Reverse,
         dedup::AdjacentDedup,
         key::Owned,
@@ -731,19 +728,22 @@ mod tests {
     impl Codec for U64Codec {
         type Item = u64;
         type Error = std::io::Error;
-        type Writer<W: Write> = U64Writer<W>;
         type Cursor<R: Read> = U64Reader<R>;
-
-        fn writer<W: Write>(&self, dest: W) -> U64Writer<W> {
-            U64Writer {
-                inner: BufWriter::new(dest),
-            }
-        }
 
         fn cursor<R: Read>(&self, source: R) -> U64Reader<R> {
             U64Reader {
                 inner: source,
                 current: None,
+            }
+        }
+    }
+
+    impl EncodeRun<u64> for U64Codec {
+        type Writer<W: Write> = U64Writer<W>;
+
+        fn writer<W: Write>(&self, dest: W) -> U64Writer<W> {
+            U64Writer {
+                inner: BufWriter::new(dest),
             }
         }
     }

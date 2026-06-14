@@ -24,7 +24,8 @@ use dryice::{
     RawQualityCodec, RecordKey, SeqRecordLike, SequenceCodec,
 };
 use spillover::codec::{
-    Codec, CodecCursor, CodecWriter, DeriveKey, KeyedCodec, KeyedCodecCursor, KeyedCodecWriter,
+    Codec, CodecCursor, CodecWriter, DeriveKey, EncodeKeyedRun, EncodeRun, KeyedCodec,
+    KeyedCodecCursor, KeyedCodecWriter,
 };
 
 use crate::{
@@ -290,32 +291,6 @@ impl<
     N: NameCodec,
     K: RecordKey,
     R: SeqRecordParts + ?Sized,
-> CodecWriter<R> for KeyedWriterAdapter<W, S, Q, N, K>
-{
-    type Error = DryIceError;
-
-    fn write(&mut self, _item: &R) -> Result<(), DryIceError> {
-        // KeyedCodec extends Codec, so this impl must exist. But
-        // a keyed writer can't write records without keys — callers
-        // should use .keyed_codec() on the builder, which routes
-        // through KeyedCodecWriter::write_keyed instead.
-        Err(DryIceError::InvalidWriterConfiguration(
-            "keyed codec used without providing a key — use .keyed_codec() on the builder",
-        ))
-    }
-
-    fn finish(self) -> Result<(), DryIceError> {
-        Self::finish(self)
-    }
-}
-
-impl<
-    W: Write,
-    S: SequenceCodec,
-    Q: QualityCodec,
-    N: NameCodec,
-    K: RecordKey,
-    R: SeqRecordParts + ?Sized,
 > KeyedCodecWriter<R, K> for KeyedWriterAdapter<W, S, Q, N, K>
 {
     type Error = DryIceError;
@@ -423,8 +398,20 @@ impl<R: Read, S: SequenceCodec, Q: QualityCodec, N: NameCodec, K: RecordKey + Cl
 impl<S: SequenceCodec, Q: QualityCodec, N: NameCodec> Codec for DryIceCodec<S, Q, N> {
     type Item = SeqRecord;
     type Error = DryIceError;
-    type Writer<W: Write> = UnkeyedWriterAdapter<W, S, Q, N>;
     type Cursor<R: Read> = UnkeyedReaderAdapter<R, S, Q, N>;
+
+    fn cursor<R: Read>(&self, source: R) -> Self::Cursor<R> {
+        UnkeyedReaderAdapter(
+            DryIceReader::with_codecs::<S, Q, N>(source)
+                .expect("dryice file header should be valid"),
+        )
+    }
+}
+
+impl<R: SeqRecordParts + ?Sized, S: SequenceCodec, Q: QualityCodec, N: NameCodec> EncodeRun<R>
+    for DryIceCodec<S, Q, N>
+{
+    type Writer<W: Write> = UnkeyedWriterAdapter<W, S, Q, N>;
 
     fn writer<W: Write>(&self, dest: W) -> Self::Writer<W> {
         UnkeyedWriterAdapter(
@@ -437,13 +424,6 @@ impl<S: SequenceCodec, Q: QualityCodec, N: NameCodec> Codec for DryIceCodec<S, Q
                 .build(),
         )
     }
-
-    fn cursor<R: Read>(&self, source: R) -> Self::Cursor<R> {
-        UnkeyedReaderAdapter(
-            DryIceReader::with_codecs::<S, Q, N>(source)
-                .expect("dryice file header should be valid"),
-        )
-    }
 }
 
 impl<Kr: RecordKeyer, S: SequenceCodec, Q: QualityCodec, N: NameCodec> Codec
@@ -451,21 +431,7 @@ impl<Kr: RecordKeyer, S: SequenceCodec, Q: QualityCodec, N: NameCodec> Codec
 {
     type Item = SeqRecord;
     type Error = DryIceError;
-    type Writer<W: Write> = KeyedWriterAdapter<W, S, Q, N, Kr::RecordKey>;
     type Cursor<R: Read> = KeyedReaderAdapter<R, S, Q, N, Kr::RecordKey>;
-
-    fn writer<W: Write>(&self, dest: W) -> Self::Writer<W> {
-        KeyedWriterAdapter(
-            DryIceWriter::builder()
-                .inner(dest)
-                .sequence_codec::<S>()
-                .quality_codec::<Q>()
-                .name_codec::<N>()
-                .record_key::<Kr::RecordKey>()
-                .target_block_records(self.target_block_records)
-                .build(),
-        )
-    }
 
     fn cursor<R: Read>(&self, source: R) -> Self::Cursor<R> {
         KeyedReaderAdapter(
@@ -479,8 +445,20 @@ impl<Kr: RecordKeyer, S: SequenceCodec, Q: QualityCodec, N: NameCodec> KeyedCode
     for KeyedDryIceCodec<Kr, S, Q, N>
 {
     type Key = Kr::RecordKey;
-    type KeyedWriter<W: Write> = KeyedWriterAdapter<W, S, Q, N, Kr::RecordKey>;
     type KeyedCursor<R: Read> = KeyedReaderAdapter<R, S, Q, N, Kr::RecordKey>;
+
+    fn keyed_cursor<R: Read>(&self, source: R) -> Self::KeyedCursor<R> {
+        KeyedReaderAdapter(
+            DryIceReader::open::<S, Q, N, Kr::RecordKey>(source)
+                .expect("dryice file header should be valid"),
+        )
+    }
+}
+
+impl<R: SeqRecordParts + ?Sized, Kr: RecordKeyer, S: SequenceCodec, Q: QualityCodec, N: NameCodec>
+    EncodeKeyedRun<R> for KeyedDryIceCodec<Kr, S, Q, N>
+{
+    type KeyedWriter<W: Write> = KeyedWriterAdapter<W, S, Q, N, Kr::RecordKey>;
 
     fn keyed_writer<W: Write>(&self, dest: W) -> Self::KeyedWriter<W> {
         KeyedWriterAdapter(
@@ -492,13 +470,6 @@ impl<Kr: RecordKeyer, S: SequenceCodec, Q: QualityCodec, N: NameCodec> KeyedCode
                 .record_key::<Kr::RecordKey>()
                 .target_block_records(self.target_block_records)
                 .build(),
-        )
-    }
-
-    fn keyed_cursor<R: Read>(&self, source: R) -> Self::KeyedCursor<R> {
-        KeyedReaderAdapter(
-            DryIceReader::open::<S, Q, N, Kr::RecordKey>(source)
-                .expect("dryice file header should be valid"),
         )
     }
 }
@@ -534,7 +505,7 @@ mod tests {
         let records = test_records();
 
         let mut buf = Vec::new();
-        let mut writer = codec.writer(&mut buf);
+        let mut writer = <DryIceCodec as EncodeRun<SeqRecord>>::writer(&codec, &mut buf);
         for rec in &records {
             writer.write(rec).expect("write should succeed");
         }
@@ -564,7 +535,7 @@ mod tests {
         let records = test_records();
 
         let mut buf = Vec::new();
-        let mut writer = codec.writer(&mut buf);
+        let mut writer = <DryIceCodec as EncodeRun<SeqRecordView<'_>>>::writer(&codec, &mut buf);
         for rec in &records {
             writer.write(&rec.as_view()).expect("write should succeed");
         }
@@ -591,7 +562,9 @@ mod tests {
             .collect();
 
         let mut buf = Vec::new();
-        let mut writer = codec.keyed_writer(&mut buf);
+        let mut writer = <KeyedDryIceCodec<crate::sort::SequenceOrder<2>> as EncodeKeyedRun<
+            SeqRecord,
+        >>::keyed_writer(&codec, &mut buf);
         for (rec, key) in records.iter().zip(keys.iter()) {
             writer
                 .write_keyed(rec, key)
@@ -623,7 +596,9 @@ mod tests {
             .collect();
 
         let mut buf = Vec::new();
-        let mut writer = codec.keyed_writer(&mut buf);
+        let mut writer = <KeyedDryIceCodec<crate::sort::SequenceOrder<2>> as EncodeKeyedRun<
+            SeqRecordView<'_>,
+        >>::keyed_writer(&codec, &mut buf);
         for (rec, key) in records.iter().zip(keys.iter()) {
             writer
                 .write_keyed(&rec.as_view(), key)
@@ -659,7 +634,7 @@ mod tests {
         let codec = DryIceCodec::new();
 
         let mut buf = Vec::new();
-        let writer = codec.writer(&mut buf);
+        let writer = <DryIceCodec as EncodeRun<SeqRecord>>::writer(&codec, &mut buf);
         writer.finish().expect("finish empty should succeed");
 
         let mut reader = codec.cursor(std::io::Cursor::new(&buf));
@@ -716,7 +691,10 @@ mod tests {
             .collect();
 
         let mut buf = Vec::new();
-        let mut writer = codec.keyed_writer(&mut buf);
+        let mut writer =
+            <KeyedDryIceCodec<crate::sort::SequenceOrder<38>, _, _, _> as EncodeKeyedRun<
+                SeqRecord,
+            >>::keyed_writer(&codec, &mut buf);
         for (rec, key) in records.iter().zip(keys.iter()) {
             writer
                 .write_keyed(rec, key)
