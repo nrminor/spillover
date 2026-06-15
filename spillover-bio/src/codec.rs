@@ -3,7 +3,7 @@
 //! Two codec types are provided, corresponding to spillover's
 //! two merge paths:
 //!
-//! - [`DryIceCodec`] implements [`Codec`] for the base merge path
+//! - [`DryIceCodec`] implements [`Codec`] for the unkeyed merge path
 //!   (no record keys, full record deserialization during merge).
 //! - [`KeyedDryIceCodec`] implements both [`Codec`] and
 //!   [`KeyedCodec`] for the keyed merge path (precomputed keys
@@ -43,7 +43,7 @@ type KeyedCodecMarker<S, Q, N, Kr> = PhantomData<fn() -> (S, Q, N, Kr)>;
 
 // ── Base path codec ──────────────────────────────────────────
 
-/// Dryice codec for the base merge path (no record keys).
+/// Dryice codec for the unkeyed merge path (no record keys).
 ///
 /// Configure with builder-style methods to select dryice's
 /// sequence, quality, and name codecs. Defaults to raw
@@ -500,7 +500,7 @@ mod tests {
     }
 
     #[test]
-    fn base_path_round_trips_records() {
+    fn unkeyed_path_round_trips_records() {
         let codec = DryIceCodec::new();
         let records = test_records();
 
@@ -530,7 +530,7 @@ mod tests {
     }
 
     #[test]
-    fn base_path_writes_record_views() {
+    fn unkeyed_path_writes_record_views() {
         let codec = DryIceCodec::new();
         let records = test_records();
 

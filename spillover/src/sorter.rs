@@ -57,7 +57,7 @@ pub struct HasSortKey<SK>(SK);
 
 /// Marker: no codec provided yet.
 pub struct NeedsCodec;
-/// Marker: codec has been provided for the ordinary record merge path.
+/// Marker: codec has been provided for the unkeyed merge path.
 pub struct HasCodec<Cod>(Cod);
 /// Marker: keyed codec has been provided (keyed merge path).
 pub struct HasKeyedCodec<Cod>(Cod);
@@ -67,8 +67,8 @@ pub struct NeedsFlushStrategy;
 /// Marker: flush strategy has been provided.
 pub struct HasFlushStrategy<T>(FlushStrategy<T>);
 
-/// Marker: base merge path — codec implements [`Codec`] only.
-pub struct Basic;
+/// Marker: unkeyed merge path — temporary runs store records without record keys.
+pub struct Unkeyed;
 /// Marker: keyed merge path — codec implements [`KeyedCodec`],
 /// enabling key-first comparisons during merge with fallback
 /// full-record comparison when keys tie.
@@ -122,7 +122,7 @@ impl<SK, Cod, Flush, Cmp, D, CS> Builder<SK, Cod, Flush, Cmp, D, CS> {
         }
     }
 
-    /// Set the codec (base merge path).
+    /// Set the codec (unkeyed merge path).
     #[must_use]
     pub fn codec<Cod2>(self, codec: Cod2) -> Builder<SK, HasCodec<Cod2>, Flush, Cmp, D, CS> {
         Builder {
@@ -285,7 +285,7 @@ impl<SK, Cod, Cmp, D, CS> Builder<SK, Cod, NeedsFlushStrategy, Cmp, D, CS> {
     }
 }
 
-// build() for ordinary record merge path.
+// build() for unkeyed merge path.
 impl<T, SK, Cod, Cmp, D, CS> Builder<HasSortKey<SK>, HasCodec<Cod>, HasFlushStrategy<T>, Cmp, D, CS>
 where
     SK: SortKey<T> + Copy,
@@ -293,9 +293,9 @@ where
     Cmp: for<'a> Compare<SK::Key<'a>> + Copy,
     CS: ChunkSorter<T>,
 {
-    /// Build the [`Sorter`] (base merge path).
+    /// Build the [`Sorter`] (unkeyed merge path).
     #[must_use]
-    pub fn build(self) -> Sorter<T, SK, Cod, Cmp, D, CS, Basic> {
+    pub fn build(self) -> Sorter<T, SK, Cod, Cmp, D, CS, Unkeyed> {
         Sorter {
             sort_key: self.sort_key.0,
             codec: self.codec.0,
@@ -361,8 +361,8 @@ where
 /// - `D`: [`Dedup`] — post-merge deduplication
 /// - `CS`: [`ChunkSorter`] — in-memory sort algorithm and
 ///   threading model
-/// - `M`: merge strategy marker ([`Basic`] or [`Keyed`])
-pub struct Sorter<T, SK, Cod, Cmp, D, CS, M = Basic> {
+/// - `M`: merge strategy marker ([`Unkeyed`] or [`Keyed`])
+pub struct Sorter<T, SK, Cod, Cmp, D, CS, M = Unkeyed> {
     sort_key: SK,
     codec: Cod,
     compare: Cmp,
@@ -494,7 +494,7 @@ where
 
 // ── Ordinary record path: push + flush + finish ───────────
 
-impl<T, SK, Cod, Cmp, D, CS> Sorter<T, SK, Cod, Cmp, D, CS, Basic>
+impl<T, SK, Cod, Cmp, D, CS> Sorter<T, SK, Cod, Cmp, D, CS, Unkeyed>
 where
     T: 'static,
     SK: SortKey<T> + Copy + Send + Sync + 'static,
@@ -513,20 +513,20 @@ where
                 self.buffer_bytes += item_size(&item);
                 self.buffer.push(item);
                 if self.buffer_bytes >= *budget {
-                    self.flush_basic()?;
+                    self.flush()?;
                 }
             }
             FlushStrategy::Items { max_items } => {
                 self.buffer.push(item);
                 if self.buffer.len() >= *max_items {
-                    self.flush_basic()?;
+                    self.flush()?;
                 }
             }
         }
         Ok(())
     }
 
-    fn flush_basic(&mut self) -> Result<(), MergeError<Cod::Error>> {
+    fn flush(&mut self) -> Result<(), MergeError<Cod::Error>> {
         let item_cmp = KeyCompare::new(self.sort_key, self.compare);
         self.chunk_sort.sort(&mut self.buffer, move |a: &T, b: &T| {
             Compare::compare(&item_cmp, a, b)
@@ -559,7 +559,7 @@ where
         D: Dedup<RunMerge<T, Cod, KeyCompare<SK, Cmp>>>,
     {
         if !self.buffer.is_empty() {
-            self.flush_basic()?;
+            self.flush()?;
         }
 
         let item_cmp = KeyCompare::new(self.sort_key, self.compare);
@@ -593,20 +593,20 @@ where
                 self.buffer_bytes += item_size(&item);
                 self.buffer.push(item);
                 if self.buffer_bytes >= *budget {
-                    self.flush_keyed()?;
+                    self.flush()?;
                 }
             }
             FlushStrategy::Items { max_items } => {
                 self.buffer.push(item);
                 if self.buffer.len() >= *max_items {
-                    self.flush_keyed()?;
+                    self.flush()?;
                 }
             }
         }
         Ok(())
     }
 
-    fn flush_keyed(&mut self) -> Result<(), MergeError<Cod::Error>> {
+    fn flush(&mut self) -> Result<(), MergeError<Cod::Error>> {
         let item_cmp = KeyCompare::new(self.sort_key, self.compare);
         self.chunk_sort.sort(&mut self.buffer, move |a: &T, b: &T| {
             Compare::compare(&item_cmp, a, b)
@@ -639,7 +639,7 @@ where
         D: Dedup<KeyedRunMerge<T, Cod, Cmp, KeyCompare<SK, Cmp>>>,
     {
         if !self.buffer.is_empty() {
-            self.flush_keyed()?;
+            self.flush()?;
         }
 
         let item_cmp = KeyCompare::new(self.sort_key, self.compare);

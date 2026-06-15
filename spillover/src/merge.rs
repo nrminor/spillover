@@ -446,7 +446,7 @@ impl<T: 'static, C: Codec<Item = T> + Copy + 'static, Cmp: Compare<T> + Copy + '
             while !runs.is_empty() {
                 let chunk_end = runs.len().min(fan_in);
                 let group: Vec<SortedRun> = runs.drain(..chunk_end).collect();
-                let readers = open_basic_readers(group, codec, &self.config)?;
+                let readers = open_unkeyed_readers(group, codec, &self.config)?;
                 let mut heap = HeapMerge::new(readers, cmp)?;
                 let run = self.spill_heap_to_disk(&mut heap, codec)?;
                 intermediate.push(run);
@@ -457,7 +457,7 @@ impl<T: 'static, C: Codec<Item = T> + Copy + 'static, Cmp: Compare<T> + Copy + '
         Ok(RunMerge::new(runs, codec, cmp, self.config.clone()))
     }
 
-    /// Drain a heap merge into a temp file via the base codec writer.
+    /// Drain a heap merge into a temp file via the unkeyed codec writer.
     fn spill_heap_to_disk<
         MR: MergeSource<Output = T, Error = C::Error>,
         HCmp: Compare<MR::HeapItem> + Copy,
@@ -596,7 +596,7 @@ impl<T: 'static, C: KeyedCodec<Item = T> + Copy + 'static, Cmp: Compare<T> + Cop
 
 // ── Reader construction helpers ──────────────────────────
 
-fn open_basic_readers<T, C: Codec<Item = T> + Copy>(
+fn open_unkeyed_readers<T, C: Codec<Item = T> + Copy>(
     runs: Vec<SortedRun>,
     codec: C,
     config: &MergeConfig,
@@ -928,7 +928,7 @@ where
     fn heap(&mut self) -> Result<&mut RecordHeap<T, C, Cmp>, MergeError<C::Error>> {
         if self.heap.is_none() {
             let runs = self.runs.take().expect("runs are initialized at most once");
-            let readers = open_basic_readers(runs, self.codec, &self.config)?;
+            let readers = open_unkeyed_readers(runs, self.codec, &self.config)?;
             self.heap = Some(HeapMerge::new(readers, self.cmp)?);
         }
 

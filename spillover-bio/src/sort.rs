@@ -131,7 +131,7 @@ pub trait SortOrder: sealed::Sealed + Copy {
     /// keyed merge path after records have been encoded into sorted runs.
     type KeyComparator: Copy + Send + Sync + 'static;
 
-    /// The merge strategy marker: [`Basic`] or [`Keyed`].
+    /// The merge strategy marker: [`Unkeyed`] or [`Keyed`].
     type Strategy;
 
     /// The sort key extractor.
@@ -166,8 +166,8 @@ impl<O> sealed::CompatibleChunkSorter<O> for spillover::chunk::Parallel {}
 
 impl<const N: usize> sealed::CompatibleChunkSorter<SequenceOrder<N>> for RadixThenRefine<N> {}
 
-/// Marker: base merge path (no record keys).
-pub struct Basic;
+/// Marker: unkeyed merge path (no record keys).
+pub struct Unkeyed;
 
 /// Marker: keyed merge path (record keys for merge acceleration).
 pub struct Keyed;
@@ -352,7 +352,7 @@ impl SortOrder for UnkeyedSequenceOrder {
     type SortKey = SequenceQualityKey;
     type Comparator = Self;
     type KeyComparator = Natural;
-    type Strategy = Basic;
+    type Strategy = Unkeyed;
 
     fn sort_key(&self) -> SequenceQualityKey {
         SequenceQualityKey
@@ -385,7 +385,7 @@ impl SortOrder for UnkeyedNameOrder {
     type SortKey = NameKey;
     type Comparator = Self;
     type KeyComparator = Natural;
-    type Strategy = Basic;
+    type Strategy = Unkeyed;
 
     fn sort_key(&self) -> NameKey {
         NameKey
@@ -416,7 +416,7 @@ impl SortOrder for UnkeyedLengthOrder {
     type SortKey = LengthKey;
     type Comparator = Self;
     type KeyComparator = Natural;
-    type Strategy = Basic;
+    type Strategy = Unkeyed;
 
     fn sort_key(&self) -> LengthKey {
         LengthKey
@@ -891,7 +891,7 @@ impl<SK, Cod, KeyCmp, RecCmp, CS, M> ArenaBackend<'_, SK, Cod, KeyCmp, RecCmp, C
 }
 
 impl<SK, Cod, KeyCmp, RecCmp, CS>
-    ArenaBackend<'_, SK, Cod, KeyCmp, RecCmp, CS, spillover::sorter::Basic>
+    ArenaBackend<'_, SK, Cod, KeyCmp, RecCmp, CS, spillover::sorter::Unkeyed>
 where
     SK: SortKey<SeqRecord> + Copy + Send + Sync + 'static,
     Cod: Codec<Item = SeqRecord> + Copy + 'static,
@@ -901,7 +901,7 @@ where
     RecCmp: Copy + Send + Sync + 'static,
     for<'v> CS: ChunkSorter<SeqRecordView<'v>>,
 {
-    fn flush_basic(&mut self) -> Result<(), MergeError<Cod::Error>> {
+    fn flush(&mut self) -> Result<(), MergeError<Cod::Error>> {
         if self.handles.is_empty() {
             return Ok(());
         }
@@ -940,7 +940,7 @@ where
     RecCmp: Copy + Send + Sync + 'static,
     for<'v> CS: ChunkSorter<SeqRecordView<'v>>,
 {
-    fn flush_keyed(&mut self) -> Result<(), MergeError<Cod::Error>> {
+    fn flush(&mut self) -> Result<(), MergeError<Cod::Error>> {
         if self.handles.is_empty() {
             return Ok(());
         }
@@ -1085,8 +1085,8 @@ impl<SK, Cod, Cmp, CS>
         Cod,
         Cmp,
         CS,
-        spillover::sorter::Basic,
-        OwnedBackend<SK, Cod, Cmp, CS, spillover::sorter::Basic>,
+        spillover::sorter::Unkeyed,
+        OwnedBackend<SK, Cod, Cmp, CS, spillover::sorter::Unkeyed>,
     >
 where
     SK: SortKey<SeqRecord> + Copy + Send + Sync + 'static,
@@ -1131,8 +1131,8 @@ impl<SK, Cod, Cmp, RecCmp, CS>
         Cod,
         Cmp,
         CS,
-        spillover::sorter::Basic,
-        ArenaBackend<'_, SK, Cod, Cmp, RecCmp, CS, spillover::sorter::Basic>,
+        spillover::sorter::Unkeyed,
+        ArenaBackend<'_, SK, Cod, Cmp, RecCmp, CS, spillover::sorter::Unkeyed>,
     >
 where
     SK: SortKey<SeqRecord> + Copy + Send + Sync + 'static,
@@ -1155,14 +1155,14 @@ where
     ) -> Result<(), MergeError<Cod::Error>> {
         let incoming_record_bytes = record_byte_len(record);
         if self.inner.should_flush_before_push(incoming_record_bytes) {
-            self.inner.flush_basic()?;
+            self.inner.flush()?;
         }
 
         let handle = self.inner.arena.store(record);
         self.inner.handles.push(handle);
 
         if self.inner.should_flush() {
-            self.inner.flush_basic()?;
+            self.inner.flush()?;
         }
 
         Ok(())
@@ -1180,7 +1180,7 @@ where
         SortedRecordStream<RunMerge<SeqRecord, Cod, KeyCompare<SK, Cmp>>>,
         MergeError<Cod::Error>,
     > {
-        self.inner.flush_basic()?;
+        self.inner.flush()?;
 
         let item_cmp = KeyCompare::new(self.inner.sort_key, self.inner.key_comparator);
         let run_merger =
@@ -1230,14 +1230,14 @@ where
     ) -> Result<(), MergeError<Cod::Error>> {
         let incoming_record_bytes = record_byte_len(record);
         if self.inner.should_flush_before_push(incoming_record_bytes) {
-            self.inner.flush_keyed()?;
+            self.inner.flush()?;
         }
 
         let handle = self.inner.arena.store(record);
         self.inner.handles.push(handle);
 
         if self.inner.should_flush() {
-            self.inner.flush_keyed()?;
+            self.inner.flush()?;
         }
 
         Ok(())
@@ -1255,7 +1255,7 @@ where
         SortedRecordStream<KeyedRunMerge<SeqRecord, Cod, Cmp, KeyCompare<SK, Cmp>>>,
         MergeError<Cod::Error>,
     > {
-        self.inner.flush_keyed()?;
+        self.inner.flush()?;
 
         let item_cmp = KeyCompare::new(self.inner.sort_key, self.inner.key_comparator);
         let run_merger =
@@ -1356,7 +1356,7 @@ impl<C, F, CS, S> Builder<NeedsOrder, C, F, CS, S> {
 
     /// Set an unkeyed sort order (merge deserializes full records).
     #[must_use]
-    pub fn sort_by_unkeyed<O: SortOrder<Strategy = Basic>>(
+    pub fn sort_by_unkeyed<O: SortOrder<Strategy = Unkeyed>>(
         self,
         order: O,
     ) -> Builder<HasUnkeyedOrder<O>, C, F, CS, S> {
@@ -1383,7 +1383,7 @@ impl<C, F, CS, S> Builder<NeedsOrder, C, F, CS, S> {
 
     /// Sort by exact raw sequence bytes, then raw quality bytes.
     ///
-    /// This uses the basic unkeyed sequence order rather than the accelerated
+    /// This uses the unkeyed sequence order rather than the accelerated
     /// packed-key order used by [`Self::sort_by_illumina`]. It also selects the
     /// sequential comparator-based chunk sorter, even if a chunk sorter was
     /// configured earlier on the builder, because packed-key radix sorting is not
@@ -1712,7 +1712,7 @@ where
 
 impl<O, C, F, CS> Builder<HasUnkeyedOrder<O>, C, F, CS, OwnedStorage>
 where
-    O: SortOrder<Strategy = Basic>,
+    O: SortOrder<Strategy = Unkeyed>,
     O::SortKey: Send + Sync + 'static,
     O::KeyComparator:
         for<'a> Compare<<O::SortKey as SortKey<SeqRecord>>::Key<'a>> + Send + Sync + 'static,
@@ -1720,7 +1720,7 @@ where
     F: sealed::ResolveFlush,
     CS: ChunkSorter<SeqRecord> + sealed::CompatibleChunkSorter<O>,
 {
-    /// Build the sorter (record merge path, no stored record keys).
+    /// Build the sorter (unkeyed merge path, no stored record keys).
     ///
     /// If `.codec()` was not called, defaults to raw (uncompressed)
     /// dryice encoding. If `.measured_budget()` / `.max_buffer_items()`
@@ -1734,7 +1734,7 @@ where
         DryIceCodec<C::S, C::Q, C::N>,
         O::KeyComparator,
         CS,
-        spillover::sorter::Basic,
+        spillover::sorter::Unkeyed,
     > {
         let order = self.order.0;
         let _storage = self.storage;
@@ -1768,7 +1768,7 @@ where
 
 impl<'a, O, C, F, CS> Builder<HasUnkeyedOrder<O>, C, F, CS, ArenaStorage<'a>>
 where
-    O: SortOrder<Strategy = Basic>,
+    O: SortOrder<Strategy = Unkeyed>,
     O::SortKey: Send + Sync + 'static,
     O::KeyComparator:
         for<'r> Compare<<O::SortKey as SortKey<SeqRecord>>::Key<'r>> + Send + Sync + 'static,
@@ -1778,7 +1778,7 @@ where
     for<'v> CS: ChunkSorter<SeqRecordView<'v>>,
     for<'v> O::Comparator: Compare<SeqRecordView<'v>>,
 {
-    /// Build an arena-backed sorter (record merge path, no stored record keys).
+    /// Build an arena-backed sorter (unkeyed merge path, no stored record keys).
     #[allow(clippy::type_complexity)]
     #[must_use]
     pub fn build(
@@ -1788,7 +1788,7 @@ where
         DryIceCodec<C::S, C::Q, C::N>,
         O::KeyComparator,
         CS,
-        spillover::sorter::Basic,
+        spillover::sorter::Unkeyed,
         ArenaBackend<
             'a,
             O::SortKey,
@@ -1796,7 +1796,7 @@ where
             O::KeyComparator,
             O::Comparator,
             CS,
-            spillover::sorter::Basic,
+            spillover::sorter::Unkeyed,
         >,
     > {
         let order = self.order.0;
@@ -2218,9 +2218,9 @@ mod tests {
     }
 
     #[test]
-    fn unkeyed_sequence_order_has_basic_strategy() {
-        fn assert_basic<O: SortOrder<Strategy = Basic>>() {}
-        assert_basic::<UnkeyedSequenceOrder>();
+    fn unkeyed_sequence_order_has_unkeyed_strategy() {
+        fn assert_unkeyed<O: SortOrder<Strategy = Unkeyed>>() {}
+        assert_unkeyed::<UnkeyedSequenceOrder>();
     }
 
     #[test]
@@ -2245,15 +2245,15 @@ mod tests {
 
     #[test]
     fn unkeyed_from_keyed() {
-        fn assert_basic<O: SortOrder<Strategy = Basic>>() {}
+        fn assert_unkeyed<O: SortOrder<Strategy = Unkeyed>>() {}
 
         let _unkeyed = ILLUMINA_ORDER.unkeyed();
-        assert_basic::<UnkeyedSequenceOrder>();
+        assert_unkeyed::<UnkeyedSequenceOrder>();
 
         let _unkeyed = NameOrder.unkeyed();
-        assert_basic::<UnkeyedNameOrder>();
+        assert_unkeyed::<UnkeyedNameOrder>();
 
         let _unkeyed = LengthOrder.unkeyed();
-        assert_basic::<UnkeyedLengthOrder>();
+        assert_unkeyed::<UnkeyedLengthOrder>();
     }
 }
