@@ -88,6 +88,18 @@ cargo run -p spillover --example 01_basic_u64_sort
 cargo run -p spillover-bio --example 01_illumina_quickstart
 ```
 
+## Development
+
+This repository uses [mise](https://mise.jdx.dev/) for its development toolchain and task runner. Git is also required to fetch the read-only reference repositories used during development.
+
+```bash
+mise trust
+mise install
+mise run setup
+mise tasks
+mise run check
+```
+
 ## Concepts & Architecture
 
 At a high level, both crates follow the same pipeline:

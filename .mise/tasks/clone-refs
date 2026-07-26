@@ -1,0 +1,37 @@
+#!/bin/sh
+#MISE description="Clone source repositories used as implementation references"
+#USAGE flag "--force" help="Replace existing reference clones"
+
+set -eu
+
+refs_root="${MISE_PROJECT_ROOT:?}/.agents/repos"
+
+if [ "${usage_force:-false}" = "true" ]; then
+    rm -rf "$refs_root"
+fi
+
+mkdir -p "$refs_root"
+
+clone_ref() {
+    name=$1
+    description=$2
+    url=$3
+    destination="$refs_root/$name"
+
+    if [ -e "$destination" ]; then
+        printf '%s already exists; skipping\n' "$name"
+        return
+    fi
+
+    printf 'Cloning %s (%s)...\n' "$name" "$description"
+    git clone --depth 1 "$url" "$destination"
+}
+
+clone_ref sra-taxa-rs "reference sort implementation" https://github.com/nrminor/sra-taxa-rs.git
+clone_ref dryice "temporary on-disk format" https://github.com/nrminor/dryice.git
+clone_ref samtools "BAM sorting" https://github.com/samtools/samtools.git
+clone_ref fastq-tools "FASTQ utilities" https://github.com/dcjones/fastq-tools.git
+clone_ref seqkit "sequence toolkit" https://github.com/shenwei356/seqkit.git
+clone_ref haveitnway "prototype sort implementation" https://github.com/nrminor/haveitnway.git
+
+printf 'Reference repositories are available at %s\n' "$refs_root"

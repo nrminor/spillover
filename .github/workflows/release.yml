@@ -19,13 +19,14 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Install git-cliff
-        uses: taiki-e/install-action@v2
+      - name: Install release tools
+        uses: jdx/mise-action@v4
         with:
-          tool: git-cliff
+          version: 2026.7.13
+          install_args: git-cliff
 
       - name: Generate changelog
-        run: git-cliff --config cliff.toml --latest --strip header -o CHANGES.md
+        run: mise run --skip-tools changelog
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2

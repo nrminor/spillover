@@ -26,14 +26,15 @@ Memory budgets are the user's business. The library should respect them precisel
 
 ## Before You Start Working
 
-1. Run `just setup` if `.agents/repos/` is empty. The reference implementations in `sra-taxa-rs` (particularly `sra-taxa-build/src/merge.rs` and `sra-taxa-build/src/engine.rs`) and `haveitnway` are essential context.
-2. Run `just --list` and use the justfile recipes for all standard operations.
-3. Run `just check` before every commit. jj does not run hooks.
+1. Run `mise install` to install the locked project toolchain.
+2. Run `mise run setup` if `.agents/repos/` is empty. The reference implementations in `sra-taxa-rs` (particularly `sra-taxa-build/src/merge.rs` and `sra-taxa-build/src/engine.rs`) and `haveitnway` are essential context.
+3. Run `mise tasks` and use the mise tasks for all standard operations.
+4. Run `mise run check` before every commit. jj does not run hooks.
 
 ## Prohibited Actions
 
 1. **`cargo install`** — the user's responsibility
 2. **`jj git push`** — the user's responsibility
-3. **Skipping `just check`** — non-negotiable
+3. **Skipping `mise run check`** — non-negotiable
 4. **Creating documentation files** unless explicitly asked
 5. **Adding domain-specific types to the `spillover` core crate**

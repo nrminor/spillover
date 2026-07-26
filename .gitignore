@@ -6,11 +6,17 @@
 !/.gitignore
 !/Cargo.toml
 !/Cargo.lock
-!/justfile
+!/mise.toml
+!/mise.lock
 !/AGENTS.md
 !/cliff.toml
 !/LICENSE
 !/README.md
+
+# === Allowed: Mise tasks ===
+!/.mise
+!/.mise/tasks
+!/.mise/tasks/clone-refs
 
 # === Allowed: Agent configuration ===
 !/.agents

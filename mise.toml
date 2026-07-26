@@ -1,0 +1,95 @@
+min_version = "2026.7.13"
+
+[tools]
+rust = { version = "1.96.0", profile = "minimal", components = ["clippy", "rustfmt", "rust-analyzer", "rust-src"] }
+"github:nextest-rs/nextest" = { version = "0.9", version_prefix = "cargo-nextest-" }
+"aqua:boyter/scc" = "3"
+git-cliff = "2"
+
+[tasks.check]
+description = "Run all pre-commit checks"
+run = [
+  { task = "fmt-check" },
+  { task = "lint" },
+  { task = "test" },
+  { task = "doc-check" },
+]
+
+[tasks.check-all]
+description = "Run all checks, including ignored tests"
+run = [
+  { task = "fmt-check" },
+  { task = "lint" },
+  { task = "test-all" },
+  { task = "doc-check" },
+]
+
+[tasks.fmt-check]
+description = "Check Rust formatting"
+run = "cargo fmt --all -- --check"
+
+[tasks.fmt]
+description = "Format Rust sources"
+run = "cargo fmt --all"
+
+[tasks.lint]
+description = "Run Clippy with warnings denied"
+run = "cargo clippy --all-targets --all-features -- -D warnings"
+
+[tasks.test]
+description = "Run the test suite"
+run = "cargo nextest run --all-features --no-tests=pass"
+
+[tasks.test-all]
+description = "Run the test suite, including ignored tests"
+run = "cargo nextest run --all-features --run-ignored all --no-tests=pass"
+
+[tasks.test-verbose]
+description = "Run tests with uncaptured output"
+interactive = true
+run = "cargo nextest run --all-features --no-capture --no-tests=pass"
+
+[tasks.build]
+description = "Build the workspace"
+run = "cargo build"
+
+[tasks.build-release]
+description = "Build the workspace with the release profile"
+run = "cargo build --release"
+
+[tasks.check-compile]
+description = "Check all targets and features without building artifacts"
+run = "cargo check --all-targets --all-features"
+
+[tasks.clean]
+description = "Remove Cargo build artifacts"
+run = "cargo clean"
+
+[tasks.update]
+description = "Update Cargo dependencies"
+run = "cargo update"
+
+[tasks.doc-check]
+description = "Build documentation without dependencies"
+run = "cargo doc --no-deps --document-private-items"
+
+[tasks.doc]
+description = "Build and open documentation"
+interactive = true
+run = "cargo doc --no-deps --open"
+
+[tasks.sloc]
+description = "Count Rust source lines"
+run = "scc --include-ext=rs --no-cocomo --no-complexity --no-size"
+
+[tasks.changelog]
+description = "Generate the latest release changelog"
+run = "git-cliff --config cliff.toml --latest --strip header -o CHANGES.md"
+
+[tasks.setup]
+description = "Prepare this checkout for development"
+run = [{ task = "clone-refs" }]
+
+[tasks.clean-refs]
+description = "Remove cloned reference repositories"
+run = 'rm -rf "${MISE_PROJECT_ROOT:?}/.agents/repos"'
