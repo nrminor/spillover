@@ -28,13 +28,9 @@ use crate::{
 
 /// How the sorter decides when to flush the in-memory buffer to
 /// disk.
-enum FlushStrategy<T> {
+enum FlushStrategy {
     /// Flush when the estimated byte usage exceeds a budget.
-    /// The closure returns the memory footprint of each item.
-    Bytes {
-        budget: usize,
-        item_size: Box<dyn Fn(&T) -> usize + Send + Sync>,
-    },
+    Bytes { budget: usize },
 
     /// Flush when the item count exceeds a limit.
     Items { max_items: usize },
@@ -65,7 +61,7 @@ pub struct HasKeyedCodec<Cod>(Cod);
 /// Marker: no flush strategy provided yet.
 pub struct NeedsFlushStrategy;
 /// Marker: flush strategy has been provided.
-pub struct HasFlushStrategy<T>(FlushStrategy<T>);
+pub struct HasFlushStrategy<T>(FlushStrategy, MaybeItemSize<T>);
 
 /// Marker: unkeyed merge path — temporary runs store records without record keys.
 pub struct Unkeyed;
@@ -216,10 +212,7 @@ impl<SK, Cod, Cmp, D, CS> Builder<SK, Cod, NeedsFlushStrategy, Cmp, D, CS> {
         Builder {
             sort_key: self.sort_key,
             codec: self.codec,
-            flush: HasFlushStrategy(FlushStrategy::Bytes {
-                budget,
-                item_size: Box::new(item_size),
-            }),
+            flush: HasFlushStrategy(FlushStrategy::Bytes { budget }, Some(Box::new(item_size))),
             compare: self.compare,
             dedup: self.dedup,
             chunk_sort: self.chunk_sort,
@@ -236,10 +229,10 @@ impl<SK, Cod, Cmp, D, CS> Builder<SK, Cod, NeedsFlushStrategy, Cmp, D, CS> {
         Builder {
             sort_key: self.sort_key,
             codec: self.codec,
-            flush: HasFlushStrategy(FlushStrategy::Bytes {
-                budget,
-                item_size: Box::new(GetSize::get_size),
-            }),
+            flush: HasFlushStrategy(
+                FlushStrategy::Bytes { budget },
+                Some(Box::new(GetSize::get_size)),
+            ),
             compare: self.compare,
             dedup: self.dedup,
             chunk_sort: self.chunk_sort,
@@ -256,10 +249,10 @@ impl<SK, Cod, Cmp, D, CS> Builder<SK, Cod, NeedsFlushStrategy, Cmp, D, CS> {
         Builder {
             sort_key: self.sort_key,
             codec: self.codec,
-            flush: HasFlushStrategy(FlushStrategy::Bytes {
-                budget,
-                item_size: Box::new(|_| std::mem::size_of::<T>()),
-            }),
+            flush: HasFlushStrategy(
+                FlushStrategy::Bytes { budget },
+                Some(Box::new(|_| std::mem::size_of::<T>())),
+            ),
             compare: self.compare,
             dedup: self.dedup,
             chunk_sort: self.chunk_sort,
@@ -276,7 +269,7 @@ impl<SK, Cod, Cmp, D, CS> Builder<SK, Cod, NeedsFlushStrategy, Cmp, D, CS> {
         Builder {
             sort_key: self.sort_key,
             codec: self.codec,
-            flush: HasFlushStrategy(FlushStrategy::Items { max_items }),
+            flush: HasFlushStrategy(FlushStrategy::Items { max_items }, None),
             compare: self.compare,
             dedup: self.dedup,
             chunk_sort: self.chunk_sort,
@@ -297,17 +290,18 @@ where
     #[must_use]
     pub fn build(self) -> Sorter<T, SK, Cod, Cmp, D, CS, Unkeyed> {
         Sorter {
-            accumulator: RunAccumulator::new(
-                self.sort_key.0,
-                self.codec.0,
-                self.compare,
-                self.chunk_sort,
-                self.config.merge,
+            session: Session::new(
+                OwnedBuffer::new(self.flush.1),
+                RunAccumulator::new(
+                    self.sort_key.0,
+                    self.codec.0,
+                    self.compare,
+                    self.chunk_sort,
+                    self.config.merge,
+                ),
             ),
             dedup: self.dedup,
             flush: self.flush.0,
-            buffer: Vec::new(),
-            buffer_bytes: 0,
             _marker: std::marker::PhantomData,
         }
     }
@@ -326,17 +320,18 @@ where
     #[must_use]
     pub fn build(self) -> Sorter<T, SK, Cod, Cmp, D, CS, Keyed> {
         Sorter {
-            accumulator: RunAccumulator::new(
-                self.sort_key.0,
-                self.codec.0,
-                self.compare,
-                self.chunk_sort,
-                self.config.merge,
+            session: Session::new(
+                OwnedBuffer::new(self.flush.1),
+                RunAccumulator::new(
+                    self.sort_key.0,
+                    self.codec.0,
+                    self.compare,
+                    self.chunk_sort,
+                    self.config.merge,
+                ),
             ),
             dedup: self.dedup,
             flush: self.flush.0,
-            buffer: Vec::new(),
-            buffer_bytes: 0,
             _marker: std::marker::PhantomData,
         }
     }
@@ -365,12 +360,148 @@ where
 ///   threading model
 /// - `M`: merge strategy marker ([`Unkeyed`] or [`Keyed`])
 pub struct Sorter<T, SK, Cod, Cmp, D, CS, M = Unkeyed> {
-    accumulator: RunAccumulator<T, SK, Cod, Cmp, CS, M>,
+    session: SorterSession<T, SK, Cod, Cmp, CS, M>,
     dedup: D,
-    flush: FlushStrategy<T>,
-    buffer: Vec<T>,
-    buffer_bytes: usize,
+    flush: FlushStrategy,
     _marker: std::marker::PhantomData<M>,
+}
+
+type SorterSession<T, SK, Cod, Cmp, CS, M> =
+    Session<OwnedBuffer<T>, RunAccumulator<T, SK, Cod, Cmp, CS, M>>;
+
+type ItemSize<T> = Box<dyn Fn(&T) -> usize + Send + Sync>;
+type MaybeItemSize<T> = Option<ItemSize<T>>;
+
+struct OwnedBuffer<T> {
+    items: Vec<T>,
+    active_bytes: usize,
+    item_size: MaybeItemSize<T>,
+}
+
+impl<T> OwnedBuffer<T> {
+    fn new(item_size: MaybeItemSize<T>) -> Self {
+        Self {
+            items: Vec::new(),
+            active_bytes: 0,
+            item_size,
+        }
+    }
+}
+
+impl<T> Extend<T> for OwnedBuffer<T> {
+    fn extend<I>(&mut self, iter: I)
+    where
+        I: IntoIterator<Item = T>,
+    {
+        for item in iter {
+            if let Some(item_size) = &self.item_size {
+                self.active_bytes += item_size(&item);
+            }
+            self.items.push(item);
+        }
+    }
+}
+
+trait ChunkBuffer {
+    type Item;
+    type Items: AsMut<[Self::Item]>;
+
+    fn items(self) -> Self::Items;
+    fn is_empty(&self) -> bool;
+    fn clear(self);
+}
+
+impl<'items, T> ChunkBuffer for &'items mut OwnedBuffer<T> {
+    type Item = T;
+    type Items = &'items mut [T];
+
+    fn items(self) -> Self::Items {
+        &mut self.items
+    }
+
+    fn is_empty(&self) -> bool {
+        self.items.is_empty()
+    }
+
+    fn clear(self) {
+        self.items.clear();
+        self.active_bytes = 0;
+    }
+}
+
+trait FlushPolicy<B, I> {
+    fn should_flush_before_push(&self, buffer: &B, input: &I) -> bool;
+    fn should_flush_after_push(&self, buffer: &B) -> bool;
+}
+
+impl<T> FlushPolicy<OwnedBuffer<T>, T> for FlushStrategy {
+    fn should_flush_before_push(&self, _buffer: &OwnedBuffer<T>, _input: &T) -> bool {
+        false
+    }
+
+    fn should_flush_after_push(&self, buffer: &OwnedBuffer<T>) -> bool {
+        match self {
+            FlushStrategy::Bytes { budget } => buffer.active_bytes >= *budget,
+            FlushStrategy::Items { max_items } => buffer.items.len() >= *max_items,
+        }
+    }
+}
+
+struct Session<B, A> {
+    buffer: B,
+    accumulator: A,
+}
+
+impl<B, A> Session<B, A> {
+    fn new(buffer: B, accumulator: A) -> Self {
+        Self {
+            buffer,
+            accumulator,
+        }
+    }
+}
+
+trait AccumulateItems<I> {
+    type Error;
+    type Final;
+
+    fn accumulate(&mut self, items: &mut [I]) -> Result<(), Self::Error>;
+    fn finish(self) -> Result<Self::Final, Self::Error>;
+}
+
+impl<B, A> Session<B, A>
+where
+    for<'items> &'items mut B: ChunkBuffer,
+{
+    fn commit<E>(&mut self) -> Result<(), E>
+    where
+        for<'items> A: AccumulateItems<<&'items mut B as ChunkBuffer>::Item, Error = E>,
+    {
+        let is_empty = {
+            let buffer = &mut self.buffer;
+            ChunkBuffer::is_empty(&buffer)
+        };
+
+        if is_empty {
+            return Ok(());
+        }
+
+        {
+            let mut items = ChunkBuffer::items(&mut self.buffer);
+            self.accumulator.accumulate(items.as_mut())?;
+        }
+
+        ChunkBuffer::clear(&mut self.buffer);
+        Ok(())
+    }
+
+    fn finish<E, F>(mut self) -> Result<F, E>
+    where
+        for<'items> A: AccumulateItems<<&'items mut B as ChunkBuffer>::Item, Error = E, Final = F>,
+    {
+        self.commit()?;
+        self.accumulator.finish()
+    }
 }
 
 struct RunAccumulator<T, SK, Cod, Cmp, CS, M> {
@@ -397,7 +528,7 @@ impl<T, SK, Cod, Cmp, CS, M> RunAccumulator<T, SK, Cod, Cmp, CS, M> {
     }
 }
 
-impl<T, SK, Cod, Cmp, CS> RunAccumulator<T, SK, Cod, Cmp, CS, Unkeyed>
+impl<T, SK, Cod, Cmp, CS> AccumulateItems<T> for RunAccumulator<T, SK, Cod, Cmp, CS, Unkeyed>
 where
     T: 'static,
     SK: SortKey<T> + Copy + Send + Sync + 'static,
@@ -405,6 +536,9 @@ where
     Cmp: for<'a> Compare<SK::Key<'a>> + Copy + Send + Sync + 'static,
     CS: ChunkSorter<T>,
 {
+    type Error = MergeError<Cod::Error>;
+    type Final = RunMerge<T, Cod, KeyCompare<SK, Cmp>>;
+
     fn accumulate(&mut self, items: &mut [T]) -> Result<(), MergeError<Cod::Error>> {
         let item_cmp = KeyCompare::new(self.sort_key, self.compare);
         self.chunk_sort
@@ -417,8 +551,7 @@ where
         Ok(())
     }
 
-    #[allow(clippy::type_complexity)]
-    fn finish(self) -> Result<RunMerge<T, Cod, KeyCompare<SK, Cmp>>, MergeError<Cod::Error>> {
+    fn finish(self) -> Result<Self::Final, MergeError<Cod::Error>> {
         let item_cmp = KeyCompare::new(self.sort_key, self.compare);
         let run_merger = RunMerger::new(self.codec, item_cmp, self.merge_config);
 
@@ -426,7 +559,7 @@ where
     }
 }
 
-impl<T, SK, Cod, Cmp, CS> RunAccumulator<T, SK, Cod, Cmp, CS, Keyed>
+impl<T, SK, Cod, Cmp, CS> AccumulateItems<T> for RunAccumulator<T, SK, Cod, Cmp, CS, Keyed>
 where
     T: 'static,
     SK: SortKey<T> + Copy + Send + Sync + 'static,
@@ -434,6 +567,9 @@ where
     Cmp: for<'a> Compare<SK::Key<'a>> + Compare<Cod::Key> + Copy + Send + Sync + 'static,
     CS: ChunkSorter<T>,
 {
+    type Error = MergeError<Cod::Error>;
+    type Final = KeyedRunMerge<T, Cod, Cmp, KeyCompare<SK, Cmp>>;
+
     fn accumulate(&mut self, items: &mut [T]) -> Result<(), MergeError<Cod::Error>> {
         let item_cmp = KeyCompare::new(self.sort_key, self.compare);
         self.chunk_sort
@@ -446,10 +582,7 @@ where
         Ok(())
     }
 
-    #[allow(clippy::type_complexity)]
-    fn finish(
-        self,
-    ) -> Result<KeyedRunMerge<T, Cod, Cmp, KeyCompare<SK, Cmp>>, MergeError<Cod::Error>> {
+    fn finish(self) -> Result<Self::Final, MergeError<Cod::Error>> {
         let item_cmp = KeyCompare::new(self.sort_key, self.compare);
         let run_merger = RunMerger::new(self.codec, item_cmp, self.merge_config);
 
@@ -589,28 +722,18 @@ where
     ///
     /// Returns an error if flushing to disk fails.
     pub fn push(&mut self, item: T) -> Result<(), MergeError<Cod::Error>> {
-        match &self.flush {
-            FlushStrategy::Bytes { budget, item_size } => {
-                self.buffer_bytes += item_size(&item);
-                self.buffer.push(item);
-                if self.buffer_bytes >= *budget {
-                    self.flush()?;
-                }
-            }
-            FlushStrategy::Items { max_items } => {
-                self.buffer.push(item);
-                if self.buffer.len() >= *max_items {
-                    self.flush()?;
-                }
-            }
+        if self
+            .flush
+            .should_flush_before_push(&self.session.buffer, &item)
+        {
+            self.session.commit()?;
         }
-        Ok(())
-    }
 
-    fn flush(&mut self) -> Result<(), MergeError<Cod::Error>> {
-        self.accumulator.accumulate(&mut self.buffer)?;
-        self.buffer.clear();
-        self.buffer_bytes = 0;
+        self.session.buffer.extend([item]);
+
+        if self.flush.should_flush_after_push(&self.session.buffer) {
+            self.session.commit()?;
+        }
 
         Ok(())
     }
@@ -624,7 +747,7 @@ where
     ///
     #[allow(clippy::type_complexity)]
     pub fn finish(
-        mut self,
+        self,
     ) -> Result<
         Sorted<<D as Dedup<RunMerge<T, Cod, KeyCompare<SK, Cmp>>>>::Deduped>,
         MergeError<Cod::Error>,
@@ -632,12 +755,8 @@ where
     where
         D: Dedup<RunMerge<T, Cod, KeyCompare<SK, Cmp>>>,
     {
-        if !self.buffer.is_empty() {
-            self.flush()?;
-        }
-
         let dedup = self.dedup;
-        let merged = self.accumulator.finish()?;
+        let merged = self.session.finish()?;
 
         Ok(Sorted::new(dedup.dedup(merged)))
     }
@@ -659,28 +778,18 @@ where
     ///
     /// Returns an error if flushing to disk fails.
     pub fn push(&mut self, item: T) -> Result<(), MergeError<Cod::Error>> {
-        match &self.flush {
-            FlushStrategy::Bytes { budget, item_size } => {
-                self.buffer_bytes += item_size(&item);
-                self.buffer.push(item);
-                if self.buffer_bytes >= *budget {
-                    self.flush()?;
-                }
-            }
-            FlushStrategy::Items { max_items } => {
-                self.buffer.push(item);
-                if self.buffer.len() >= *max_items {
-                    self.flush()?;
-                }
-            }
+        if self
+            .flush
+            .should_flush_before_push(&self.session.buffer, &item)
+        {
+            self.session.commit()?;
         }
-        Ok(())
-    }
 
-    fn flush(&mut self) -> Result<(), MergeError<Cod::Error>> {
-        self.accumulator.accumulate(&mut self.buffer)?;
-        self.buffer.clear();
-        self.buffer_bytes = 0;
+        self.session.buffer.extend([item]);
+
+        if self.flush.should_flush_after_push(&self.session.buffer) {
+            self.session.commit()?;
+        }
 
         Ok(())
     }
@@ -694,7 +803,7 @@ where
     ///
     #[allow(clippy::type_complexity)]
     pub fn finish(
-        mut self,
+        self,
     ) -> Result<
         Sorted<<D as Dedup<KeyedRunMerge<T, Cod, Cmp, KeyCompare<SK, Cmp>>>>::Deduped>,
         MergeError<Cod::Error>,
@@ -702,12 +811,8 @@ where
     where
         D: Dedup<KeyedRunMerge<T, Cod, Cmp, KeyCompare<SK, Cmp>>>,
     {
-        if !self.buffer.is_empty() {
-            self.flush()?;
-        }
-
         let dedup = self.dedup;
-        let merged = self.accumulator.finish()?;
+        let merged = self.session.finish()?;
 
         Ok(Sorted::new(dedup.dedup(merged)))
     }
@@ -927,10 +1032,22 @@ mod tests {
 
     type U64Sorter = Sorter<u64, Owned<fn(&u64) -> u64>, U64Codec, Natural, Identity, Sequential>;
 
+    #[allow(clippy::type_complexity)]
+    type U64KeyedSorter =
+        Sorter<u64, Owned<fn(&u64) -> u64>, U64KeyedCodec, Natural, Identity, Sequential, Keyed>;
+
     fn u64_sorter(max_items: usize) -> U64Sorter {
         Builder::new()
             .key(Owned((|v: &u64| *v) as fn(&u64) -> u64))
             .codec(U64Codec)
+            .max_buffer_items::<u64>(max_items)
+            .build()
+    }
+
+    fn u64_keyed_sorter(max_items: usize) -> U64KeyedSorter {
+        Builder::new()
+            .key(Owned((|v: &u64| *v) as fn(&u64) -> u64))
+            .keyed_codec(U64KeyedCodec)
             .max_buffer_items::<u64>(max_items)
             .build()
     }
@@ -959,6 +1076,19 @@ mod tests {
             Natural,
             Sequential,
             config,
+        )
+    }
+
+    #[allow(clippy::type_complexity)]
+    fn u64_session(
+        config: MergeConfig,
+    ) -> Session<
+        OwnedBuffer<u64>,
+        RunAccumulator<u64, Owned<fn(&u64) -> u64>, U64Codec, Natural, Sequential, Unkeyed>,
+    > {
+        Session::new(
+            OwnedBuffer::new(Some(Box::new(|_| 8))),
+            u64_accumulator(config),
         )
     }
 
@@ -1093,6 +1223,149 @@ mod tests {
         let result = accumulator.accumulate(&mut items);
         assert!(matches!(result, Err(MergeError::Io(_))));
         assert_eq!(accumulator.runs.len(), 0);
+    }
+
+    #[test]
+    fn successful_session_commit_registers_one_run_and_clears_owned_buffer() {
+        let mut session = u64_session(MergeConfig::default());
+        session.buffer.extend([3, 1, 2]);
+        let capacity = session.buffer.items.capacity();
+
+        session.commit().expect("commit");
+
+        assert_eq!(session.accumulator.runs.len(), 1);
+        assert!(session.buffer.items.is_empty());
+        assert_eq!(session.buffer.active_bytes, 0);
+        assert_eq!(session.buffer.items.capacity(), capacity);
+    }
+
+    #[test]
+    fn failed_session_commit_keeps_items_accounting_and_registers_no_run() {
+        let temp_dir = tempfile::tempdir().expect("create temp dir");
+        let config = MergeConfig {
+            temp_dir: Some(temp_dir.path().join("missing")),
+            ..MergeConfig::default()
+        };
+        let mut session = u64_session(config);
+        session.buffer.extend([3, 1, 2]);
+
+        let result = session.commit();
+
+        assert!(matches!(result, Err(MergeError::Io(_))));
+        assert_eq!(session.accumulator.runs.len(), 0);
+        assert_eq!(session.buffer.items.len(), 3);
+        assert_eq!(session.buffer.active_bytes, 24);
+
+        let mut retained = session.buffer.items.clone();
+        retained.sort_unstable();
+        assert_eq!(retained, vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn session_finish_includes_nonempty_residual_chunk() {
+        let mut session = u64_session(MergeConfig::default());
+        session.buffer.extend([5, 1, 3]);
+
+        let merged = session.finish().expect("finish");
+
+        assert_eq!(collect_unkeyed(merged), vec![1, 3, 5]);
+    }
+
+    #[test]
+    fn empty_session_commit_leaves_zero_private_runs() {
+        let mut session = u64_session(MergeConfig::default());
+
+        session.commit().expect("commit");
+
+        assert_eq!(session.accumulator.runs.len(), 0);
+        assert!(session.buffer.items.is_empty());
+        assert_eq!(session.buffer.active_bytes, 0);
+    }
+
+    #[test]
+    fn empty_finish_creates_no_temp_run_artifact() {
+        let temp_dir = tempfile::tempdir().expect("create temp dir");
+        let sorter = Builder::new()
+            .key(Owned((|v: &u64| *v) as fn(&u64) -> u64))
+            .codec(U64Codec)
+            .max_buffer_items::<u64>(2)
+            .merge_config(MergeConfig {
+                temp_dir: Some(temp_dir.path().to_path_buf()),
+                ..MergeConfig::default()
+            })
+            .build();
+
+        let results: Vec<u64> = sorter
+            .finish()
+            .expect("finish")
+            .map(|r| r.expect("read"))
+            .collect();
+        let artifacts = std::fs::read_dir(temp_dir.path())
+            .expect("read temp dir")
+            .count();
+
+        assert!(results.is_empty());
+        assert_eq!(artifacts, 0);
+    }
+
+    #[test]
+    fn unkeyed_public_push_commits_through_session() {
+        let mut sorter = u64_sorter(2);
+
+        sorter.push(2).expect("push");
+        sorter.push(1).expect("push");
+
+        assert_eq!(sorter.session.accumulator.runs.len(), 1);
+        assert!(sorter.session.buffer.items.is_empty());
+        assert_eq!(sorter.session.buffer.active_bytes, 0);
+    }
+
+    #[test]
+    fn keyed_public_push_commits_through_session() {
+        let mut sorter = u64_keyed_sorter(2);
+
+        sorter.push(22).expect("push");
+        sorter.push(11).expect("push");
+
+        assert_eq!(sorter.session.accumulator.runs.len(), 1);
+        assert!(sorter.session.buffer.items.is_empty());
+        assert_eq!(sorter.session.buffer.active_bytes, 0);
+    }
+
+    #[test]
+    fn item_count_sorter_carries_no_byte_sizing_operation() {
+        let mut sorter = u64_sorter(3);
+
+        sorter.push(10).expect("push");
+
+        assert!(sorter.session.buffer.item_size.is_none());
+        assert_eq!(sorter.session.buffer.active_bytes, 0);
+        assert_eq!(sorter.session.buffer.items, vec![10]);
+    }
+
+    #[test]
+    fn byte_budget_sorter_accounts_and_commits_at_existing_threshold() {
+        let mut sorter = Builder::new()
+            .key(Owned((|v: &u64| *v) as fn(&u64) -> u64))
+            .codec(U64Codec)
+            .memory_budget::<u64>(10, |v| usize::try_from(*v).expect("test value fits usize"))
+            .build();
+
+        sorter.push(4).expect("first push");
+        assert_eq!(sorter.session.accumulator.runs.len(), 0);
+        assert_eq!(sorter.session.buffer.active_bytes, 4);
+        assert_eq!(sorter.session.buffer.items, vec![4]);
+
+        sorter.push(5).expect("second push");
+        assert_eq!(sorter.session.accumulator.runs.len(), 0);
+        assert_eq!(sorter.session.buffer.active_bytes, 9);
+        assert_eq!(sorter.session.buffer.items, vec![4, 5]);
+
+        sorter.push(1).expect("threshold push");
+        assert_eq!(sorter.session.accumulator.runs.len(), 1);
+        assert!(sorter.session.buffer.items.is_empty());
+        assert_eq!(sorter.session.buffer.active_bytes, 0);
+        assert!(sorter.session.buffer.item_size.is_some());
     }
 
     #[test]
