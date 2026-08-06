@@ -297,16 +297,17 @@ where
     #[must_use]
     pub fn build(self) -> Sorter<T, SK, Cod, Cmp, D, CS, Unkeyed> {
         Sorter {
-            sort_key: self.sort_key.0,
-            codec: self.codec.0,
-            compare: self.compare,
+            accumulator: RunAccumulator::new(
+                self.sort_key.0,
+                self.codec.0,
+                self.compare,
+                self.chunk_sort,
+                self.config.merge,
+            ),
             dedup: self.dedup,
-            chunk_sort: self.chunk_sort,
             flush: self.flush.0,
             buffer: Vec::new(),
             buffer_bytes: 0,
-            spilled_runs: Vec::new(),
-            config: self.config,
             _marker: std::marker::PhantomData,
         }
     }
@@ -325,16 +326,17 @@ where
     #[must_use]
     pub fn build(self) -> Sorter<T, SK, Cod, Cmp, D, CS, Keyed> {
         Sorter {
-            sort_key: self.sort_key.0,
-            codec: self.codec.0,
-            compare: self.compare,
+            accumulator: RunAccumulator::new(
+                self.sort_key.0,
+                self.codec.0,
+                self.compare,
+                self.chunk_sort,
+                self.config.merge,
+            ),
             dedup: self.dedup,
-            chunk_sort: self.chunk_sort,
             flush: self.flush.0,
             buffer: Vec::new(),
             buffer_bytes: 0,
-            spilled_runs: Vec::new(),
-            config: self.config,
             _marker: std::marker::PhantomData,
         }
     }
@@ -363,17 +365,96 @@ where
 ///   threading model
 /// - `M`: merge strategy marker ([`Unkeyed`] or [`Keyed`])
 pub struct Sorter<T, SK, Cod, Cmp, D, CS, M = Unkeyed> {
-    sort_key: SK,
-    codec: Cod,
-    compare: Cmp,
+    accumulator: RunAccumulator<T, SK, Cod, Cmp, CS, M>,
     dedup: D,
-    chunk_sort: CS,
     flush: FlushStrategy<T>,
     buffer: Vec<T>,
     buffer_bytes: usize,
-    spilled_runs: Vec<SortedRun>,
-    config: SorterConfig,
     _marker: std::marker::PhantomData<M>,
+}
+
+struct RunAccumulator<T, SK, Cod, Cmp, CS, M> {
+    sort_key: SK,
+    codec: Cod,
+    compare: Cmp,
+    chunk_sort: CS,
+    merge_config: MergeConfig,
+    runs: Vec<SortedRun>,
+    _marker: std::marker::PhantomData<fn() -> (T, M)>,
+}
+
+impl<T, SK, Cod, Cmp, CS, M> RunAccumulator<T, SK, Cod, Cmp, CS, M> {
+    fn new(sort_key: SK, codec: Cod, compare: Cmp, chunk_sort: CS, config: MergeConfig) -> Self {
+        Self {
+            sort_key,
+            codec,
+            compare,
+            chunk_sort,
+            merge_config: config,
+            runs: Vec::new(),
+            _marker: std::marker::PhantomData,
+        }
+    }
+}
+
+impl<T, SK, Cod, Cmp, CS> RunAccumulator<T, SK, Cod, Cmp, CS, Unkeyed>
+where
+    T: 'static,
+    SK: SortKey<T> + Copy + Send + Sync + 'static,
+    Cod: Codec<Item = T> + EncodeRun<T> + Copy + 'static,
+    Cmp: for<'a> Compare<SK::Key<'a>> + Copy + Send + Sync + 'static,
+    CS: ChunkSorter<T>,
+{
+    fn accumulate(&mut self, items: &mut [T]) -> Result<(), MergeError<Cod::Error>> {
+        let item_cmp = KeyCompare::new(self.sort_key, self.compare);
+        self.chunk_sort
+            .sort(items, move |a: &T, b: &T| Compare::compare(&item_cmp, a, b));
+
+        let run_writer = RunWriter::new_unkeyed(self.codec, self.merge_config.clone());
+        let run = run_writer.write_sorted(items)?;
+        self.runs.push(run);
+
+        Ok(())
+    }
+
+    #[allow(clippy::type_complexity)]
+    fn finish(self) -> Result<RunMerge<T, Cod, KeyCompare<SK, Cmp>>, MergeError<Cod::Error>> {
+        let item_cmp = KeyCompare::new(self.sort_key, self.compare);
+        let run_merger = RunMerger::new(self.codec, item_cmp, self.merge_config);
+
+        run_merger.merge(self.runs)
+    }
+}
+
+impl<T, SK, Cod, Cmp, CS> RunAccumulator<T, SK, Cod, Cmp, CS, Keyed>
+where
+    T: 'static,
+    SK: SortKey<T> + Copy + Send + Sync + 'static,
+    Cod: KeyedCodec<Item = T> + EncodeKeyedRun<T> + Copy + 'static,
+    Cmp: for<'a> Compare<SK::Key<'a>> + Compare<Cod::Key> + Copy + Send + Sync + 'static,
+    CS: ChunkSorter<T>,
+{
+    fn accumulate(&mut self, items: &mut [T]) -> Result<(), MergeError<Cod::Error>> {
+        let item_cmp = KeyCompare::new(self.sort_key, self.compare);
+        self.chunk_sort
+            .sort(items, move |a: &T, b: &T| Compare::compare(&item_cmp, a, b));
+
+        let run_writer = RunWriter::new_keyed(self.codec, self.merge_config.clone());
+        let run = run_writer.write_sorted(items)?;
+        self.runs.push(run);
+
+        Ok(())
+    }
+
+    #[allow(clippy::type_complexity)]
+    fn finish(
+        self,
+    ) -> Result<KeyedRunMerge<T, Cod, Cmp, KeyCompare<SK, Cmp>>, MergeError<Cod::Error>> {
+        let item_cmp = KeyCompare::new(self.sort_key, self.compare);
+        let run_merger = RunMerger::new(self.codec, item_cmp, self.merge_config);
+
+        run_merger.merge_keyed(self.runs, self.compare)
+    }
 }
 
 /// Finalized sorted output.
@@ -527,14 +608,7 @@ where
     }
 
     fn flush(&mut self) -> Result<(), MergeError<Cod::Error>> {
-        let item_cmp = KeyCompare::new(self.sort_key, self.compare);
-        self.chunk_sort.sort(&mut self.buffer, move |a: &T, b: &T| {
-            Compare::compare(&item_cmp, a, b)
-        });
-
-        let run_writer = RunWriter::new_unkeyed(self.codec, self.config.merge.clone());
-        let run = run_writer.write_sorted(&self.buffer)?;
-        self.spilled_runs.push(run);
+        self.accumulator.accumulate(&mut self.buffer)?;
         self.buffer.clear();
         self.buffer_bytes = 0;
 
@@ -562,11 +636,8 @@ where
             self.flush()?;
         }
 
-        let item_cmp = KeyCompare::new(self.sort_key, self.compare);
-        let run_merger = RunMerger::new(self.codec, item_cmp, self.config.merge.clone());
-        let merged = run_merger.merge(std::mem::take(&mut self.spilled_runs))?;
-
         let dedup = self.dedup;
+        let merged = self.accumulator.finish()?;
 
         Ok(Sorted::new(dedup.dedup(merged)))
     }
@@ -607,14 +678,7 @@ where
     }
 
     fn flush(&mut self) -> Result<(), MergeError<Cod::Error>> {
-        let item_cmp = KeyCompare::new(self.sort_key, self.compare);
-        self.chunk_sort.sort(&mut self.buffer, move |a: &T, b: &T| {
-            Compare::compare(&item_cmp, a, b)
-        });
-
-        let run_writer = RunWriter::new_keyed(self.codec, self.config.merge.clone());
-        let run = run_writer.write_sorted(&self.buffer)?;
-        self.spilled_runs.push(run);
+        self.accumulator.accumulate(&mut self.buffer)?;
         self.buffer.clear();
         self.buffer_bytes = 0;
 
@@ -642,12 +706,8 @@ where
             self.flush()?;
         }
 
-        let item_cmp = KeyCompare::new(self.sort_key, self.compare);
-        let run_merger = RunMerger::new(self.codec, item_cmp, self.config.merge.clone());
-        let merged =
-            run_merger.merge_keyed(std::mem::take(&mut self.spilled_runs), self.compare)?;
-
         let dedup = self.dedup;
+        let merged = self.accumulator.finish()?;
 
         Ok(Sorted::new(dedup.dedup(merged)))
     }
@@ -659,7 +719,10 @@ mod tests {
 
     use super::*;
     use crate::{
-        codec::{CodecCursor, CodecWriter, EncodeRun},
+        codec::{
+            CodecCursor, CodecWriter, DeriveKey, EncodeKeyedRun, EncodeRun, KeyedCodec,
+            KeyedCodecCursor, KeyedCodecWriter,
+        },
         compare::Reverse,
         dedup::AdjacentDedup,
         key::Owned,
@@ -667,6 +730,9 @@ mod tests {
 
     #[derive(Clone, Copy)]
     struct U64Codec;
+
+    #[derive(Clone, Copy)]
+    struct U64KeyedCodec;
 
     struct U64Writer<W: Write> {
         inner: BufWriter<W>,
@@ -748,6 +814,117 @@ mod tests {
         }
     }
 
+    struct U64OnlyKeyedWriter<W: Write> {
+        inner: BufWriter<W>,
+    }
+
+    impl<W: Write> KeyedCodecWriter<u64, u8> for U64OnlyKeyedWriter<W> {
+        type Error = std::io::Error;
+
+        fn write_keyed(&mut self, item: &u64, key: &u8) -> Result<(), Self::Error> {
+            self.inner.write_all(&[*key])?;
+            self.inner.write_all(&item.to_le_bytes())
+        }
+
+        fn finish(mut self) -> Result<(), Self::Error> {
+            self.inner.flush()
+        }
+    }
+
+    struct U64OnlyKeyedReader<R: Read> {
+        inner: R,
+        current_key: Option<u8>,
+        current: Option<u64>,
+    }
+
+    impl<R: Read> CodecCursor<u64> for U64OnlyKeyedReader<R> {
+        type Error = std::io::Error;
+        type Current<'a>
+            = u64
+        where
+            Self: 'a;
+
+        fn advance(&mut self) -> Result<bool, Self::Error> {
+            let mut key = [0u8; 1];
+            match self.inner.read(&mut key) {
+                Ok(0) => {
+                    self.current_key = None;
+                    self.current = None;
+                    Ok(false)
+                }
+                Ok(_) => {
+                    let mut item = [0u8; 8];
+                    self.inner.read_exact(&mut item)?;
+                    self.current_key = Some(key[0]);
+                    self.current = Some(u64::from_le_bytes(item));
+                    Ok(true)
+                }
+                Err(e) => Err(e),
+            }
+        }
+
+        fn current(&mut self) -> Result<u64, Self::Error> {
+            self.current
+                .ok_or_else(|| std::io::Error::other("current called before advance"))
+        }
+
+        fn with_current<'a, F>(
+            &'a mut self,
+            f: impl FnOnce(Self::Current<'a>) -> F,
+        ) -> Result<F, Self::Error> {
+            self.current().map(f)
+        }
+    }
+
+    impl<R: Read> KeyedCodecCursor<u64, u8> for U64OnlyKeyedReader<R> {
+        fn current_key(&self) -> Result<u8, Self::Error> {
+            self.current_key
+                .ok_or_else(|| std::io::Error::other("current_key called before advance"))
+        }
+    }
+
+    impl Codec for U64KeyedCodec {
+        type Item = u64;
+        type Error = std::io::Error;
+        type Cursor<R: Read> = U64Reader<R>;
+
+        fn cursor<R: Read>(&self, source: R) -> U64Reader<R> {
+            U64Reader {
+                inner: source,
+                current: None,
+            }
+        }
+    }
+
+    impl KeyedCodec for U64KeyedCodec {
+        type Key = u8;
+        type KeyedCursor<R: Read> = U64OnlyKeyedReader<R>;
+
+        fn keyed_cursor<R: Read>(&self, source: R) -> Self::KeyedCursor<R> {
+            U64OnlyKeyedReader {
+                inner: source,
+                current_key: None,
+                current: None,
+            }
+        }
+    }
+
+    impl DeriveKey<u64> for U64KeyedCodec {
+        fn derive_key(&self, item: &u64) -> u8 {
+            u8::try_from(*item / 10).expect("test values should fit in u8")
+        }
+    }
+
+    impl EncodeKeyedRun<u64> for U64KeyedCodec {
+        type KeyedWriter<W: Write> = U64OnlyKeyedWriter<W>;
+
+        fn keyed_writer<W: Write>(&self, dest: W) -> Self::KeyedWriter<W> {
+            U64OnlyKeyedWriter {
+                inner: BufWriter::new(dest),
+            }
+        }
+    }
+
     type U64Sorter = Sorter<u64, Owned<fn(&u64) -> u64>, U64Codec, Natural, Identity, Sequential>;
 
     fn u64_sorter(max_items: usize) -> U64Sorter {
@@ -756,6 +933,52 @@ mod tests {
             .codec(U64Codec)
             .max_buffer_items::<u64>(max_items)
             .build()
+    }
+
+    #[allow(clippy::type_complexity)]
+    fn u64_accumulator(
+        config: MergeConfig,
+    ) -> RunAccumulator<u64, Owned<fn(&u64) -> u64>, U64Codec, Natural, Sequential, Unkeyed> {
+        RunAccumulator::new(
+            Owned((|v: &u64| *v) as fn(&u64) -> u64),
+            U64Codec,
+            Natural,
+            Sequential,
+            config,
+        )
+    }
+
+    #[allow(clippy::type_complexity)]
+    fn u64_keyed_accumulator(
+        config: MergeConfig,
+    ) -> RunAccumulator<u64, Owned<fn(&u64) -> u64>, U64KeyedCodec, Natural, Sequential, Keyed>
+    {
+        RunAccumulator::new(
+            Owned((|v: &u64| *v) as fn(&u64) -> u64),
+            U64KeyedCodec,
+            Natural,
+            Sequential,
+            config,
+        )
+    }
+
+    #[allow(clippy::type_complexity)]
+    fn collect_unkeyed(
+        merged: RunMerge<u64, U64Codec, KeyCompare<Owned<fn(&u64) -> u64>, Natural>>,
+    ) -> Vec<u64> {
+        merged.map(|r| r.expect("read")).collect()
+    }
+
+    #[allow(clippy::type_complexity)]
+    fn collect_keyed(
+        merged: KeyedRunMerge<
+            u64,
+            U64KeyedCodec,
+            Natural,
+            KeyCompare<Owned<fn(&u64) -> u64>, Natural>,
+        >,
+    ) -> Vec<u64> {
+        merged.map(|r| r.expect("read")).collect()
     }
 
     struct TestVisitable {
@@ -794,6 +1017,82 @@ mod tests {
             .map(|r| r.expect("read"))
             .collect();
         assert_eq!(results, vec![42]);
+    }
+
+    #[test]
+    fn unkeyed_accumulator_sorts_and_finalizes_multiple_runs() {
+        let mut accumulator = u64_accumulator(MergeConfig::default());
+        let mut first = vec![9, 3, 7];
+        let mut second = vec![8, 1, 5];
+
+        accumulator.accumulate(&mut first).expect("first run");
+        accumulator.accumulate(&mut second).expect("second run");
+        assert_eq!(accumulator.runs.len(), 2);
+
+        let merged = accumulator.finish().expect("finish");
+        assert_eq!(collect_unkeyed(merged), vec![1, 3, 5, 7, 8, 9]);
+    }
+
+    #[test]
+    fn keyed_accumulator_sorts_and_finalizes_multiple_runs() {
+        let mut accumulator = u64_keyed_accumulator(MergeConfig::default());
+        let mut first = vec![24, 11, 19];
+        let mut second = vec![12, 25, 18];
+
+        accumulator.accumulate(&mut first).expect("first run");
+        accumulator.accumulate(&mut second).expect("second run");
+        assert_eq!(accumulator.runs.len(), 2);
+
+        let merged = accumulator.finish().expect("finish");
+        assert_eq!(collect_keyed(merged), vec![11, 12, 18, 19, 24, 25]);
+    }
+
+    #[test]
+    fn empty_accumulator_finalizes_to_empty_output() {
+        let accumulator = u64_accumulator(MergeConfig::default());
+        assert_eq!(accumulator.runs.len(), 0);
+
+        let merged = accumulator.finish().expect("finish");
+        assert!(collect_unkeyed(merged).is_empty());
+    }
+
+    #[test]
+    fn empty_keyed_accumulator_finalizes_to_empty_output() {
+        let accumulator = u64_keyed_accumulator(MergeConfig::default());
+        assert_eq!(accumulator.runs.len(), 0);
+
+        let merged = accumulator.finish().expect("finish");
+        assert!(collect_keyed(merged).is_empty());
+    }
+
+    #[test]
+    fn failed_accumulation_registers_zero_runs() {
+        let temp_dir = tempfile::tempdir().expect("create temp dir");
+        let config = MergeConfig {
+            temp_dir: Some(temp_dir.path().join("missing")),
+            ..MergeConfig::default()
+        };
+        let mut accumulator = u64_accumulator(config);
+        let mut items = vec![3, 1, 2];
+
+        let result = accumulator.accumulate(&mut items);
+        assert!(matches!(result, Err(MergeError::Io(_))));
+        assert_eq!(accumulator.runs.len(), 0);
+    }
+
+    #[test]
+    fn failed_keyed_accumulation_registers_zero_runs() {
+        let temp_dir = tempfile::tempdir().expect("create temp dir");
+        let config = MergeConfig {
+            temp_dir: Some(temp_dir.path().join("missing")),
+            ..MergeConfig::default()
+        };
+        let mut accumulator = u64_keyed_accumulator(config);
+        let mut items = vec![24, 11, 19];
+
+        let result = accumulator.accumulate(&mut items);
+        assert!(matches!(result, Err(MergeError::Io(_))));
+        assert_eq!(accumulator.runs.len(), 0);
     }
 
     #[test]
