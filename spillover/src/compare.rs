@@ -1,8 +1,8 @@
-//! Key comparison traits and built-in comparators.
+//! Value comparison traits and built-in comparators.
 //!
-//! [`Compare`] defines the *ordering relation* used by the sort
-//! and merge engines. It determines *what order* items end up in,
-//! not *how* the sorting is performed — that is the job of
+//! [`Compare`] defines an *ordering relation* over records or keys.
+//! The configured sorting path determines how these comparisons compose.
+//! It does not choose the sorting algorithm — that is the job of
 //! [`ChunkSorter`](crate::chunk::ChunkSorter).
 //!
 //! `Compare` is deliberately separated from
@@ -17,8 +17,8 @@
 
 use std::{cmp::Ordering, marker::PhantomData};
 
-/// Compare two keys by reference. Implementations define the
-/// ordering used by the sort and merge engines.
+/// Compare two values by reference: records, extracted keys, or stored keys.
+/// The configured sorting path determines how these comparisons compose.
 ///
 /// The `?Sized` bound on `K` allows comparing unsized types like
 /// `[u8]` and `str` directly, which is useful with [`CompareVia`].

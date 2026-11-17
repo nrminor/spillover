@@ -100,8 +100,8 @@ pub trait TakeOwned: CodecCursor {
 /// knows how to create cursors for its format. Cursors hold whatever read-side
 /// state the format needs, such as reusable decode buffers.
 ///
-/// Writing is modeled by [`EncodeRun`] because a run format may be readable as
-/// one owned item type while accepting several write-side item shapes.
+/// Writing is modeled by [`EncodeRun`] because a run format may expose a
+/// borrowed record representation while accepting several write-side item shapes.
 ///
 /// The core crate provides no built-in codecs — implementations
 /// live in domain crates (e.g., `spillover-bio` provides a
@@ -123,7 +123,7 @@ pub trait Codec: Copy {
 
 /// Read sorted runs using an ordinary iterator of owned records.
 ///
-/// Implementing this trait provides [`Codec`] and [`TakeOwned`] automatically.
+/// Implementing this trait provides [`Codec`] with a cursor implementing [`TakeOwned`].
 /// Formats needing borrowed decoder storage may implement [`Codec`] directly.
 pub trait DecodeRun: Copy {
     /// The record yielded by the reader.
@@ -245,11 +245,10 @@ pub trait KeyedCodecWriter<I: ?Sized, K> {
 /// A stateful cursor that separates key access from full record
 /// materialization.
 ///
-/// The merge engine calls [`advance`](CodecCursor::advance) to position the
-/// cursor, [`current_key`](Self::current_key) to feed the heap, and
-/// [`with_current`](CodecCursor::with_current) for the merge winner and for
-/// both records when stored keys tie. Distinct keys can be compared without
-/// accessing full records; tied keys require full-record comparison.
+/// The merge engine uses [`advance`](CodecCursor::advance) to position cursors
+/// and [`current_key`](Self::current_key) for key-first selection. Ties require
+/// borrowed full-record comparison. Winners are visited through
+/// [`with_current`](CodecCursor::with_current) or extracted through [`TakeOwned`].
 pub trait KeyedCodecCursor<K>: CodecCursor {
     /// Return the stored key for the current entry.
     ///
@@ -266,19 +265,15 @@ pub trait KeyedCodecCursor<K>: CodecCursor {
 /// Read-side extension for codecs that store a compact *record key*
 /// alongside each record on disk.
 ///
-/// The record key is a compact, owned representation derived from
-/// the same data as the [`SortKey`](crate::key::SortKey), but
-/// potentially in a different encoding (e.g., 2-bit packed
-/// nucleotides vs. raw ASCII bytes). During the k-way merge, the
-/// heap compares these small fixed-width record keys first. Full-record access
-/// is needed for the winner and for both records when keys tie; codecs may defer
-/// full deserialization until that access.
+/// The record key is an owned value used for key-first merge comparison.
+/// It may use a different encoding from the record (e.g., packed nucleotides
+/// vs. raw ASCII bytes). Full-record comparison resolves ties; codecs may
+/// defer full deserialization until a tie or winner delivery requires it.
 ///
-/// Because the record key and the sort key may use different
-/// representations of the same underlying data, the user's
-/// [`Compare`](crate::compare::Compare) implementation must
-/// handle both types — sorting behaviour cannot be assumed to
-/// transfer between encodings.
+/// The [`SortKey`](crate::key::SortKey) builder path requires its comparator to
+/// support both extracted and stored keys. Complete-order sorting instead uses
+/// [`KeyedOrder::compare_keys`](crate::key::KeyedOrder::compare_keys) and record
+/// comparison. Ordering coherence cannot be assumed to transfer between encodings.
 ///
 /// The merge engine selects between ordinary [`Codec`] cursors and keyed cursors
 /// at compile time based on whether the user calls `.codec()` or

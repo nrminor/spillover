@@ -267,8 +267,7 @@ impl<W: Write, S: SequenceCodec, Q: QualityCodec, N: NameCodec, R: SeqRecordPart
     }
 }
 
-/// Newtype wrapping a keyed [`DryIceWriter`] to implement both
-/// [`CodecWriter`] and [`KeyedCodecWriter`].
+/// Newtype wrapping a keyed [`DryIceWriter`] to implement [`KeyedCodecWriter`].
 pub struct KeyedWriterAdapter<W, S: SequenceCodec, Q: QualityCodec, N: NameCodec, K>(
     DryIceWriter<W, S, Q, N, K>,
 );

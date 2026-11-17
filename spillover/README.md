@@ -4,9 +4,9 @@
 
 It provides reusable sorting primitives and lets you plug in your own:
 
-- sort key extraction (`SortKey`)
+- sort key extraction (`SortKey`) or complete record ordering
 - comparison (`Compare`)
-- temporary on-disk format (`Codec` / `KeyedCodec`)
+- run reading (`DecodeRun` or `Codec` / `KeyedCodec`) and writing (`EncodeRun` / `EncodeKeyedRun`)
 - post-merge deduplication (`Dedup`)
 - in-memory chunk sorting strategy (`ChunkSorter`)
 

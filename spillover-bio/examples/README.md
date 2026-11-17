@@ -10,7 +10,7 @@ These examples focus on `spillover-bio`'s ready-to-use sorting pipeline for sequ
 - [`06_alternate_orders.rs`](./06_alternate_orders.rs): name sorting, length sorting, and reversed sequence order.
 - [`07_arena_backed_ingest.rs`](./07_arena_backed_ingest.rs): arena-backed ingest for amortizing allocation when pushing borrowed record views.
 
-Run an example from the workspace root with:
+Run against the local workspace code, rather than the crates.io release:
 
 ```bash
 cargo run -p spillover-bio --example 01_illumina_quickstart

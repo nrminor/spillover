@@ -5,9 +5,9 @@
 //! packed sequence key bytes, followed by a comparison-based
 //! refinement pass for tiebreaking within equal-key groups.
 //!
-//! The radix sort operates via swaps (`slice::swap`), not copies,
-//! so it works on non-`Copy` record-shaped values without extra
-//! allocation.
+//! Radix partitioning swaps prepared key/index entries in place.
+//! Sorting record-shaped slices allocates temporary entries before
+//! permuting the records.
 
 use std::cmp::Ordering;
 
@@ -29,8 +29,8 @@ use crate::{key::PackedSequenceKey, record::SeqRecordParts};
 ///
 /// This is not a general-purpose comparator sort. It imposes
 /// ascending [`PackedSequenceKey`]
-/// bucket order before calling the supplied comparator, and the
-/// comparator is used only to refine records whose packed keys tie.
+/// bucket order, using the supplied comparator for small buckets
+/// and equal-key refinement.
 /// Use it only when ascending `PackedSequenceKey<N>` is the primary
 /// ordering component of the comparator, such as with
 /// [`SequenceOrder<N>`](crate::sort::SequenceOrder). It is not
@@ -38,13 +38,13 @@ use crate::{key::PackedSequenceKey, record::SeqRecordParts};
 /// ordering, name or length ordering, or arbitrary custom
 /// comparators.
 ///
-/// For small groups (below the insertion threshold), the radix
+/// For small groups (at or below the insertion threshold), the radix
 /// sort falls through to comparison sort directly, avoiding
 /// the overhead of counting and partitioning for tiny slices.
 #[derive(Debug, Clone, Copy)]
 pub struct RadixThenRefine<const N: usize>;
 
-/// Groups smaller than this are sorted by comparison instead
+/// Groups at or below this size are sorted by comparison instead
 /// of continuing the radix recursion. Tuned for the cost of
 /// a 256-bucket counting pass vs. a short comparison sort.
 const INSERTION_THRESHOLD: usize = 64;

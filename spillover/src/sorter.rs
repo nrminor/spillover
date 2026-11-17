@@ -881,26 +881,21 @@ type KeyedRecord<C> = <<C as KeyedCodec>::KeyedCursor<BufReader<File>> as CodecC
 /// A disk-spilling external sorter.
 ///
 /// Push items via [`push`](Self::push), then call
-/// [`finish`](Self::finish) to flush remaining items, merge all
-/// sorted runs, apply deduplication, and produce a sorted output
-/// handle.
+/// [`finish`](Self::finish) to spill residual items, perform required intermediate
+/// merges, and return lazy sorted output with the selected dedup transform.
 ///
 /// Buffered inputs and decoded records may have different representations.
-/// The sort key must support both the input and the selected cursor's record.
+/// The key extractor or complete order must support both representations.
 /// Owned iteration additionally requires the cursor's
 /// [`TakeOwned`](crate::codec::TakeOwned) capability.
 ///
 /// - `T`: the item type being sorted
-/// - `SK`: [`SortKey`] — extracts the value to sort by from each
-///   item (e.g. sequence bytes, a name, a length)
-/// - `Cod`: [`Codec`] — serializes items to/from temporary files
-///   on disk. On the keyed path ([`KeyedCodec`]), the codec also
-///   stores a compact *record key* alongside each item for merge
-///   acceleration
-/// - `Cmp`: [`Compare`] — the ordering relation, applied to both
-///   sort keys (during chunk sort) and record keys (during merge).
-///   These are different representations of the same underlying
-///   data, so the comparator must handle both types
+/// - `SK`: a [`SortKey`] extractor or complete record order;
+///   keyed complete orders also supply stored-key comparison and derivation
+/// - `Cod`: [`Codec`] — reads temporary runs; [`EncodeRun`] and
+///   [`EncodeKeyedRun`] supply writing
+/// - `Cmp`: [`Compare`] on the key-extractor path, supporting extracted
+///   keys and, for keyed merging, stored keys; unused for complete orders
 /// - `D`: [`Dedup`] — post-merge deduplication
 /// - `CS`: [`ChunkSorter`] — in-memory sort algorithm and
 ///   threading model
@@ -2329,8 +2324,8 @@ impl<I> Sorted<I> {
         Self { source }
     }
 
-    /// Consume this sorted output handle and visit items through the
-    /// current-item traversal namespace.
+    /// Consume this output handle into an adapter for callback-scoped
+    /// visits to its fixed record representation.
     pub fn items(self) -> SortedItems<I> {
         SortedItems {
             source: self.source,
@@ -2409,12 +2404,13 @@ where
         self.session.push(item, &self.flush)
     }
 
-    /// Flush remaining items, merge all sorted runs, apply dedup,
-    /// and return finalized sorted output.
+    /// Spill remaining items, perform required intermediate merges,
+    /// and return lazy sorted output with the selected dedup transform.
     ///
     /// # Errors
     ///
-    /// Returns an error if flushing or merging fails.
+    /// Spill and intermediate-merge failures are returned here;
+    /// final-merge failures occur during consumption.
     ///
     #[allow(clippy::type_complexity)]
     pub fn finish(
@@ -2459,12 +2455,13 @@ where
         self.session.push(item, &self.flush)
     }
 
-    /// Flush remaining items, merge all sorted runs, apply dedup,
-    /// and return finalized sorted output.
+    /// Spill remaining items, perform required intermediate merges,
+    /// and return lazy sorted output with the selected dedup transform.
     ///
     /// # Errors
     ///
-    /// Returns an error if flushing or merging fails.
+    /// Spill and intermediate-merge failures are returned here;
+    /// final-merge failures occur during consumption.
     ///
     #[allow(clippy::type_complexity)]
     pub fn finish(

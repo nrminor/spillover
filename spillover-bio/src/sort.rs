@@ -4,10 +4,9 @@
 //! Sort orders bundle a sort key with a compatible dryice record
 //! key and a merge strategy, preventing invalid combinations.
 //!
-//! The primary sort strategy for genomic data is sequence-first
-//! with quality as the tiebreaker, expressed as a tuple key
-//! `(&[u8], &[u8])` whose [`Ord`] implementation compares
-//! sequence first, then quality lexicographically.
+//! Accelerated sequence orders compare packed sequence keys first, then
+//! raw sequence and quality bytes. Exact sequence ordering compares
+//! raw sequence bytes, then quality bytes.
 //!
 //! The [`Builder`] is the main entry point for creating a sorter.
 
@@ -128,8 +127,8 @@ pub trait SortOrder: sealed::Sealed + Copy {
 
     /// Comparator for extracted sort keys and compact merge keys.
     ///
-    /// This is the lower-level comparator used by the generic core sorter and
-    /// keyed merge path after records have been encoded into sorted runs.
+    /// Available for explicit key comparisons; the builder passes the complete
+    /// order to the core sorter.
     type KeyComparator: Copy + Send + Sync + 'static;
 
     /// The merge strategy marker: [`Unkeyed`] or [`Keyed`].
@@ -224,8 +223,8 @@ impl<const N: usize> RecordKeyer for SequenceOrder<N> {
 }
 
 impl<const N: usize> SequenceOrder<N> {
-    /// Opt out of record key acceleration, using the base
-    /// merge path with full record deserialization.
+    /// Switch to exact raw sequence-then-quality ordering
+    /// without record key acceleration.
     #[must_use]
     pub fn unkeyed(self) -> UnkeyedSequenceOrder {
         UnkeyedSequenceOrder
@@ -1031,7 +1030,7 @@ where
     ///
     /// # Errors
     ///
-    /// Returns an error if flushing, merging, or deduplicating output fails.
+    /// Returns an error if flushing or merging fails.
     #[allow(clippy::type_complexity)]
     pub fn finish(
         self,
@@ -1080,7 +1079,7 @@ where
     ///
     /// # Errors
     ///
-    /// Returns an error if flushing, merging, or deduplicating output fails.
+    /// Returns an error if flushing or merging fails.
     #[allow(clippy::type_complexity)]
     pub fn finish(
         self,
@@ -1256,7 +1255,7 @@ impl<Core, St, M> Builder<Core, NeedsCodec, St, M> {
 // Flush strategy selection.
 
 impl<SK, C, CS, S, M> Builder<CoreBuilder<SK, NeedsLimit, CS>, C, S, M> {
-    /// Flush when estimated memory usage exceeds `budget` bytes.
+    /// Set a byte budget for modeled active-window and initial-spill memory.
     /// Requires [`SeqRecord`] to implement `GetSize`.
     #[must_use]
     pub fn measured_budget(

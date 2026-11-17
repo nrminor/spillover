@@ -27,7 +27,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .build();
 
     // A real parser often reuses its own input buffers. Arena-backed ingest still
-    // copies each record, but it copies into sorter-owned storage whose allocation
+    // copies each record into caller-provided arena storage whose allocation
     // can be reused across spill windows.
     for record in [
         ParserRecord {

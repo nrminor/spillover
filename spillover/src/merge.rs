@@ -43,7 +43,7 @@ pub enum MergeError<CE> {
     /// A selected cursor did not provide its current record.
     MissingCurrent,
 
-    /// The codec failed to decode an entry from bytes.
+    /// A codec operation failed.
     Codec(CE),
 }
 

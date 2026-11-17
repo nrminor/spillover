@@ -47,11 +47,10 @@ impl<S> Dedup<S> for Identity {
 /// Drop consecutive items where a predicate says they are equal,
 /// keeping the first item from each run of duplicates.
 ///
-/// Since the stream is sorted, "consecutive" means "all duplicates
-/// are adjacent," so this provides exact deduplication on whatever
-/// the predicate tests. The predicate receives two items by
-/// reference and returns `true` if they should be considered
-/// duplicates.
+/// This provides exact deduplication when the sort order makes all items
+/// equivalent under the predicate contiguous; otherwise only consecutive
+/// duplicates are removed. The predicate receives two items by reference
+/// and returns `true` if they should be considered duplicates.
 ///
 /// Requires `T: Clone` because the iterator must retain the
 /// previous item for comparison while also yielding it to the

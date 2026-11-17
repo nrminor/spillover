@@ -1,13 +1,9 @@
 //! Error types for the spillover crate.
 //!
-//! [`SpilloverError`] covers failures that originate within
-//! spillover itself: I/O errors during flush and merge operations,
-//! and corrupt temporary files. Errors from user-provided trait
-//! implementations (`Codec`, `Dedup`) remain as their concrete
-//! types — spillover does not wrap or erase them. Users compose
-//! these with `SpilloverError` in whatever way suits their
-//! application, whether via a custom enum with `#[from]`, a
-//! boxed trait object, or any other pattern.
+//! Sorter and merge operations return [`MergeError`](crate::merge::MergeError),
+//! preserving codec errors in its `Codec` variant. Borrowed traversal
+//! distinguishes source and sink failures with [`SortedItemsError`].
+//! [`SpilloverError`] is a separate error enum, not the sorter's return type.
 
 /// Errors originating from spillover's own operations.
 ///
@@ -15,11 +11,8 @@
 /// external sort: I/O errors when writing or reading temporary
 /// files, and detection of corrupt (truncated) run files.
 ///
-/// Errors from user-provided `Codec` and `Dedup` implementations
-/// are not included here — they stay as their concrete associated
-/// types. Users who want a unified error type for their pipeline
-/// can wrap `SpilloverError` alongside their codec/dedup errors
-/// in their own enum.
+/// Sorter and merge APIs use [`MergeError`](crate::merge::MergeError) instead,
+/// including its variant for concrete codec errors.
 ///
 /// ```
 /// use spillover::SpilloverError;

@@ -12,9 +12,9 @@
 //! [`KeyedCodec`](crate::codec::KeyedCodec), which is a compact,
 //! owned encoding written to disk for merge acceleration. Both
 //! are derived from the same underlying data, but they may use
-//! different representations — so the
-//! [`Compare`](crate::compare::Compare) trait must be implemented
-//! for both types independently.
+//! different representations. The `SortKey` builder path requires its comparator
+//! to support both; complete-order sorting uses [`KeyedOrder`] for stored keys
+//! and [`Compare`](crate::compare::Compare) for records.
 //!
 //! The key may borrow from the item via a GAT lifetime (e.g.,
 //! `&'a [u8]` for a sequence slice) or may be fully owned (e.g.,
@@ -277,9 +277,8 @@ pub trait SortKey<T: ?Sized> {
 
 /// A [`Compare<T>`](crate::compare::Compare) implementation that
 /// compares items by extracting keys via a [`SortKey`] and
-/// delegating to a key comparator. This bridges the gap between
-/// "compare keys" and "compare items" — the merge engine needs
-/// the latter, but the user provides the former.
+/// delegating to a key comparator. This adapts the `SortKey` builder path
+/// to record comparison; complete-order sorting supplies record comparison directly.
 ///
 /// Cloning a `KeyCompare` is cheap when both the sort key and
 /// comparator are zero-sized types (the common case).

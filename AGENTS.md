@@ -18,6 +18,16 @@ The two crates have a strict dependency direction: `spillover-bio` depends on `s
 
 Prefer fewer, more powerful abstractions over many narrow ones. A trait with one method that covers ten use cases is better than five traits that each cover two. But don't sacrifice clarity for generality — if a single trait is doing too much, it's a sign that the abstraction is wrong, not that you need more surface area.
 
+Treat every public concept as a teaching and maintenance cost. Extension authors are users too: hiding complexity from application callsites is not enough. Evaluate the complete minimal extension implementation, its generic bounds, and the relationships its author must understand—not isolated trait definitions or method counts.
+
+A new public trait must earn its place through a real capability distinction or meaningful leverage. Cleaner private callsites, shorter bounds, or avoiding a qualified method call are not sufficient reasons. Prefer explicit private plumbing when it preserves a smaller, coherent public interface. Check existing library and standard-library capabilities first, but judge reuse by total implementation and teaching cost, not by whether it avoids a custom trait.
+
+Before selecting an interface, show connected application callsites, minimal extension implementations, and the private code they require. Explain how someone would learn it. Compare alternatives where the choice is genuinely open, and distinguish accepted behavior from unresolved trait declarations; filling in declarations is not permission to reopen the architecture. Tie added machinery to the responsibility or duplicated protocol it lets callers delete.
+
+Write code and sketches as a readable sequence, left to right and top to bottom. Use descriptive bindings for intermediate values before passing them to another operation; give derivation, construction, and mutation their own named steps instead of nesting them for compactness. Names should explain each value's role, not merely shorten an expression.
+
+Design construction so applications and extension authors do not need turbofish syntax or know wrapper assembly order. Let configured receivers, input values, and return types determine type arguments; assemble wrappers behind discoverable constructors. Apply the same inference discipline to library internals and sketches. Verify concrete callsites as well as generic helpers.
+
 Treat compiler errors and clippy warnings as information, not obstacles. They are telling you something about the design. A type error during refactoring often reveals that two things you thought were the same are actually different. Listen to that signal.
 
 Be skeptical of convenience methods that obscure what's happening. A user who calls `.sort()` should be able to predict roughly what the library will do (buffer items, flush to disk when full, merge at the end). If the convenience hides behavior that would surprise a careful user, it needs a different name or shouldn't exist.

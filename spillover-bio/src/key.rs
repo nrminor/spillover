@@ -6,9 +6,9 @@
 //! records in dryice files and compared during the merge phase
 //! without deserializing full records.
 //!
-//! 2-bit packing via [`bitnuc`] gives 4 bases per byte. The
-//! packed representation preserves lexicographic order — byte-level
-//! comparison gives the same ordering as base-level comparison.
+//! Two-bit packing stores four bases per byte in A < C < G < T order.
+//! Case folding, ambiguous-base mapping, truncation, and padding can make
+//! packed-key order differ from raw-byte order.
 //!
 //! Type aliases are provided for common read lengths:
 //! - [`IlluminaKey`]: 38 bytes = 152 bases (covers 150bp reads)
@@ -44,11 +44,11 @@ const fn make_tag(n: usize) -> [u8; 16] {
 /// For reads shorter than `N * 4` bases, the remaining bytes
 /// are zero-padded. Because A encodes as `0b00` (the same as
 /// padding), sequences that differ only by trailing A's versus
-/// truncation will receive identical packed keys. This means
-/// packed key ordering is exact when all sequences are at least
-/// `N * 4` bases long. For mixed-length inputs where some
-/// sequences are shorter than the key capacity, use the unkeyed
-/// sort path (`SequenceOrder.unkeyed()`) for exact ordering.
+/// truncation will receive identical packed keys. Packed keys alone do not
+/// define exact raw-byte order. [`SequenceOrder`](crate::sort::SequenceOrder)
+/// refines equal keys with full sequence and quality comparisons; use
+/// [`Builder::sort_by_sequence_exact`](crate::sort::Builder::sort_by_sequence_exact)
+/// for exact raw-byte ordering.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct PackedSequenceKey<const N: usize>(pub [u8; N]);
 

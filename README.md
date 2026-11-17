@@ -12,16 +12,16 @@
 
 The core crate is intentionally unopinionated: it knows how to spill sorted runs to disk and merge them back, but leaves domain behavior to user-provided traits. You can plug in your own implementations for:
 
-1. sort key extraction (`SortKey`)
+1. sort key extraction (`SortKey`) or complete record ordering
 2. comparison (`Compare`)
-3. on-disk format (`Codec` / `KeyedCodec`)
+3. run reading (`DecodeRun` or `Codec` / `KeyedCodec`) and writing (`EncodeRun` / `EncodeKeyedRun`)
 4. post-merge deduplication (`Dedup`)
 5. in-memory chunk sorting strategy (`ChunkSorter`)
 6. flush strategy (byte-based or item-count based budgets)
 
 `spillover-bio` builds on `spillover` with genomics-focused defaults and convenience APIs. It uses [`dryice`](https://github.com/nrminor/dryice) for temporary on-disk storage, includes packed sequence keys for keyed merge acceleration, provides FASTQ/FASTA-friendly record handling, and includes practical sort orders (sequence, quality tiebreaking, name, length, reverse order).
 
-That said, `spillover-bio` is still extensible: users can choose codecs, sort orders, dedup strategies, and flush controls. When you need full control, you can always drop down to `spillover` directly.
+That said, `spillover-bio` is still extensible: users can configure dryice encodings, sort orders, built-in deduplication modes, and flush controls. When you need full control, you can always drop down to `spillover` directly.
 
 Here is a small `spillover-bio` quickstart:
 
@@ -30,9 +30,9 @@ use spillover_bio::{codec::DryIceCodec, record::SeqRecord, sort::Builder};
 
 fn rec(name: &str, seq: &str, qual: &str) -> SeqRecord {
     SeqRecord::new(
-        name.as_bytes().to_vec(),
-        seq.as_bytes().to_vec(),
-        qual.as_bytes().to_vec(),
+        name.as_bytes(),
+        seq.as_bytes(),
+        qual.as_bytes(),
     )
 }
 
@@ -78,7 +78,7 @@ cargo add spillover-bio
 ### First steps
 
 - If you want a ready-to-use genomics pipeline, start with `spillover-bio`.
-- If you need a custom domain pipeline, start with `spillover` and implement your own `Codec` and `SortKey`.
+- If you need a custom domain pipeline, start with `spillover` and provide ordering plus run-reading and run-writing implementations.
 - Use small buffer budgets in development to force spills and validate merge behavior early.
 
 You can run examples from this workspace root:
@@ -112,14 +112,14 @@ At a high level, both crates follow the same pipeline:
 
 Put another way, in `spillover`, sorting is an engine with interchangeable parts:
 
-- Define what order means by choosing a `SortKey` and `Compare` pair. `SortKey` is the item you sort on, and `Compare` defines the sorting algorithm.
-- Define how temporary runs are represented with `Codec` (or `KeyedCodec` when you can store compact precomputed keys). These types describe how records are represented on disk as well as how they should be parsed and written.
+- Define ordering with a `SortKey`/`Compare` pair or a complete record order; keyed complete orders also implement `KeyedOrder` for stored-key comparison. `ChunkSorter` selects the in-memory sorting algorithm.
+- Define temporary-run reading with `DecodeRun` for ordinary owned-record iterators, or `Codec` / `KeyedCodec` for cursors; define writing with `EncodeRun` / `EncodeKeyedRun`.
 - Define what "duplicate" means in your domain with `Dedup`. Custom deduplication logic can be introduced with this interface.
-- Define memory behavior explicitly with flush budgets (`measured_budget`, `max_buffer_items`, etc.). `spillover` ultimately uses n-way merge sorting. The budgets provided here determine when `spillover` flushes batches from memory onto disk to keep memory usage constant.
+- Control spilling with byte budgets (`measured_budget`) or item limits (`max_buffer_items`); these are not hard limits on total process memory.
 
 Three practical mental models help when designing a pipeline:
 
-1. **Sort semantics are a contract.** Your key/comparator pair should fully capture the order your downstream logic depends on.
+1. **Sort semantics are a contract.** Your configured order must capture the order your downstream logic depends on, including stored-key comparisons and record tie-breaking.
 2. **Disk format is a performance lever.** Better temporary encodings and keyed merge support can significantly reduce merge-time work.
 3. **Memory limits are part of correctness.** Budgets are not tuning afterthoughts; they define when data spills and therefore how the algorithm behaves at scale.
 
