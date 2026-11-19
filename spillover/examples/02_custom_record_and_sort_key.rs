@@ -1,7 +1,8 @@
 use std::io::{BufRead, BufReader, BufWriter, Write};
 
 use spillover::{
-    codec::{Codec, CodecCursor, CodecWriter, EncodeRun},
+    codec::{CodecWriter, DecodeRun, EncodeRun},
+    key::Owned,
     sorter::Builder,
 };
 
@@ -38,22 +39,14 @@ impl<W: Write> CodecWriter<LogEvent> for LogWriter<W> {
 struct LogReader<R: std::io::Read> {
     inner: BufReader<R>,
     line: String,
-    current: Option<LogEvent>,
 }
 
-impl<R: std::io::Read> CodecCursor<LogEvent> for LogReader<R> {
-    type Error = std::io::Error;
-    type Current<'a>
-        = &'a LogEvent
-    where
-        Self: 'a;
-
-    fn advance(&mut self) -> Result<bool, Self::Error> {
+impl<R: std::io::Read> LogReader<R> {
+    fn read_event(&mut self) -> std::io::Result<Option<LogEvent>> {
         self.line.clear();
         let n = self.inner.read_line(&mut self.line)?;
         if n == 0 {
-            self.current = None;
-            return Ok(false);
+            return Ok(None);
         }
 
         let mut parts = self.line.trim_end().splitn(3, '\t');
@@ -77,42 +70,33 @@ impl<R: std::io::Read> CodecCursor<LogEvent> for LogReader<R> {
             )
         })?;
 
-        self.current = Some(LogEvent {
+        let event = LogEvent {
             timestamp,
             level,
             message: msg.to_string(),
-        });
-        Ok(true)
-    }
-
-    fn current(&mut self) -> Result<LogEvent, Self::Error> {
-        self.current
-            .take()
-            .ok_or_else(|| std::io::Error::other("current called before advance"))
-    }
-
-    fn with_current<'a, T>(
-        &'a mut self,
-        f: impl FnOnce(Self::Current<'a>) -> T,
-    ) -> Result<T, Self::Error> {
-        match self.current.as_ref() {
-            Some(current) => Ok(f(current)),
-            None => Err(std::io::Error::other("current called before advance")),
-        }
+        };
+        Ok(Some(event))
     }
 }
 
-impl Codec for LogCodec {
-    type Item = LogEvent;
-    type Error = std::io::Error;
-    type Cursor<R: std::io::Read> = LogReader<R>;
+impl<R: std::io::Read> Iterator for LogReader<R> {
+    type Item = std::io::Result<LogEvent>;
 
-    fn cursor<R: std::io::Read>(&self, source: R) -> Self::Cursor<R> {
-        LogReader {
+    fn next(&mut self) -> Option<Self::Item> {
+        self.read_event().transpose()
+    }
+}
+
+impl DecodeRun for LogCodec {
+    type Record = LogEvent;
+    type Error = std::io::Error;
+    type Reader<R: std::io::Read> = LogReader<R>;
+
+    fn reader<R: std::io::Read>(&self, source: R) -> Result<Self::Reader<R>, Self::Error> {
+        Ok(LogReader {
             inner: BufReader::new(source),
             line: String::new(),
-            current: None,
-        }
+        })
     }
 }
 
@@ -128,9 +112,9 @@ impl EncodeRun<LogEvent> for LogCodec {
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut sorter = Builder::new()
-        .key(spillover::key::Owned(|e: &LogEvent| (e.level, e.timestamp)))
+        .key(Owned(|e: &LogEvent| (e.level, e.timestamp)))
         .codec(LogCodec)
-        .max_buffer_items::<LogEvent>(2)
+        .max_buffer_items(2)
         .build();
 
     let input = [
@@ -160,7 +144,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         sorter.push(event)?;
     }
 
-    let output: Vec<LogEvent> = sorter.finish()?.collect::<Result<Vec<_>, _>>()?;
+    let output_stream = sorter.finish()?;
+    let collected: Result<Vec<LogEvent>, _> = output_stream.collect();
+    let output = collected?;
     for event in output {
         println!("L{} @ {}: {}", event.level, event.timestamp, event.message);
     }

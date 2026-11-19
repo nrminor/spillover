@@ -3,7 +3,7 @@ use std::io::{BufReader, BufWriter, Read, Write};
 use spillover::{
     codec::{
         Codec, CodecCursor, DeriveKey, EncodeKeyedRun, KeyedCodec, KeyedCodecCursor,
-        KeyedCodecWriter,
+        KeyedCodecWriter, TakeOwned,
     },
     key::Owned,
     sorter::Builder,
@@ -35,12 +35,9 @@ struct Reader<R: Read> {
     current: Option<u64>,
 }
 
-impl<R: Read> CodecCursor<u64> for Reader<R> {
+impl<R: Read> CodecCursor for Reader<R> {
     type Error = std::io::Error;
-    type Current<'a>
-        = u64
-    where
-        Self: 'a;
+    type Record = u64;
 
     fn advance(&mut self) -> Result<bool, Self::Error> {
         let mut key = [0_u8; 1];
@@ -61,20 +58,24 @@ impl<R: Read> CodecCursor<u64> for Reader<R> {
         }
     }
 
-    fn current(&mut self) -> Result<u64, Self::Error> {
-        self.current
-            .ok_or_else(|| std::io::Error::other("current called before advance"))
-    }
-
-    fn with_current<'a, T>(
-        &'a mut self,
-        f: impl FnOnce(Self::Current<'a>) -> T,
-    ) -> Result<T, Self::Error> {
-        self.current().map(f)
+    fn with_current<T>(&mut self, f: impl FnOnce(&Self::Record) -> T) -> Result<T, Self::Error> {
+        let record = self
+            .current
+            .as_ref()
+            .ok_or_else(|| std::io::Error::other("current called before advance"))?;
+        Ok(f(record))
     }
 }
 
-impl<R: Read> KeyedCodecCursor<u64, u8> for Reader<R> {
+impl<R: Read> TakeOwned for Reader<R> {
+    type Owned = u64;
+
+    fn take_owned(&mut self) -> Result<Option<Self::Owned>, Self::Error> {
+        Ok(self.current.take())
+    }
+}
+
+impl<R: Read> KeyedCodecCursor<u8> for Reader<R> {
     fn current_key(&self) -> Result<u8, Self::Error> {
         self.current_key.ok_or_else(|| {
             std::io::Error::new(
@@ -86,16 +87,15 @@ impl<R: Read> KeyedCodecCursor<u64, u8> for Reader<R> {
 }
 
 impl Codec for DecadeKeyedCodec {
-    type Item = u64;
     type Error = std::io::Error;
     type Cursor<R: Read> = Reader<R>;
 
-    fn cursor<R: Read>(&self, source: R) -> Self::Cursor<R> {
-        Reader {
+    fn cursor<R: Read>(&self, source: R) -> Result<Self::Cursor<R>, Self::Error> {
+        Ok(Reader {
             inner: BufReader::new(source),
             current_key: None,
             current: None,
-        }
+        })
     }
 }
 
@@ -103,7 +103,7 @@ impl KeyedCodec for DecadeKeyedCodec {
     type Key = u8;
     type KeyedCursor<R: Read> = Reader<R>;
 
-    fn keyed_cursor<R: Read>(&self, source: R) -> Self::KeyedCursor<R> {
+    fn keyed_cursor<R: Read>(&self, source: R) -> Result<Self::KeyedCursor<R>, Self::Error> {
         self.cursor(source)
     }
 }
@@ -128,14 +128,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut sorter = Builder::new()
         .key(Owned(|v: &u64| *v))
         .keyed_codec(DecadeKeyedCodec)
-        .max_buffer_items::<u64>(2)
+        .max_buffer_items(2)
         .build();
 
     for value in [19_u64, 11, 25, 12, 18, 26] {
         sorter.push(value)?;
     }
 
-    let output: Vec<u64> = sorter.finish()?.collect::<Result<Vec<_>, _>>()?;
+    let output_stream = sorter.finish()?;
+    let collected: Result<Vec<u64>, _> = output_stream.collect();
+    let output = collected?;
     println!("keyed merge output: {output:?}");
 
     Ok(())

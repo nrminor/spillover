@@ -1,7 +1,23 @@
 //! End-to-end integration tests for the spillover-bio sort pipeline.
 
+use std::{
+    cmp::Ordering,
+    convert::Infallible,
+    io::{self, Read, Write},
+    num::NonZeroUsize,
+};
+
 use dryice::SeqRecordLike;
+use spillover::SortedItemsError;
+use spillover::codec::{
+    Codec, CodecCursor, CodecWriter, DecodeRun, DeriveKey, EncodeKeyedRun, EncodeRun, KeyedCodec,
+    KeyedCodecCursor, KeyedCodecWriter, TakeOwned,
+};
 use spillover::compare::Compare;
+use spillover::dedup::Dedup;
+use spillover::key::{Owned, SortKey};
+use spillover::merge::{MergeConfig, MergeError, RunMerger};
+use spillover::sorter::VisitSortedItems;
 use spillover_bio::{
     codec::DryIceCodec,
     error::SortedRecordStreamError,
@@ -11,6 +27,805 @@ use spillover_bio::{
         Builder, ILLUMINA_ORDER, LENGTH_ORDER, NAME_ORDER, Reverse, SeqRecordSink, SequenceOrder,
     },
 };
+use thiserror::Error;
+
+struct Number(u8);
+
+#[derive(Clone, Copy)]
+struct NumberCodec;
+
+struct NumberReader<R>(R);
+
+struct NumberWriter<W>(W);
+
+impl<R: Read> Iterator for NumberReader<R> {
+    type Item = io::Result<Number>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let mut byte = [0];
+        match self.0.read(&mut byte) {
+            Ok(0) => None,
+            Ok(_) => Some(Ok(Number(byte[0]))),
+            Err(error) => Some(Err(error)),
+        }
+    }
+}
+
+impl DecodeRun for NumberCodec {
+    type Record = Number;
+    type Error = io::Error;
+    type Reader<R: Read> = NumberReader<R>;
+
+    fn reader<R: Read>(&self, source: R) -> io::Result<Self::Reader<R>> {
+        Ok(NumberReader(source))
+    }
+}
+
+impl EncodeRun<Number> for NumberCodec {
+    type Writer<W: Write> = NumberWriter<W>;
+
+    fn writer<W: Write>(&self, destination: W) -> Self::Writer<W> {
+        NumberWriter(destination)
+    }
+}
+
+impl<W: Write> CodecWriter<Number> for NumberWriter<W> {
+    type Error = io::Error;
+
+    fn write(&mut self, item: &Number) -> io::Result<()> {
+        self.0.write_all(&[item.0])
+    }
+
+    fn finish(mut self) -> io::Result<()> {
+        self.0.flush()
+    }
+}
+
+#[test]
+fn ordinary_decode_run_moves_non_clone_records_across_spills() {
+    let sort_key = Owned(|record: &Number| record.0);
+    let mut sorter = spillover::sorter::Builder::new()
+        .key(sort_key)
+        .codec(NumberCodec)
+        .max_buffer_items(1)
+        .build();
+
+    for value in [3, 1, 2] {
+        let record = Number(value);
+        sorter.push(record).expect("push");
+    }
+
+    let output_stream = sorter.finish().expect("finish");
+    let values: Vec<u8> = output_stream.map(|item| item.expect("decode").0).collect();
+    assert_eq!(values, [1, 2, 3]);
+}
+
+#[derive(Clone, Copy)]
+struct ByteCodec;
+
+#[derive(Clone, Copy)]
+struct ByteKey;
+
+struct ByteCursor<R> {
+    source: R,
+    current: Vec<u8>,
+}
+
+struct ByteWriter<W>(W);
+
+impl Codec for ByteCodec {
+    type Error = io::Error;
+    type Cursor<R: Read> = ByteCursor<R>;
+
+    fn cursor<R: Read>(&self, source: R) -> io::Result<Self::Cursor<R>> {
+        Ok(ByteCursor {
+            source,
+            current: Vec::new(),
+        })
+    }
+}
+
+impl<R: Read> CodecCursor for ByteCursor<R> {
+    type Record = [u8];
+    type Error = io::Error;
+
+    fn advance(&mut self) -> io::Result<bool> {
+        self.current.clear();
+        let mut length_prefix = [0_u8; 1];
+        if self.source.read(&mut length_prefix)? == 0 {
+            return Ok(false);
+        }
+
+        let record_length = usize::from(length_prefix[0]);
+        self.current.resize(record_length, 0);
+        self.source.read_exact(&mut self.current)?;
+        Ok(true)
+    }
+
+    fn with_current<Output>(
+        &mut self,
+        visit: impl FnOnce(&Self::Record) -> Output,
+    ) -> io::Result<Output> {
+        Ok(visit(self.current.as_slice()))
+    }
+}
+
+impl<I: ?Sized + AsRef<[u8]>> EncodeRun<I> for ByteCodec {
+    type Writer<W: Write> = ByteWriter<W>;
+
+    fn writer<W: Write>(&self, destination: W) -> Self::Writer<W> {
+        ByteWriter(destination)
+    }
+}
+
+impl<I: ?Sized + AsRef<[u8]>, W: Write> CodecWriter<I> for ByteWriter<W> {
+    type Error = io::Error;
+
+    fn write(&mut self, item: &I) -> io::Result<()> {
+        let bytes = item.as_ref();
+        let record_length = u8::try_from(bytes.len())
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
+        let length_prefix = [record_length];
+        self.0.write_all(&length_prefix)?;
+        self.0.write_all(bytes)
+    }
+
+    fn finish(mut self) -> io::Result<()> {
+        self.0.flush()
+    }
+}
+
+impl<I: ?Sized + AsRef<[u8]>> SortKey<I> for ByteKey {
+    type Key<'a>
+        = &'a [u8]
+    where
+        I: 'a;
+
+    fn key<'a>(&self, item: &'a I) -> Self::Key<'a> {
+        item.as_ref()
+    }
+}
+
+#[test]
+fn advanced_unsized_records_support_borrowed_output_across_spills() {
+    let mut sorter = spillover::sorter::Builder::new()
+        .key(ByteKey)
+        .codec(ByteCodec)
+        .max_buffer_items(1)
+        .build();
+
+    for record in [vec![3], vec![1, 2], vec![1]] {
+        sorter.push(record).expect("push");
+    }
+
+    let output_stream = sorter.finish().expect("finish");
+    let mut observed = Vec::new();
+    output_stream
+        .visit_items(|record: &[u8]| -> Result<(), Infallible> {
+            let copied_bytes = record.to_vec();
+            observed.push(copied_bytes);
+            Ok(())
+        })
+        .expect("borrowed output");
+
+    assert_eq!(observed, vec![vec![1], vec![1, 2], vec![3]]);
+}
+
+struct ScoredRecord {
+    identity: u8,
+    score: u8,
+}
+
+#[derive(Debug, PartialEq, Eq, PartialOrd, Ord)]
+struct StoredScore(u8);
+
+#[derive(Clone, Copy)]
+struct ScoreCodec;
+
+struct ScoreCursor<R> {
+    source: R,
+    current: Option<(ScoredRecord, u8)>,
+}
+
+struct ScoreWriter<W>(W);
+
+#[derive(Debug, Error)]
+enum ScoreCodecError {
+    #[error(transparent)]
+    Io(#[from] io::Error),
+    #[error("unknown record identity {0}")]
+    UnknownIdentity(u8),
+    #[error("record {identity} requires original key {expected}, received {supplied}")]
+    KeyMismatch {
+        identity: u8,
+        expected: u8,
+        supplied: u8,
+    },
+}
+
+impl Codec for ScoreCodec {
+    type Error = ScoreCodecError;
+    type Cursor<R: Read> = ScoreCursor<R>;
+
+    fn cursor<R: Read>(&self, source: R) -> Result<Self::Cursor<R>, Self::Error> {
+        Ok(ScoreCursor {
+            source,
+            current: None,
+        })
+    }
+}
+
+impl KeyedCodec for ScoreCodec {
+    type Key = StoredScore;
+    type KeyedCursor<R: Read> = ScoreCursor<R>;
+
+    fn keyed_cursor<R: Read>(&self, source: R) -> Result<Self::KeyedCursor<R>, Self::Error> {
+        self.cursor(source)
+    }
+}
+
+impl<R: Read> CodecCursor for ScoreCursor<R> {
+    type Record = ScoredRecord;
+    type Error = ScoreCodecError;
+
+    fn advance(&mut self) -> Result<bool, Self::Error> {
+        self.current = None;
+        let mut encoded = [0_u8; 2];
+        if self.source.read(&mut encoded[..1])? == 0 {
+            return Ok(false);
+        }
+        self.source.read_exact(&mut encoded[1..])?;
+
+        let [identity, stored_score] = encoded;
+        let record = ScoredRecord { identity, score: 0 };
+        self.current = Some((record, stored_score));
+        Ok(true)
+    }
+
+    fn with_current<Output>(
+        &mut self,
+        visit: impl FnOnce(&Self::Record) -> Output,
+    ) -> Result<Output, Self::Error> {
+        let (record, _) = self
+            .current
+            .as_ref()
+            .expect("current access requires a positioned cursor");
+        Ok(visit(record))
+    }
+}
+
+impl<R: Read> KeyedCodecCursor<StoredScore> for ScoreCursor<R> {
+    fn current_key(&self) -> Result<StoredScore, Self::Error> {
+        let (_, stored_score) = self
+            .current
+            .as_ref()
+            .expect("key access requires a positioned cursor");
+        Ok(StoredScore(*stored_score))
+    }
+}
+
+impl DeriveKey<ScoredRecord> for ScoreCodec {
+    fn derive_key(&self, item: &ScoredRecord) -> StoredScore {
+        StoredScore(item.score)
+    }
+}
+
+impl EncodeKeyedRun<ScoredRecord> for ScoreCodec {
+    type KeyedWriter<W: Write> = ScoreWriter<W>;
+
+    fn keyed_writer<W: Write>(&self, destination: W) -> Self::KeyedWriter<W> {
+        ScoreWriter(destination)
+    }
+}
+
+impl<W: Write> KeyedCodecWriter<ScoredRecord, StoredScore> for ScoreWriter<W> {
+    type Error = ScoreCodecError;
+
+    fn write_keyed(&mut self, item: &ScoredRecord, key: &StoredScore) -> Result<(), Self::Error> {
+        let expected = match item.identity {
+            b'a' => 9,
+            b'b' => 8,
+            b'c' => 7,
+            b'd' => 6,
+            b'e' => 5,
+            b'f' => 4,
+            b'g' => 3,
+            b'h' => 2,
+            b'i' => 1,
+            identity => return Err(ScoreCodecError::UnknownIdentity(identity)),
+        };
+        if key.0 != expected {
+            return Err(ScoreCodecError::KeyMismatch {
+                identity: item.identity,
+                expected,
+                supplied: key.0,
+            });
+        }
+
+        let encoded = [item.identity, key.0];
+        self.0.write_all(&encoded)?;
+        Ok(())
+    }
+
+    fn finish(mut self) -> Result<(), Self::Error> {
+        self.0.flush()?;
+        Ok(())
+    }
+}
+
+#[test]
+fn keyed_merge_preserves_original_keys_across_multiple_spill_generations() {
+    let mut merge_config = MergeConfig::default();
+    let max_fan_in = NonZeroUsize::new(2).expect("two is nonzero");
+    merge_config.max_fan_in = max_fan_in;
+    let sort_key = Owned(|record: &ScoredRecord| record.score);
+    let mut sorter = spillover::sorter::Builder::new()
+        .key(sort_key)
+        .keyed_codec(ScoreCodec)
+        .merge_config(merge_config)
+        .max_buffer_items(1)
+        .build();
+
+    for (identity, score) in [
+        (b'a', 9),
+        (b'b', 8),
+        (b'c', 7),
+        (b'd', 6),
+        (b'e', 5),
+        (b'f', 4),
+        (b'g', 3),
+        (b'h', 2),
+        (b'i', 1),
+    ] {
+        let record = ScoredRecord { identity, score };
+        sorter.push(record).expect("push with original key");
+    }
+
+    let output_stream = sorter.finish().expect("merge with original keys");
+    let mut observed = Vec::new();
+    output_stream
+        .visit_items(|record: &ScoredRecord| -> Result<(), Infallible> {
+            observed.push(record.identity);
+            Ok(())
+        })
+        .expect("borrowed output");
+
+    assert_eq!(
+        observed,
+        [b'i', b'h', b'g', b'f', b'e', b'd', b'c', b'b', b'a']
+    );
+}
+
+#[derive(Clone, Copy)]
+struct RejectTwoCodec;
+
+struct RejectTwoReader<R>(R);
+
+struct RejectTwoWriter<W>(W);
+
+#[derive(Debug, Error)]
+enum NumberDecodeError {
+    #[error(transparent)]
+    Io(#[from] io::Error),
+    #[error("rejected encoded byte {0}")]
+    RejectedByte(u8),
+}
+
+impl<R: Read> Iterator for RejectTwoReader<R> {
+    type Item = Result<Number, NumberDecodeError>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let mut byte = [0_u8; 1];
+        match self.0.read(&mut byte) {
+            Ok(0) => None,
+            Ok(_) if byte[0] == 2 => Some(Err(NumberDecodeError::RejectedByte(2))),
+            Ok(_) => Some(Ok(Number(byte[0]))),
+            Err(error) => Some(Err(error.into())),
+        }
+    }
+}
+
+impl DecodeRun for RejectTwoCodec {
+    type Record = Number;
+    type Error = NumberDecodeError;
+    type Reader<R: Read> = RejectTwoReader<R>;
+
+    fn reader<R: Read>(&self, source: R) -> Result<Self::Reader<R>, Self::Error> {
+        Ok(RejectTwoReader(source))
+    }
+}
+
+impl EncodeRun<Number> for RejectTwoCodec {
+    type Writer<W: Write> = RejectTwoWriter<W>;
+
+    fn writer<W: Write>(&self, destination: W) -> Self::Writer<W> {
+        RejectTwoWriter(destination)
+    }
+}
+
+impl<W: Write> CodecWriter<Number> for RejectTwoWriter<W> {
+    type Error = NumberDecodeError;
+
+    fn write(&mut self, item: &Number) -> Result<(), Self::Error> {
+        let encoded = [item.0];
+        self.0.write_all(&encoded)?;
+        Ok(())
+    }
+
+    fn finish(mut self) -> Result<(), Self::Error> {
+        self.0.flush()?;
+        Ok(())
+    }
+}
+
+#[test]
+fn owned_delivery_precedes_refill_error_and_fuses() {
+    let sort_key = Owned(|record: &Number| record.0);
+    let mut sorter = spillover::sorter::Builder::new()
+        .key(sort_key)
+        .codec(RejectTwoCodec)
+        .max_buffer_items(3)
+        .build();
+
+    let deliverable_record = Number(1);
+    sorter.push(deliverable_record).expect("push one");
+    let rejected_record = Number(2);
+    sorter.push(rejected_record).expect("push two");
+    let trailing_record = Number(3);
+    sorter.push(trailing_record).expect("push three");
+    let mut output_stream = sorter.finish().expect("finish");
+
+    let first = output_stream.next();
+    assert!(matches!(first, Some(Ok(Number(1)))));
+
+    let failure = output_stream.next();
+    assert!(matches!(
+        failure,
+        Some(Err(MergeError::Codec(NumberDecodeError::RejectedByte(2))))
+    ));
+    assert!(output_stream.next().is_none());
+}
+
+#[derive(Clone, Copy)]
+struct MissingCurrentCodec;
+
+struct MissingCurrentCursor<R> {
+    reader: NumberReader<R>,
+    current: Option<Number>,
+}
+
+impl Codec for MissingCurrentCodec {
+    type Error = io::Error;
+    type Cursor<R: Read> = MissingCurrentCursor<R>;
+
+    fn cursor<R: Read>(&self, source: R) -> io::Result<Self::Cursor<R>> {
+        let reader = NumberReader(source);
+        Ok(MissingCurrentCursor {
+            reader,
+            current: None,
+        })
+    }
+}
+
+impl EncodeRun<Number> for MissingCurrentCodec {
+    type Writer<W: Write> = NumberWriter<W>;
+
+    fn writer<W: Write>(&self, destination: W) -> Self::Writer<W> {
+        NumberWriter(destination)
+    }
+}
+
+impl<R: Read> CodecCursor for MissingCurrentCursor<R> {
+    type Record = Number;
+    type Error = io::Error;
+
+    fn advance(&mut self) -> io::Result<bool> {
+        self.current = None;
+        let decoded = self.reader.next().transpose()?;
+        let positioned = decoded.is_some();
+        self.current = decoded;
+        Ok(positioned)
+    }
+
+    fn with_current<Output>(
+        &mut self,
+        visit: impl FnOnce(&Self::Record) -> Output,
+    ) -> io::Result<Output> {
+        let record = self
+            .current
+            .as_ref()
+            .expect("current access requires a positioned cursor");
+        Ok(visit(record))
+    }
+}
+
+impl<R: Read> TakeOwned for MissingCurrentCursor<R> {
+    type Owned = Number;
+
+    fn take_owned(&mut self) -> io::Result<Option<Self::Owned>> {
+        let record = self.current.take().filter(|record| record.0 != 1);
+        Ok(record)
+    }
+}
+
+#[test]
+fn selected_missing_current_is_terminal() {
+    let sort_key = Owned(|record: &Number| record.0);
+    let mut sorter = spillover::sorter::Builder::new()
+        .key(sort_key)
+        .codec(MissingCurrentCodec)
+        .max_buffer_items(2)
+        .build();
+
+    let selected_record = Number(1);
+    sorter.push(selected_record).expect("push one");
+    let later_record = Number(2);
+    sorter.push(later_record).expect("push two");
+    let mut output_stream = sorter.finish().expect("finish");
+
+    let failure = output_stream.next();
+    assert!(matches!(failure, Some(Err(MergeError::MissingCurrent))));
+    assert!(output_stream.next().is_none());
+}
+
+#[derive(Clone, Copy)]
+struct DistinctProjectionCodec;
+
+struct KeyedNumberCursor<R> {
+    source: R,
+    current: Option<(Number, u8)>,
+}
+
+struct KeyedNumberWriter<W>(W);
+
+impl Codec for DistinctProjectionCodec {
+    type Error = io::Error;
+    type Cursor<R: Read> = ByteCursor<R>;
+
+    fn cursor<R: Read>(&self, source: R) -> io::Result<Self::Cursor<R>> {
+        ByteCodec.cursor(source)
+    }
+}
+
+impl KeyedCodec for DistinctProjectionCodec {
+    type Key = u8;
+    type KeyedCursor<R: Read> = KeyedNumberCursor<R>;
+
+    fn keyed_cursor<R: Read>(&self, source: R) -> io::Result<Self::KeyedCursor<R>> {
+        Ok(KeyedNumberCursor {
+            source,
+            current: None,
+        })
+    }
+}
+
+impl<R: Read> CodecCursor for KeyedNumberCursor<R> {
+    type Record = Number;
+    type Error = io::Error;
+
+    fn advance(&mut self) -> io::Result<bool> {
+        self.current = None;
+        let mut encoded = [0_u8; 2];
+        if self.source.read(&mut encoded[..1])? == 0 {
+            return Ok(false);
+        }
+        self.source.read_exact(&mut encoded[1..])?;
+
+        let [value, stored_key] = encoded;
+        let record = Number(value);
+        self.current = Some((record, stored_key));
+        Ok(true)
+    }
+
+    fn with_current<Output>(
+        &mut self,
+        visit: impl FnOnce(&Self::Record) -> Output,
+    ) -> io::Result<Output> {
+        let (record, _) = self
+            .current
+            .as_ref()
+            .expect("current access requires a positioned cursor");
+        Ok(visit(record))
+    }
+}
+
+impl<R: Read> KeyedCodecCursor<u8> for KeyedNumberCursor<R> {
+    fn current_key(&self) -> io::Result<u8> {
+        let (_, stored_key) = self
+            .current
+            .as_ref()
+            .expect("key access requires a positioned cursor");
+        Ok(*stored_key)
+    }
+}
+
+impl DeriveKey<Number> for DistinctProjectionCodec {
+    fn derive_key(&self, item: &Number) -> u8 {
+        item.0 / 10
+    }
+}
+
+impl EncodeKeyedRun<Number> for DistinctProjectionCodec {
+    type KeyedWriter<W: Write> = KeyedNumberWriter<W>;
+
+    fn keyed_writer<W: Write>(&self, destination: W) -> Self::KeyedWriter<W> {
+        KeyedNumberWriter(destination)
+    }
+}
+
+impl<W: Write> KeyedCodecWriter<Number, u8> for KeyedNumberWriter<W> {
+    type Error = io::Error;
+
+    fn write_keyed(&mut self, item: &Number, key: &u8) -> io::Result<()> {
+        let encoded = [item.0, *key];
+        self.0.write_all(&encoded)
+    }
+
+    fn finish(mut self) -> io::Result<()> {
+        self.0.flush()
+    }
+}
+
+#[test]
+fn keyed_builder_uses_distinct_keyed_record_projection_across_spills() {
+    let sort_key = Owned(|record: &Number| record.0);
+    let mut sorter = spillover::sorter::Builder::new()
+        .key(sort_key)
+        .keyed_codec(DistinctProjectionCodec)
+        .max_buffer_items(1)
+        .build();
+
+    for value in [31, 12, 11, 22] {
+        let record = Number(value);
+        sorter.push(record).expect("push");
+    }
+
+    let output_stream = sorter.finish().expect("finish");
+    let mut observed = Vec::new();
+    output_stream
+        .visit_items(|record: &Number| -> Result<(), Infallible> {
+            observed.push(record.0);
+            Ok(())
+        })
+        .expect("borrowed output");
+
+    assert_eq!(observed, [11, 12, 22, 31]);
+}
+
+struct ForwardTraversal;
+
+struct ForwardedSource<S>(S);
+
+struct Stop(u8);
+
+impl<S> Dedup<S> for ForwardTraversal {
+    type Deduped = ForwardedSource<S>;
+
+    fn dedup(self, source: S) -> Self::Deduped {
+        ForwardedSource(source)
+    }
+}
+
+impl<S: VisitSortedItems> VisitSortedItems for ForwardedSource<S> {
+    type Record = S::Record;
+    type Error = S::Error;
+
+    fn visit_items<F, FE>(self, callback: F) -> Result<(), SortedItemsError<Self::Error, FE>>
+    where
+        F: FnMut(&Self::Record) -> Result<(), FE>,
+    {
+        self.0.visit_items(callback)
+    }
+}
+
+#[test]
+fn downstream_dedup_adapter_forwards_typed_sink_error() {
+    let sort_key = Owned(|record: &Number| record.0);
+    let mut sorter = spillover::sorter::Builder::new()
+        .key(sort_key)
+        .codec(NumberCodec)
+        .dedup(ForwardTraversal)
+        .max_buffer_items(1)
+        .build();
+
+    for value in [3, 1, 2] {
+        let record = Number(value);
+        sorter.push(record).expect("push");
+    }
+
+    let output_stream = sorter.finish().expect("finish");
+    let mut visited = Vec::new();
+    let result = output_stream.items().try_for_each(|record| {
+        visited.push(record.0);
+        if record.0 == 2 {
+            return Err(Stop(42));
+        }
+        Ok(())
+    });
+
+    assert_eq!(visited, [1, 2]);
+    assert!(matches!(result, Err(SortedItemsError::Sink(Stop(42)))));
+}
+
+#[test]
+fn downstream_dedup_adapter_forwards_typed_source_error() {
+    let sort_key = Owned(|record: &Number| record.0);
+    let mut sorter = spillover::sorter::Builder::new()
+        .key(sort_key)
+        .codec(RejectTwoCodec)
+        .dedup(ForwardTraversal)
+        .max_buffer_items(3)
+        .build();
+
+    for value in [1, 2, 3] {
+        let record = Number(value);
+        sorter.push(record).expect("push");
+    }
+
+    let output_stream = sorter.finish().expect("finish");
+    let mut visited = Vec::new();
+    let result = output_stream
+        .items()
+        .try_for_each(|record| -> Result<(), Infallible> {
+            visited.push(record.0);
+            Ok(())
+        });
+
+    assert_eq!(visited, [1]);
+    assert!(matches!(
+        result,
+        Err(SortedItemsError::Source(MergeError::Codec(
+            NumberDecodeError::RejectedByte(2)
+        )))
+    ));
+}
+
+struct BorrowedPriorityOrder<'a> {
+    priority: &'a [u8],
+}
+
+impl Compare<Number> for BorrowedPriorityOrder<'_> {
+    fn compare(&self, left: &Number, right: &Number) -> Ordering {
+        let left_position = self.priority.iter().position(|&value| value == left.0);
+        let right_position = self.priority.iter().position(|&value| value == right.0);
+
+        match (left_position, right_position) {
+            (Some(left_rank), Some(right_rank)) => left_rank.cmp(&right_rank),
+            (Some(_), None) => Ordering::Less,
+            (None, Some(_)) => Ordering::Greater,
+            (None, None) => left.0.cmp(&right.0),
+        }
+    }
+}
+
+#[test]
+fn borrowed_non_clone_order_survives_intermediate_and_terminal_merge() {
+    let priority = [2, 3, 1];
+    let comparator = BorrowedPriorityOrder {
+        priority: &priority,
+    };
+    let max_fan_in = NonZeroUsize::new(2).expect("two is nonzero");
+    let mut config = MergeConfig::default();
+    config.max_fan_in = max_fan_in;
+    let merger = RunMerger::new(NumberCodec, comparator, config);
+    let mut runs = Vec::new();
+
+    for value in [1, 2, 3] {
+        let records = [Number(value)];
+        let run = merger.spill_sorted(records).expect("spill singleton");
+        runs.push(run);
+    }
+
+    let output_stream = merger.merge(runs).expect("merge");
+    let observed: Vec<u8> = output_stream
+        .map(|item| {
+            let record = item.expect("decode");
+            record.0
+        })
+        .collect();
+
+    assert_eq!(observed, [2, 3, 1]);
+}
 
 fn make_record(name: &[u8], seq: &[u8], qual: &[u8]) -> SeqRecord {
     SeqRecord::new(name, seq, qual)

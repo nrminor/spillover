@@ -55,7 +55,7 @@ use std::cmp::Ordering;
 /// let key = quality_key.key(&scores);
 /// assert!((key - 35.0).abs() < f64::EPSILON);
 /// ```
-pub trait SortKey<T> {
+pub trait SortKey<T: ?Sized> {
     /// The key type, which may borrow from the item for lifetime `'a`.
     type Key<'a>
     where
@@ -101,7 +101,7 @@ impl<SK, Cmp> KeyCompare<SK, Cmp> {
     }
 }
 
-impl<T, SK, Cmp> crate::compare::Compare<T> for KeyCompare<SK, Cmp>
+impl<T: ?Sized, SK, Cmp> crate::compare::Compare<T> for KeyCompare<SK, Cmp>
 where
     SK: SortKey<T>,
     Cmp: for<'a> crate::compare::Compare<SK::Key<'a>>,
@@ -126,7 +126,7 @@ where
 #[derive(Clone, Copy)]
 pub struct Owned<F>(pub F);
 
-impl<T, K, F> SortKey<T> for Owned<F>
+impl<T: ?Sized, K, F> SortKey<T> for Owned<F>
 where
     F: Fn(&T) -> K,
 {

@@ -25,11 +25,11 @@ use dryice::{
 };
 use spillover::codec::{
     Codec, CodecCursor, CodecWriter, DeriveKey, EncodeKeyedRun, EncodeRun, KeyedCodec,
-    KeyedCodecCursor, KeyedCodecWriter,
+    KeyedCodecCursor, KeyedCodecWriter, TakeOwned,
 };
 
 use crate::{
-    record::{SeqRecord, SeqRecordParts, SeqRecordView},
+    record::{SeqRecord, SeqRecordParts},
     sort::RecordKeyer,
 };
 
@@ -307,104 +307,140 @@ impl<
 
 // ── Reader adapters ──────────────────────────────────────────
 
-/// Newtype wrapping an unkeyed [`DryIceReader`] to implement
-/// spillover's [`CodecCursor`]. Yields owned [`SeqRecord`] values.
-pub struct UnkeyedReaderAdapter<R, S: SequenceCodec, Q: QualityCodec, N: NameCodec>(
-    DryIceReader<R, S, Q, N, dryice::NoRecordKey>,
-);
+/// Read-only access to the current record in native dryice decoding storage.
+///
+/// Cursors lend this facade through [`CodecCursor::with_current`]. It exposes
+/// record data through [`SeqRecordParts`], without exposing cursor control.
+/// The native reader is retained here once per cursor, not copied per record.
+pub struct DecodedRecord<R, S: SequenceCodec, Q: QualityCodec, N: NameCodec, K> {
+    reader: DryIceReader<R, S, Q, N, K>,
+}
 
-impl<R: Read, S: SequenceCodec, Q: QualityCodec, N: NameCodec> CodecCursor<SeqRecord>
-    for UnkeyedReaderAdapter<R, S, Q, N>
+impl<R: Read, S: SequenceCodec, Q: QualityCodec, N: NameCodec, K> SeqRecordParts
+    for DecodedRecord<R, S, Q, N, K>
 {
-    type Error = DryIceError;
-    type Current<'a>
-        = SeqRecordView<'a>
-    where
-        Self: 'a;
-
-    fn advance(&mut self) -> Result<bool, DryIceError> {
-        self.0.next_record()
+    fn name(&self) -> &[u8] {
+        self.reader.name()
     }
 
-    fn current(&mut self) -> Result<SeqRecord, DryIceError> {
-        Ok(SeqRecord::from_slices(
-            self.0.name(),
-            self.0.sequence(),
-            self.0.quality(),
-        ))
+    fn sequence(&self) -> &[u8] {
+        self.reader.sequence()
     }
 
-    fn with_current<'a, T>(
-        &'a mut self,
-        f: impl FnOnce(Self::Current<'a>) -> T,
-    ) -> Result<T, DryIceError> {
-        Ok(f(SeqRecordView::new(
-            self.0.name(),
-            self.0.sequence(),
-            self.0.quality(),
-        )))
+    fn quality(&self) -> &[u8] {
+        self.reader.quality()
     }
 }
 
-/// Newtype wrapping a keyed [`DryIceReader`] to implement both
-/// [`CodecCursor`] and [`KeyedCodecCursor`].
-pub struct KeyedReaderAdapter<R, S: SequenceCodec, Q: QualityCodec, N: NameCodec, K>(
-    DryIceReader<R, S, Q, N, K>,
+fn own_record<R: SeqRecordParts + ?Sized>(record: &R) -> SeqRecord {
+    let name = record.name();
+    let sequence = record.sequence();
+    let quality = record.quality();
+    SeqRecord::from_slices(name, sequence, quality)
+}
+
+/// Unkeyed dryice cursor with borrowed record access and optional owned output.
+pub struct UnkeyedReaderAdapter<R, S: SequenceCodec, Q: QualityCodec, N: NameCodec>(
+    DecodedRecord<R, S, Q, N, dryice::NoRecordKey>,
 );
 
-impl<R: Read, S: SequenceCodec, Q: QualityCodec, N: NameCodec, K: RecordKey> CodecCursor<SeqRecord>
-    for KeyedReaderAdapter<R, S, Q, N, K>
+impl<R: Read, S: SequenceCodec, Q: QualityCodec, N: NameCodec> UnkeyedReaderAdapter<R, S, Q, N> {
+    fn open(source: R) -> Result<Self, DryIceError> {
+        let reader = DryIceReader::with_codecs(source)?;
+        let record = DecodedRecord { reader };
+        Ok(Self(record))
+    }
+}
+
+impl<R: Read, S: SequenceCodec, Q: QualityCodec, N: NameCodec> CodecCursor
+    for UnkeyedReaderAdapter<R, S, Q, N>
 {
+    type Record = DecodedRecord<R, S, Q, N, dryice::NoRecordKey>;
     type Error = DryIceError;
-    type Current<'a>
-        = SeqRecordView<'a>
-    where
-        Self: 'a;
 
     fn advance(&mut self) -> Result<bool, DryIceError> {
-        self.0.next_record()
+        self.0.reader.next_record()
     }
 
-    fn current(&mut self) -> Result<SeqRecord, DryIceError> {
-        Ok(SeqRecord::from_slices(
-            self.0.name(),
-            self.0.sequence(),
-            self.0.quality(),
-        ))
+    fn with_current<Output>(
+        &mut self,
+        visit: impl FnOnce(&Self::Record) -> Output,
+    ) -> Result<Output, DryIceError> {
+        Ok(visit(&self.0))
+    }
+}
+
+impl<R: Read, S: SequenceCodec, Q: QualityCodec, N: NameCodec> TakeOwned
+    for UnkeyedReaderAdapter<R, S, Q, N>
+{
+    type Owned = SeqRecord;
+
+    fn take_owned(&mut self) -> Result<Option<Self::Owned>, DryIceError> {
+        let record = self.with_current(own_record)?;
+        Ok(Some(record))
+    }
+}
+
+/// Keyed dryice cursor with borrowed record access and optional owned output.
+pub struct KeyedReaderAdapter<R, S: SequenceCodec, Q: QualityCodec, N: NameCodec, K>(
+    DecodedRecord<R, S, Q, N, K>,
+);
+
+impl<R: Read, S: SequenceCodec, Q: QualityCodec, N: NameCodec, K: RecordKey>
+    KeyedReaderAdapter<R, S, Q, N, K>
+{
+    fn open(source: R) -> Result<Self, DryIceError> {
+        let reader = DryIceReader::open(source)?;
+        let record = DecodedRecord { reader };
+        Ok(Self(record))
+    }
+}
+
+impl<R: Read, S: SequenceCodec, Q: QualityCodec, N: NameCodec, K: RecordKey> CodecCursor
+    for KeyedReaderAdapter<R, S, Q, N, K>
+{
+    type Record = DecodedRecord<R, S, Q, N, K>;
+    type Error = DryIceError;
+
+    fn advance(&mut self) -> Result<bool, DryIceError> {
+        self.0.reader.next_record()
     }
 
-    fn with_current<'a, T>(
-        &'a mut self,
-        f: impl FnOnce(Self::Current<'a>) -> T,
-    ) -> Result<T, DryIceError> {
-        Ok(f(SeqRecordView::new(
-            self.0.name(),
-            self.0.sequence(),
-            self.0.quality(),
-        )))
+    fn with_current<Output>(
+        &mut self,
+        visit: impl FnOnce(&Self::Record) -> Output,
+    ) -> Result<Output, DryIceError> {
+        Ok(visit(&self.0))
+    }
+}
+
+impl<R: Read, S: SequenceCodec, Q: QualityCodec, N: NameCodec, K: RecordKey> TakeOwned
+    for KeyedReaderAdapter<R, S, Q, N, K>
+{
+    type Owned = SeqRecord;
+
+    fn take_owned(&mut self) -> Result<Option<Self::Owned>, DryIceError> {
+        let record = self.with_current(own_record)?;
+        Ok(Some(record))
     }
 }
 
 impl<R: Read, S: SequenceCodec, Q: QualityCodec, N: NameCodec, K: RecordKey + Clone>
-    KeyedCodecCursor<SeqRecord, K> for KeyedReaderAdapter<R, S, Q, N, K>
+    KeyedCodecCursor<K> for KeyedReaderAdapter<R, S, Q, N, K>
 {
     fn current_key(&self) -> Result<K, DryIceError> {
-        self.0.record_key()
+        self.0.reader.record_key()
     }
 }
 
 // ── Codec impls ──────────────────────────────────────────────
 
 impl<S: SequenceCodec, Q: QualityCodec, N: NameCodec> Codec for DryIceCodec<S, Q, N> {
-    type Item = SeqRecord;
     type Error = DryIceError;
     type Cursor<R: Read> = UnkeyedReaderAdapter<R, S, Q, N>;
 
-    fn cursor<R: Read>(&self, source: R) -> Self::Cursor<R> {
-        UnkeyedReaderAdapter(
-            DryIceReader::with_codecs::<S, Q, N>(source)
-                .expect("dryice file header should be valid"),
-        )
+    fn cursor<R: Read>(&self, source: R) -> Result<Self::Cursor<R>, Self::Error> {
+        UnkeyedReaderAdapter::open(source)
     }
 }
 
@@ -429,15 +465,11 @@ impl<R: SeqRecordParts + ?Sized, S: SequenceCodec, Q: QualityCodec, N: NameCodec
 impl<Kr: RecordKeyer, S: SequenceCodec, Q: QualityCodec, N: NameCodec> Codec
     for KeyedDryIceCodec<Kr, S, Q, N>
 {
-    type Item = SeqRecord;
     type Error = DryIceError;
     type Cursor<R: Read> = KeyedReaderAdapter<R, S, Q, N, Kr::RecordKey>;
 
-    fn cursor<R: Read>(&self, source: R) -> Self::Cursor<R> {
-        KeyedReaderAdapter(
-            DryIceReader::open::<S, Q, N, Kr::RecordKey>(source)
-                .expect("dryice file header should be valid"),
-        )
+    fn cursor<R: Read>(&self, source: R) -> Result<Self::Cursor<R>, Self::Error> {
+        KeyedReaderAdapter::open(source)
     }
 }
 
@@ -447,11 +479,8 @@ impl<Kr: RecordKeyer, S: SequenceCodec, Q: QualityCodec, N: NameCodec> KeyedCode
     type Key = Kr::RecordKey;
     type KeyedCursor<R: Read> = KeyedReaderAdapter<R, S, Q, N, Kr::RecordKey>;
 
-    fn keyed_cursor<R: Read>(&self, source: R) -> Self::KeyedCursor<R> {
-        KeyedReaderAdapter(
-            DryIceReader::open::<S, Q, N, Kr::RecordKey>(source)
-                .expect("dryice file header should be valid"),
-        )
+    fn keyed_cursor<R: Read>(&self, source: R) -> Result<Self::KeyedCursor<R>, Self::Error> {
+        KeyedReaderAdapter::open(source)
     }
 }
 
@@ -489,6 +518,10 @@ where
 
 #[cfg(test)]
 mod tests {
+    use std::io::Cursor;
+
+    use crate::{key::PackedSequenceKey, record::SeqRecordView};
+
     use super::*;
 
     fn test_records() -> Vec<SeqRecord> {
@@ -511,11 +544,14 @@ mod tests {
         }
         writer.finish().expect("finish should succeed");
 
-        let mut reader = codec.cursor(std::io::Cursor::new(&buf));
+        let source = Cursor::new(&buf);
+        let mut reader = codec.cursor(source).expect("cursor should open");
         let mut recovered = Vec::new();
         while reader.advance().expect("advance should succeed") {
             reader
-                .with_current(|view| {
+                .with_current(|record| {
+                    let view =
+                        SeqRecordView::new(record.name(), record.sequence(), record.quality());
                     assert_eq!(
                         view,
                         records[recovered.len()].as_view(),
@@ -523,7 +559,11 @@ mod tests {
                     );
                 })
                 .expect("with_current should succeed");
-            recovered.push(reader.current().expect("current should succeed"));
+            let record = reader
+                .take_owned()
+                .expect("take_owned should succeed")
+                .expect("current record should be available");
+            recovered.push(record);
         }
 
         assert_eq!(recovered, records);
@@ -541,10 +581,15 @@ mod tests {
         }
         writer.finish().expect("finish should succeed");
 
-        let mut reader = codec.cursor(std::io::Cursor::new(&buf));
+        let source = Cursor::new(&buf);
+        let mut reader = codec.cursor(source).expect("cursor should open");
         let mut recovered = Vec::new();
         while reader.advance().expect("advance should succeed") {
-            recovered.push(reader.current().expect("current should succeed"));
+            let record = reader
+                .take_owned()
+                .expect("take_owned should succeed")
+                .expect("current record should be available");
+            recovered.push(record);
         }
 
         assert_eq!(recovered, records);
@@ -552,8 +597,6 @@ mod tests {
 
     #[test]
     fn keyed_path_round_trips_records_and_keys() {
-        use crate::key::PackedSequenceKey;
-
         let codec = DryIceCodec::new().with_record_keyer(crate::sort::SequenceOrder::<2>);
         let records = test_records();
         let keys: Vec<_> = records
@@ -572,12 +615,17 @@ mod tests {
         }
         writer.finish().expect("finish should succeed");
 
-        let mut reader = codec.keyed_cursor(std::io::Cursor::new(&buf));
+        let source = Cursor::new(&buf);
+        let mut reader = codec.keyed_cursor(source).expect("cursor should open");
         let mut recovered_keys = Vec::new();
         let mut recovered_records = Vec::new();
         while reader.advance().expect("advance should succeed") {
             recovered_keys.push(reader.current_key().expect("current_key should succeed"));
-            recovered_records.push(reader.current().expect("current should succeed"));
+            let record = reader
+                .take_owned()
+                .expect("take_owned should succeed")
+                .expect("current record should be available");
+            recovered_records.push(record);
         }
 
         assert_eq!(recovered_records, records);
@@ -586,8 +634,6 @@ mod tests {
 
     #[test]
     fn keyed_path_writes_record_views() {
-        use crate::key::PackedSequenceKey;
-
         let codec = DryIceCodec::new().with_record_keyer(crate::sort::SequenceOrder::<2>);
         let records = test_records();
         let keys: Vec<_> = records
@@ -606,10 +652,15 @@ mod tests {
         }
         writer.finish().expect("finish should succeed");
 
-        let mut reader = codec.keyed_cursor(std::io::Cursor::new(&buf));
+        let source = Cursor::new(&buf);
+        let mut reader = codec.keyed_cursor(source).expect("cursor should open");
         let mut recovered_records = Vec::new();
         while reader.advance().expect("advance should succeed") {
-            recovered_records.push(reader.current().expect("current should succeed"));
+            let record = reader
+                .take_owned()
+                .expect("take_owned should succeed")
+                .expect("current record should be available");
+            recovered_records.push(record);
         }
 
         assert_eq!(recovered_records, records);
@@ -617,8 +668,6 @@ mod tests {
 
     #[test]
     fn keyed_codec_derives_keys_from_record_views() {
-        use crate::key::PackedSequenceKey;
-
         let codec = DryIceCodec::new().with_record_keyer(crate::sort::SequenceOrder::<2>);
         let record = SeqRecord::new(b"r1", b"ACGT", b"!!!!");
 
@@ -637,7 +686,8 @@ mod tests {
         let writer = <DryIceCodec as EncodeRun<SeqRecord>>::writer(&codec, &mut buf);
         writer.finish().expect("finish empty should succeed");
 
-        let mut reader = codec.cursor(std::io::Cursor::new(&buf));
+        let source = Cursor::new(&buf);
+        let mut reader = codec.cursor(source).expect("cursor should open");
         assert!(
             !reader.advance().expect("advance should succeed"),
             "empty file should yield no records"
@@ -676,8 +726,6 @@ mod tests {
 
     #[test]
     fn keyed_codec_with_compact_codecs() {
-        use crate::key::PackedSequenceKey;
-
         let codec = DryIceCodec::new()
             .two_bit_exact()
             .binned_quality()
@@ -702,11 +750,15 @@ mod tests {
         }
         writer.finish().expect("finish should succeed");
 
-        let mut reader = codec.keyed_cursor(std::io::Cursor::new(&buf));
+        let source = Cursor::new(&buf);
+        let mut reader = codec.keyed_cursor(source).expect("cursor should open");
         let mut count = 0;
         while reader.advance().expect("advance") {
             let _key = reader.current_key().expect("current_key");
-            let _rec = reader.current().expect("current");
+            let _record = reader
+                .take_owned()
+                .expect("take_owned should succeed")
+                .expect("current record should be available");
             count += 1;
         }
         assert_eq!(count, records.len());

@@ -1,7 +1,7 @@
 use std::io::{BufReader, BufWriter, Read, Write};
 
 use spillover::{
-    codec::{Codec, CodecCursor, CodecWriter, EncodeRun},
+    codec::{CodecWriter, DecodeRun, EncodeRun},
     dedup::AdjacentDedup,
     key::Owned,
     sorter::Builder,
@@ -28,55 +28,36 @@ impl<W: Write> CodecWriter<u64> for U64Writer<W> {
 
 struct U64Reader<R: Read> {
     inner: BufReader<R>,
-    current: Option<u64>,
 }
 
-impl<R: Read> CodecCursor<u64> for U64Reader<R> {
-    type Error = std::io::Error;
-    type Current<'a>
-        = u64
-    where
-        Self: 'a;
+impl<R: Read> Iterator for U64Reader<R> {
+    type Item = std::io::Result<u64>;
 
-    fn advance(&mut self) -> Result<bool, Self::Error> {
+    fn next(&mut self) -> Option<Self::Item> {
         let mut bytes = [0_u8; 8];
         match self.inner.read(&mut bytes[..1]) {
-            Ok(0) => {
-                self.current = None;
-                Ok(false)
-            }
+            Ok(0) => None,
             Ok(_) => {
-                self.inner.read_exact(&mut bytes[1..])?;
-                self.current = Some(u64::from_le_bytes(bytes));
-                Ok(true)
+                let decoded = self
+                    .inner
+                    .read_exact(&mut bytes[1..])
+                    .map(|()| u64::from_le_bytes(bytes));
+                Some(decoded)
             }
-            Err(e) => Err(e),
+            Err(error) => Some(Err(error)),
         }
-    }
-
-    fn current(&mut self) -> Result<u64, Self::Error> {
-        self.current
-            .ok_or_else(|| std::io::Error::other("current called before advance"))
-    }
-
-    fn with_current<'a, T>(
-        &'a mut self,
-        f: impl FnOnce(Self::Current<'a>) -> T,
-    ) -> Result<T, Self::Error> {
-        self.current().map(f)
     }
 }
 
-impl Codec for U64Codec {
-    type Item = u64;
+impl DecodeRun for U64Codec {
+    type Record = u64;
     type Error = std::io::Error;
-    type Cursor<R: Read> = U64Reader<R>;
+    type Reader<R: Read> = U64Reader<R>;
 
-    fn cursor<R: Read>(&self, source: R) -> Self::Cursor<R> {
-        U64Reader {
+    fn reader<R: Read>(&self, source: R) -> Result<Self::Reader<R>, Self::Error> {
+        Ok(U64Reader {
             inner: BufReader::new(source),
-            current: None,
-        }
+        })
     }
 }
 
@@ -95,14 +76,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .key(Owned(|v: &u64| *v))
         .codec(U64Codec)
         .dedup(AdjacentDedup::new(|a: &u64, b: &u64| a == b))
-        .max_buffer_items::<u64>(3)
+        .max_buffer_items(3)
         .build();
 
     for value in [3_u64, 3, 2, 2, 2, 1, 1, 4, 4] {
         sorter.push(value)?;
     }
 
-    let output: Vec<u64> = sorter.finish()?.collect::<Result<Vec<_>, _>>()?;
+    let output_stream = sorter.finish()?;
+    let collected: Result<Vec<u64>, _> = output_stream.collect();
+    let output = collected?;
     println!("deduplicated sorted values: {output:?}");
 
     Ok(())

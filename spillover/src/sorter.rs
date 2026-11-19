@@ -14,12 +14,14 @@
 //! [`Dedup`]: crate::dedup::Dedup
 //! [`ChunkSorter`]: crate::chunk::ChunkSorter
 
+use std::{fs::File, io::BufReader};
+
 use get_size2::GetSize;
 
 use crate::{
     SortedItemsError,
     chunk::{ChunkSorter, Sequential},
-    codec::{Codec, EncodeKeyedRun, EncodeRun, KeyedCodec},
+    codec::{Codec, CodecCursor, EncodeKeyedRun, EncodeRun, KeyedCodec},
     compare::{Compare, Natural},
     dedup::{Dedup, Identity},
     key::{KeyCompare, SortKey},
@@ -282,7 +284,7 @@ impl<SK, Cod, Cmp, D, CS> Builder<SK, Cod, NeedsFlushStrategy, Cmp, D, CS> {
 impl<T, SK, Cod, Cmp, D, CS> Builder<HasSortKey<SK>, HasCodec<Cod>, HasFlushStrategy<T>, Cmp, D, CS>
 where
     SK: SortKey<T> + Copy,
-    Cod: Codec<Item = T> + Copy,
+    Cod: Codec + Copy,
     Cmp: for<'a> Compare<SK::Key<'a>> + Copy,
     CS: ChunkSorter<T>,
 {
@@ -312,7 +314,7 @@ impl<T, SK, Cod, Cmp, D, CS>
     Builder<HasSortKey<SK>, HasKeyedCodec<Cod>, HasFlushStrategy<T>, Cmp, D, CS>
 where
     SK: SortKey<T> + Copy,
-    Cod: KeyedCodec<Item = T> + Copy,
+    Cod: KeyedCodec + Copy,
     Cmp: for<'a> Compare<SK::Key<'a>> + Compare<Cod::Key> + Copy,
     CS: ChunkSorter<T>,
 {
@@ -342,7 +344,12 @@ where
 /// Push items via [`push`](Self::push), then call
 /// [`finish`](Self::finish) to flush remaining items, merge all
 /// sorted runs, apply deduplication, and produce a sorted output
-/// iterator.
+/// handle.
+///
+/// Buffered inputs and decoded records may have different representations.
+/// The sort key must support both the input and the selected cursor's record.
+/// Owned iteration additionally requires the cursor's
+/// [`TakeOwned`](crate::codec::TakeOwned) capability.
 ///
 /// - `T`: the item type being sorted
 /// - `SK`: [`SortKey`] — extracts the value to sort by from each
@@ -532,17 +539,24 @@ impl<T, SK, Cod, Cmp, CS> AccumulateItems<T> for RunAccumulator<T, SK, Cod, Cmp,
 where
     T: 'static,
     SK: SortKey<T> + Copy + Send + Sync + 'static,
-    Cod: Codec<Item = T> + EncodeRun<T> + Copy + 'static,
+    Cod: Codec
+        + EncodeRun<T>
+        + EncodeRun<<<Cod as Codec>::Cursor<BufReader<File>> as CodecCursor>::Record>
+        + Copy
+        + 'static,
     Cmp: for<'a> Compare<SK::Key<'a>> + Copy + Send + Sync + 'static,
+    KeyCompare<SK, Cmp>: Compare<<<Cod as Codec>::Cursor<BufReader<File>> as CodecCursor>::Record>,
     CS: ChunkSorter<T>,
 {
     type Error = MergeError<Cod::Error>;
-    type Final = RunMerge<T, Cod, KeyCompare<SK, Cmp>>;
+    type Final = RunMerge<Cod, KeyCompare<SK, Cmp>>;
 
     fn accumulate(&mut self, items: &mut [T]) -> Result<(), MergeError<Cod::Error>> {
         let item_cmp = KeyCompare::new(self.sort_key, self.compare);
-        self.chunk_sort
-            .sort(items, move |a: &T, b: &T| Compare::compare(&item_cmp, a, b));
+        let compare_items = move |left: &T, right: &T| {
+            <KeyCompare<SK, Cmp> as Compare<T>>::compare(&item_cmp, left, right)
+        };
+        self.chunk_sort.sort(items, compare_items);
 
         let run_writer = RunWriter::new_unkeyed(self.codec, self.merge_config.clone());
         let run = run_writer.write_sorted(items)?;
@@ -563,17 +577,25 @@ impl<T, SK, Cod, Cmp, CS> AccumulateItems<T> for RunAccumulator<T, SK, Cod, Cmp,
 where
     T: 'static,
     SK: SortKey<T> + Copy + Send + Sync + 'static,
-    Cod: KeyedCodec<Item = T> + EncodeKeyedRun<T> + Copy + 'static,
+    Cod: KeyedCodec
+        + EncodeKeyedRun<T>
+        + EncodeKeyedRun<<<Cod as KeyedCodec>::KeyedCursor<BufReader<File>> as CodecCursor>::Record>
+        + Copy
+        + 'static,
     Cmp: for<'a> Compare<SK::Key<'a>> + Compare<Cod::Key> + Copy + Send + Sync + 'static,
+    KeyCompare<SK, Cmp>:
+        Compare<<<Cod as KeyedCodec>::KeyedCursor<BufReader<File>> as CodecCursor>::Record>,
     CS: ChunkSorter<T>,
 {
     type Error = MergeError<Cod::Error>;
-    type Final = KeyedRunMerge<T, Cod, Cmp, KeyCompare<SK, Cmp>>;
+    type Final = KeyedRunMerge<Cod, Cmp, KeyCompare<SK, Cmp>>;
 
     fn accumulate(&mut self, items: &mut [T]) -> Result<(), MergeError<Cod::Error>> {
         let item_cmp = KeyCompare::new(self.sort_key, self.compare);
-        self.chunk_sort
-            .sort(items, move |a: &T, b: &T| Compare::compare(&item_cmp, a, b));
+        let compare_items = move |left: &T, right: &T| {
+            <KeyCompare<SK, Cmp> as Compare<T>>::compare(&item_cmp, left, right)
+        };
+        self.chunk_sort.sort(items, compare_items);
 
         let run_writer = RunWriter::new_keyed(self.codec, self.merge_config.clone());
         let run = run_writer.write_sorted(items)?;
@@ -613,30 +635,23 @@ pub struct SortedItems<S> {
     source: S,
 }
 
-#[doc(hidden)]
-pub mod sealed {
-    pub trait Sealed {}
-}
-
-/// Implementation detail for sources that can be drained through
-/// [`SortedItems`].
-///
-/// This trait is sealed. Users should not implement it directly; use
-/// [`Sorted::items`] and [`SortedItems::try_for_each`] instead.
-#[doc(hidden)]
-pub trait VisitSortedItems: sealed::Sealed {
-    /// The item representation passed to the item sink.
-    type Item<'a>
-    where
-        Self: 'a;
+/// A sorted source that can be consumed through borrowed record visits.
+pub trait VisitSortedItems {
+    /// The record representation passed to the item sink.
+    type Record: ?Sized;
 
     /// The source error type.
     type Error;
 
     /// Visit each item in source order.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SortedItemsError::Source`] if producing a record fails, or
+    /// [`SortedItemsError::Sink`] if the callback fails.
     fn visit_items<F, FE>(self, f: F) -> Result<(), SortedItemsError<Self::Error, FE>>
     where
-        F: for<'a> FnMut(Self::Item<'a>) -> Result<(), FE>;
+        F: FnMut(&Self::Record) -> Result<(), FE>;
 }
 
 impl<I> Sorted<I> {
@@ -668,7 +683,7 @@ where
     /// [`SortedItemsError::Sink`] if the callback fails.
     pub fn try_for_each<F, FE>(self, f: F) -> Result<(), SortedItemsError<S::Error, FE>>
     where
-        F: for<'a> FnMut(S::Item<'a>) -> Result<(), FE>,
+        F: FnMut(&S::Record) -> Result<(), FE>,
     {
         self.source.visit_items(f)
     }
@@ -685,22 +700,16 @@ where
     }
 }
 
-impl<I> sealed::Sealed for Sorted<I> where I: VisitSortedItems + 'static {}
-
 impl<I> VisitSortedItems for Sorted<I>
 where
-    I: VisitSortedItems + 'static,
+    I: VisitSortedItems,
 {
-    type Item<'a>
-        = I::Item<'a>
-    where
-        Self: 'a;
-
+    type Record = I::Record;
     type Error = I::Error;
 
     fn visit_items<F, FE>(self, f: F) -> Result<(), SortedItemsError<Self::Error, FE>>
     where
-        F: for<'a> FnMut(Self::Item<'a>) -> Result<(), FE>,
+        F: FnMut(&Self::Record) -> Result<(), FE>,
     {
         self.source.visit_items(f)
     }
@@ -712,8 +721,13 @@ impl<T, SK, Cod, Cmp, D, CS> Sorter<T, SK, Cod, Cmp, D, CS, Unkeyed>
 where
     T: 'static,
     SK: SortKey<T> + Copy + Send + Sync + 'static,
-    Cod: Codec<Item = T> + EncodeRun<T> + Copy + 'static,
+    Cod: Codec
+        + EncodeRun<T>
+        + EncodeRun<<<Cod as Codec>::Cursor<BufReader<File>> as CodecCursor>::Record>
+        + Copy
+        + 'static,
     Cmp: for<'a> Compare<SK::Key<'a>> + Copy + Send + Sync + 'static,
+    KeyCompare<SK, Cmp>: Compare<<<Cod as Codec>::Cursor<BufReader<File>> as CodecCursor>::Record>,
     CS: ChunkSorter<T>,
 {
     /// Add an item to the sorter.
@@ -749,11 +763,11 @@ where
     pub fn finish(
         self,
     ) -> Result<
-        Sorted<<D as Dedup<RunMerge<T, Cod, KeyCompare<SK, Cmp>>>>::Deduped>,
+        Sorted<<D as Dedup<RunMerge<Cod, KeyCompare<SK, Cmp>>>>::Deduped>,
         MergeError<Cod::Error>,
     >
     where
-        D: Dedup<RunMerge<T, Cod, KeyCompare<SK, Cmp>>>,
+        D: Dedup<RunMerge<Cod, KeyCompare<SK, Cmp>>>,
     {
         let dedup = self.dedup;
         let merged = self.session.finish()?;
@@ -768,8 +782,14 @@ impl<T, SK, Cod, Cmp, D, CS> Sorter<T, SK, Cod, Cmp, D, CS, Keyed>
 where
     T: 'static,
     SK: SortKey<T> + Copy + Send + Sync + 'static,
-    Cod: KeyedCodec<Item = T> + EncodeKeyedRun<T> + Copy + 'static,
+    Cod: KeyedCodec
+        + EncodeKeyedRun<T>
+        + EncodeKeyedRun<<<Cod as KeyedCodec>::KeyedCursor<BufReader<File>> as CodecCursor>::Record>
+        + Copy
+        + 'static,
     Cmp: for<'a> Compare<SK::Key<'a>> + Compare<Cod::Key> + Copy + Send + Sync + 'static,
+    KeyCompare<SK, Cmp>:
+        Compare<<<Cod as KeyedCodec>::KeyedCursor<BufReader<File>> as CodecCursor>::Record>,
     CS: ChunkSorter<T>,
 {
     /// Add an item to the sorter.
@@ -805,11 +825,11 @@ where
     pub fn finish(
         self,
     ) -> Result<
-        Sorted<<D as Dedup<KeyedRunMerge<T, Cod, Cmp, KeyCompare<SK, Cmp>>>>::Deduped>,
+        Sorted<<D as Dedup<KeyedRunMerge<Cod, Cmp, KeyCompare<SK, Cmp>>>>::Deduped>,
         MergeError<Cod::Error>,
     >
     where
-        D: Dedup<KeyedRunMerge<T, Cod, Cmp, KeyCompare<SK, Cmp>>>,
+        D: Dedup<KeyedRunMerge<Cod, Cmp, KeyCompare<SK, Cmp>>>,
     {
         let dedup = self.dedup;
         let merged = self.session.finish()?;
@@ -826,7 +846,7 @@ mod tests {
     use crate::{
         codec::{
             CodecCursor, CodecWriter, DeriveKey, EncodeKeyedRun, EncodeRun, KeyedCodec,
-            KeyedCodecCursor, KeyedCodecWriter,
+            KeyedCodecCursor, KeyedCodecWriter, TakeOwned,
         },
         compare::Reverse,
         dedup::AdjacentDedup,
@@ -860,12 +880,9 @@ mod tests {
         current: Option<u64>,
     }
 
-    impl<R: Read> CodecCursor<u64> for U64Reader<R> {
+    impl<R: Read> CodecCursor for U64Reader<R> {
         type Error = std::io::Error;
-        type Current<'a>
-            = u64
-        where
-            Self: 'a;
+        type Record = u64;
 
         fn advance(&mut self) -> Result<bool, Self::Error> {
             let mut buf = [0u8; 8];
@@ -883,29 +900,35 @@ mod tests {
             }
         }
 
-        fn current(&mut self) -> Result<u64, Self::Error> {
-            self.current
-                .ok_or_else(|| std::io::Error::other("current called before advance"))
-        }
-
-        fn with_current<'a, F>(
-            &'a mut self,
-            f: impl FnOnce(Self::Current<'a>) -> F,
+        fn with_current<F>(
+            &mut self,
+            f: impl FnOnce(&Self::Record) -> F,
         ) -> Result<F, Self::Error> {
-            self.current().map(f)
+            let record = self
+                .current
+                .as_ref()
+                .ok_or_else(|| std::io::Error::other("current called before advance"))?;
+            Ok(f(record))
+        }
+    }
+
+    impl<R: Read> TakeOwned for U64Reader<R> {
+        type Owned = u64;
+
+        fn take_owned(&mut self) -> Result<Option<Self::Owned>, Self::Error> {
+            Ok(self.current.take())
         }
     }
 
     impl Codec for U64Codec {
-        type Item = u64;
         type Error = std::io::Error;
         type Cursor<R: Read> = U64Reader<R>;
 
-        fn cursor<R: Read>(&self, source: R) -> U64Reader<R> {
-            U64Reader {
+        fn cursor<R: Read>(&self, source: R) -> Result<U64Reader<R>, Self::Error> {
+            Ok(U64Reader {
                 inner: source,
                 current: None,
-            }
+            })
         }
     }
 
@@ -942,12 +965,9 @@ mod tests {
         current: Option<u64>,
     }
 
-    impl<R: Read> CodecCursor<u64> for U64OnlyKeyedReader<R> {
+    impl<R: Read> CodecCursor for U64OnlyKeyedReader<R> {
         type Error = std::io::Error;
-        type Current<'a>
-            = u64
-        where
-            Self: 'a;
+        type Record = u64;
 
         fn advance(&mut self) -> Result<bool, Self::Error> {
             let mut key = [0u8; 1];
@@ -968,20 +988,27 @@ mod tests {
             }
         }
 
-        fn current(&mut self) -> Result<u64, Self::Error> {
-            self.current
-                .ok_or_else(|| std::io::Error::other("current called before advance"))
-        }
-
-        fn with_current<'a, F>(
-            &'a mut self,
-            f: impl FnOnce(Self::Current<'a>) -> F,
+        fn with_current<F>(
+            &mut self,
+            f: impl FnOnce(&Self::Record) -> F,
         ) -> Result<F, Self::Error> {
-            self.current().map(f)
+            let record = self
+                .current
+                .as_ref()
+                .ok_or_else(|| std::io::Error::other("current called before advance"))?;
+            Ok(f(record))
         }
     }
 
-    impl<R: Read> KeyedCodecCursor<u64, u8> for U64OnlyKeyedReader<R> {
+    impl<R: Read> TakeOwned for U64OnlyKeyedReader<R> {
+        type Owned = u64;
+
+        fn take_owned(&mut self) -> Result<Option<Self::Owned>, Self::Error> {
+            Ok(self.current.take())
+        }
+    }
+
+    impl<R: Read> KeyedCodecCursor<u8> for U64OnlyKeyedReader<R> {
         fn current_key(&self) -> Result<u8, Self::Error> {
             self.current_key
                 .ok_or_else(|| std::io::Error::other("current_key called before advance"))
@@ -989,15 +1016,14 @@ mod tests {
     }
 
     impl Codec for U64KeyedCodec {
-        type Item = u64;
         type Error = std::io::Error;
         type Cursor<R: Read> = U64Reader<R>;
 
-        fn cursor<R: Read>(&self, source: R) -> U64Reader<R> {
-            U64Reader {
+        fn cursor<R: Read>(&self, source: R) -> Result<U64Reader<R>, Self::Error> {
+            Ok(U64Reader {
                 inner: source,
                 current: None,
-            }
+            })
         }
     }
 
@@ -1005,12 +1031,12 @@ mod tests {
         type Key = u8;
         type KeyedCursor<R: Read> = U64OnlyKeyedReader<R>;
 
-        fn keyed_cursor<R: Read>(&self, source: R) -> Self::KeyedCursor<R> {
-            U64OnlyKeyedReader {
+        fn keyed_cursor<R: Read>(&self, source: R) -> Result<Self::KeyedCursor<R>, Self::Error> {
+            Ok(U64OnlyKeyedReader {
                 inner: source,
                 current_key: None,
                 current: None,
-            }
+            })
         }
     }
 
@@ -1094,19 +1120,14 @@ mod tests {
 
     #[allow(clippy::type_complexity)]
     fn collect_unkeyed(
-        merged: RunMerge<u64, U64Codec, KeyCompare<Owned<fn(&u64) -> u64>, Natural>>,
+        merged: RunMerge<U64Codec, KeyCompare<Owned<fn(&u64) -> u64>, Natural>>,
     ) -> Vec<u64> {
         merged.map(|r| r.expect("read")).collect()
     }
 
     #[allow(clippy::type_complexity)]
     fn collect_keyed(
-        merged: KeyedRunMerge<
-            u64,
-            U64KeyedCodec,
-            Natural,
-            KeyCompare<Owned<fn(&u64) -> u64>, Natural>,
-        >,
+        merged: KeyedRunMerge<U64KeyedCodec, Natural, KeyCompare<Owned<fn(&u64) -> u64>, Natural>>,
     ) -> Vec<u64> {
         merged.map(|r| r.expect("read")).collect()
     }
@@ -1115,22 +1136,16 @@ mod tests {
         items: Vec<u64>,
     }
 
-    impl sealed::Sealed for TestVisitable {}
-
     impl VisitSortedItems for TestVisitable {
-        type Item<'a>
-            = u64
-        where
-            Self: 'a;
-
+        type Record = u64;
         type Error = std::convert::Infallible;
 
         fn visit_items<F, FE>(self, mut f: F) -> Result<(), SortedItemsError<Self::Error, FE>>
         where
-            F: for<'a> FnMut(u64) -> Result<(), FE>,
+            F: FnMut(&u64) -> Result<(), FE>,
         {
             for item in self.items {
-                f(item).map_err(SortedItemsError::Sink)?;
+                f(&item).map_err(SortedItemsError::Sink)?;
             }
 
             Ok(())
@@ -1376,7 +1391,7 @@ mod tests {
         })
         .items()
         .try_for_each(|item| {
-            visited.push(item);
+            visited.push(*item);
             Ok::<(), std::convert::Infallible>(())
         })
         .expect("visit items");
@@ -1403,8 +1418,8 @@ mod tests {
         })
         .items()
         .try_for_each(|item| {
-            visited.push(item);
-            if item == 2 { Err(SinkError) } else { Ok(()) }
+            visited.push(*item);
+            if *item == 2 { Err(SinkError) } else { Ok(()) }
         })
         .expect_err("sink error should stop traversal");
 

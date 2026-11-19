@@ -11,7 +11,7 @@
 //!
 //! The [`Builder`] is the main entry point for creating a sorter.
 
-use std::mem::size_of;
+use std::{fs::File, io::BufReader, mem::size_of};
 
 use dryice::{
     DryIceWriter, NameCodec, QualityCodec, RawAsciiCodec, RawNameCodec, RawQualityCodec, RecordKey,
@@ -20,7 +20,7 @@ use dryice::{
 use spillover::{
     SortedItemsError,
     chunk::{ChunkSorter, Sequential},
-    codec::{Codec, EncodeKeyedRun, EncodeRun, KeyedCodec},
+    codec::{Codec, CodecCursor, EncodeKeyedRun, EncodeRun, KeyedCodec},
     compare::{Compare, Natural},
     dedup::Identity,
     key::{KeyCompare, SortKey},
@@ -947,7 +947,7 @@ impl<SK, Cod, KeyCmp, RecCmp, CS>
     ArenaBackend<'_, SK, Cod, KeyCmp, RecCmp, CS, spillover::sorter::Unkeyed>
 where
     SK: SortKey<SeqRecord> + Copy + Send + Sync + 'static,
-    Cod: Codec<Item = SeqRecord> + Copy + 'static,
+    Cod: Codec + Copy + 'static,
     for<'v> Cod: EncodeRun<SeqRecordView<'v>>,
     KeyCmp: for<'r> Compare<<SK as SortKey<SeqRecord>>::Key<'r>> + Copy + Send + Sync + 'static,
     for<'v> RecCmp: Compare<SeqRecordView<'v>>,
@@ -981,7 +981,7 @@ impl<SK, Cod, KeyCmp, RecCmp, CS>
     ArenaBackend<'_, SK, Cod, KeyCmp, RecCmp, CS, spillover::sorter::Keyed>
 where
     SK: SortKey<SeqRecord> + Copy + Send + Sync + 'static,
-    Cod: KeyedCodec<Item = SeqRecord> + EncodeKeyedRun<SeqRecord> + Copy + 'static,
+    Cod: KeyedCodec + EncodeKeyedRun<SeqRecord> + Copy + 'static,
     for<'v> Cod: EncodeKeyedRun<SeqRecordView<'v>>,
     KeyCmp: for<'r> Compare<<SK as SortKey<SeqRecord>>::Key<'r>>
         + Compare<Cod::Key>
@@ -1051,7 +1051,7 @@ where
 impl<I, RE> SortedRecordStream<I>
 where
     I: VisitSortedItems<Error = RE>,
-    for<'a> I::Item<'a>: SeqRecordParts,
+    I::Record: SeqRecordParts,
     RE: std::error::Error + Send + Sync + 'static,
 {
     /// Write all sorted records to a destination sink.
@@ -1080,7 +1080,7 @@ where
         }
 
         inner
-            .visit_items(|record| dedup.write(&record, writer))
+            .visit_items(|record| dedup.write(record, writer))
             .map_err(|err| match err {
                 SortedItemsError::Source(err) => SortedRecordStreamError::Source(err),
                 SortedItemsError::Sink(err) => SortedRecordStreamError::Sink(err),
@@ -1125,9 +1125,11 @@ impl<SK, Cod, Cmp, CS>
     >
 where
     SK: SortKey<SeqRecord> + Copy + Send + Sync + 'static,
-    Cod: Codec<Item = SeqRecord> + Copy + 'static,
+    Cod: Codec + Copy + 'static,
     Cod: EncodeRun<SeqRecord>,
+    Cod: EncodeRun<<<Cod as Codec>::Cursor<BufReader<File>> as CodecCursor>::Record>,
     Cmp: for<'a> Compare<SK::Key<'a>> + Copy + Send + Sync + 'static,
+    KeyCompare<SK, Cmp>: Compare<<<Cod as Codec>::Cursor<BufReader<File>> as CodecCursor>::Record>,
     CS: ChunkSorter<SeqRecord>,
 {
     /// Add an unsorted record to the sorter.
@@ -1148,7 +1150,7 @@ where
     pub fn finish(
         self,
     ) -> Result<
-        SortedRecordStream<spillover::Sorted<RunMerge<SeqRecord, Cod, KeyCompare<SK, Cmp>>>>,
+        SortedRecordStream<spillover::Sorted<RunMerge<Cod, KeyCompare<SK, Cmp>>>>,
         MergeError<Cod::Error>,
     > {
         let inner = self.inner.inner.finish()?;
@@ -1168,10 +1170,12 @@ impl<SK, Cod, Cmp, RecCmp, CS>
     >
 where
     SK: SortKey<SeqRecord> + Copy + Send + Sync + 'static,
-    Cod: Codec<Item = SeqRecord> + Copy + 'static,
+    Cod: Codec + Copy + 'static,
     Cod: EncodeRun<SeqRecord>,
+    Cod: EncodeRun<<<Cod as Codec>::Cursor<BufReader<File>> as CodecCursor>::Record>,
     for<'v> Cod: EncodeRun<SeqRecordView<'v>>,
     Cmp: for<'r> Compare<<SK as SortKey<SeqRecord>>::Key<'r>> + Copy + Send + Sync + 'static,
+    KeyCompare<SK, Cmp>: Compare<<<Cod as Codec>::Cursor<BufReader<File>> as CodecCursor>::Record>,
     for<'v> RecCmp: Compare<SeqRecordView<'v>>,
     RecCmp: Copy + Send + Sync + 'static,
     for<'v> CS: ChunkSorter<SeqRecordView<'v>>,
@@ -1208,10 +1212,8 @@ where
     #[allow(clippy::type_complexity)]
     pub fn finish(
         mut self,
-    ) -> Result<
-        SortedRecordStream<RunMerge<SeqRecord, Cod, KeyCompare<SK, Cmp>>>,
-        MergeError<Cod::Error>,
-    > {
+    ) -> Result<SortedRecordStream<RunMerge<Cod, KeyCompare<SK, Cmp>>>, MergeError<Cod::Error>>
+    {
         self.inner.flush()?;
 
         let item_cmp = KeyCompare::new(self.inner.sort_key, self.inner.key_comparator);
@@ -1235,7 +1237,8 @@ impl<SK, Cod, Cmp, RecCmp, CS>
     >
 where
     SK: SortKey<SeqRecord> + Copy + Send + Sync + 'static,
-    Cod: KeyedCodec<Item = SeqRecord> + EncodeKeyedRun<SeqRecord> + Copy + 'static,
+    Cod: KeyedCodec + EncodeKeyedRun<SeqRecord> + Copy + 'static,
+    Cod: EncodeKeyedRun<<<Cod as KeyedCodec>::KeyedCursor<BufReader<File>> as CodecCursor>::Record>,
     for<'v> Cod: EncodeKeyedRun<SeqRecordView<'v>>,
     Cmp: for<'r> Compare<<SK as SortKey<SeqRecord>>::Key<'r>>
         + Compare<Cod::Key>
@@ -1246,6 +1249,8 @@ where
     for<'v> RecCmp: Compare<SeqRecordView<'v>>,
     RecCmp: Copy + Send + Sync + 'static,
     for<'v> CS: ChunkSorter<SeqRecordView<'v>>,
+    KeyCompare<SK, Cmp>:
+        Compare<<<Cod as KeyedCodec>::KeyedCursor<BufReader<File>> as CodecCursor>::Record>,
 {
     /// Add an unsorted record to the arena-backed sorter.
     ///
@@ -1280,7 +1285,7 @@ where
     pub fn finish(
         mut self,
     ) -> Result<
-        SortedRecordStream<KeyedRunMerge<SeqRecord, Cod, Cmp, KeyCompare<SK, Cmp>>>,
+        SortedRecordStream<KeyedRunMerge<Cod, Cmp, KeyCompare<SK, Cmp>>>,
         MergeError<Cod::Error>,
     > {
         self.inner.flush()?;
@@ -1309,8 +1314,11 @@ impl<SK, Cod, Cmp, CS>
     >
 where
     SK: SortKey<SeqRecord> + Copy + Send + Sync + 'static,
-    Cod: KeyedCodec<Item = SeqRecord> + EncodeKeyedRun<SeqRecord> + Copy + 'static,
+    Cod: KeyedCodec + EncodeKeyedRun<SeqRecord> + Copy + 'static,
+    Cod: EncodeKeyedRun<<<Cod as KeyedCodec>::KeyedCursor<BufReader<File>> as CodecCursor>::Record>,
     Cmp: for<'a> Compare<SK::Key<'a>> + Compare<Cod::Key> + Copy + Send + Sync + 'static,
+    KeyCompare<SK, Cmp>:
+        Compare<<<Cod as KeyedCodec>::KeyedCursor<BufReader<File>> as CodecCursor>::Record>,
     CS: ChunkSorter<SeqRecord>,
 {
     /// Add an unsorted record to the sorter.
@@ -1331,9 +1339,7 @@ where
     pub fn finish(
         self,
     ) -> Result<
-        SortedRecordStream<
-            spillover::Sorted<KeyedRunMerge<SeqRecord, Cod, Cmp, KeyCompare<SK, Cmp>>>,
-        >,
+        SortedRecordStream<spillover::Sorted<KeyedRunMerge<Cod, Cmp, KeyCompare<SK, Cmp>>>>,
         MergeError<Cod::Error>,
     > {
         let inner = self.inner.inner.finish()?;

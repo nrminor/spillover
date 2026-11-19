@@ -7,15 +7,15 @@
 //! to temporary files automatically.
 //!
 //! The merge engine supports two paths:
-//! - record path: heap holds full records
+//! - record path: heap holds source indices; cursors retain current records
 //! - keyed path: heap holds compact keys and falls back to
 //!   full-record comparison when keys tie
 //!
 //! Both paths share fan-in recursion and intermediate spilling.
 
 use std::{
-    cmp::Reverse,
-    collections::BinaryHeap,
+    cmp::Ordering,
+    convert::Infallible,
     io::{BufReader, BufWriter},
     num::NonZeroUsize,
     path::PathBuf,
@@ -25,10 +25,10 @@ use crate::{
     SortedItemsError,
     codec::{
         Codec, CodecCursor, CodecWriter, EncodeKeyedRun, EncodeRun, KeyedCodec, KeyedCodecCursor,
-        KeyedCodecWriter,
+        KeyedCodecWriter, TakeOwned,
     },
-    compare::{Compare, WithOrd},
-    sorter::{VisitSortedItems, sealed},
+    compare::Compare,
+    sorter::VisitSortedItems,
 };
 
 /// Errors that can occur during merge operations.
@@ -40,6 +40,9 @@ pub enum MergeError<CE> {
     /// A temporary file ended with a partial record.
     TruncatedEntry,
 
+    /// A selected cursor did not provide its current record.
+    MissingCurrent,
+
     /// The codec failed to decode an entry from bytes.
     Codec(CE),
 }
@@ -49,6 +52,7 @@ impl<CE: std::fmt::Display> std::fmt::Display for MergeError<CE> {
         match self {
             Self::Io(e) => write!(f, "merge I/O error: {e}"),
             Self::TruncatedEntry => write!(f, "sorted run ended with a partial record"),
+            Self::MissingCurrent => write!(f, "selected cursor has no current record"),
             Self::Codec(e) => write!(f, "failed to decode entry from sorted run: {e}"),
         }
     }
@@ -58,7 +62,7 @@ impl<CE: std::error::Error + 'static> std::error::Error for MergeError<CE> {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::Io(e) => Some(e),
-            Self::TruncatedEntry => None,
+            Self::TruncatedEntry | Self::MissingCurrent => None,
             Self::Codec(e) => Some(e),
         }
     }
@@ -138,136 +142,13 @@ impl SortedRun {
     }
 }
 
-// ── MergeSource trait ────────────────────────────────────
-
-/// Abstracts one sorted run as a source for heap merge.
-///
-/// For the record path, the heap holds full records and
-/// [`output`](Self::output) returns the record directly.
-/// For the keyed path, the heap holds compact keys and
-/// `output` fetches the full record from the reader only
-/// for the merge winner.
-pub(crate) trait MergeSource {
-    /// What goes in the merge heap (full record or compact key).
-    type HeapItem;
-
-    /// What the merge emits (always the full record).
-    type Output;
-
-    /// The error type from the underlying codec.
-    type Error: std::error::Error + Send + Sync + 'static;
-
-    /// Read the next heap item from this source.
-    /// Returns `None` at clean EOF.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if reading or decoding fails.
-    fn next(&mut self) -> Result<Option<Self::HeapItem>, Self::Error>;
-
-    /// Convert a popped heap item into the output value.
-    /// For the record path this returns the item itself.
-    /// For the keyed path this fetches the full record
-    /// from the reader.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if fetching the record fails.
-    fn output(&mut self, heap_item: Self::HeapItem) -> Result<Self::Output, Self::Error>;
-}
-
-/// Merge reader whose heap entries are full records.
-pub(crate) struct MergeReader<T, C: Codec<Item = T>> {
-    reader: C::Cursor<RunReader>,
-    _item: std::marker::PhantomData<fn() -> T>,
-}
-
-impl<T, C: Codec<Item = T>> MergeReader<T, C> {
-    pub fn new(codec: C, reader: RunReader) -> Self {
-        Self {
-            reader: codec.cursor(reader),
-            _item: std::marker::PhantomData,
-        }
-    }
-}
-
-impl<T, C> MergeSource for MergeReader<T, C>
-where
-    C: Codec<Item = T>,
-{
-    type HeapItem = T;
-    type Output = T;
-    type Error = C::Error;
-
-    fn next(&mut self) -> Result<Option<T>, C::Error> {
-        if self.reader.advance()? {
-            self.reader.current().map(Some)
-        } else {
-            Ok(None)
-        }
-    }
-
-    fn output(&mut self, heap_item: T) -> Result<T, C::Error> {
-        Ok(heap_item)
-    }
-}
-
-/// Keyed merge reader: heap holds compact keys, records
-/// fetched on demand for the winner only.
-pub(crate) struct KeyedMergeReader<T, C: KeyedCodec<Item = T>> {
-    reader: C::KeyedCursor<RunReader>,
-    _item: std::marker::PhantomData<fn() -> T>,
-}
-
-impl<T, C: KeyedCodec<Item = T>> KeyedMergeReader<T, C> {
-    pub fn new(codec: C, reader: RunReader) -> Self {
-        Self {
-            reader: codec.keyed_cursor(reader),
-            _item: std::marker::PhantomData,
-        }
-    }
-
-    fn current(&mut self) -> Result<T, C::Error> {
-        self.reader.current()
-    }
-
-    fn with_current<'a, R>(
-        &'a mut self,
-        f: impl FnOnce(<C::KeyedCursor<RunReader> as CodecCursor<T>>::Current<'a>) -> R,
-    ) -> Result<R, C::Error> {
-        self.reader.with_current(f)
-    }
-}
-
-impl<T, C> MergeSource for KeyedMergeReader<T, C>
-where
-    C: KeyedCodec<Item = T>,
-{
-    type HeapItem = C::Key;
-    type Output = T;
-    type Error = C::Error;
-
-    fn next(&mut self) -> Result<Option<C::Key>, C::Error> {
-        if self.reader.advance()? {
-            self.reader.current_key().map(Some)
-        } else {
-            Ok(None)
-        }
-    }
-
-    fn output(&mut self, _key: C::Key) -> Result<T, C::Error> {
-        self.reader.current()
-    }
-}
-
 // ── RunMerger ────────────────────────────────────────────
 
 /// Orchestrates the creation and merging of sorted runs on disk.
-pub struct RunMerger<T, C: Codec<Item = T>, Cmp: Compare<T> + Copy> {
+pub struct RunMerger<C: Codec, Cmp> {
     codec: C,
     cmp: Cmp,
     config: MergeConfig,
-    _item: std::marker::PhantomData<fn() -> T>,
 }
 
 /// Writes sorted entries into temporary run files.
@@ -313,11 +194,11 @@ impl<C, M> RunWriter<C, M> {
 
 impl<C> RunWriter<C, Unkeyed>
 where
-    C: Codec + Copy,
+    C: Codec,
 {
     pub(crate) fn write_sorted<T>(&self, items: &[T]) -> MergeResult<SortedRun, C::Error>
     where
-        C: Codec<Item = T> + EncodeRun<T>,
+        C: EncodeRun<T>,
     {
         let named = self.create_temp_file()?;
         let file = named.reopen().map_err(MergeError::Io)?;
@@ -339,11 +220,11 @@ where
 
 impl<C> RunWriter<C, Keyed>
 where
-    C: KeyedCodec + Copy,
+    C: KeyedCodec,
 {
     pub(crate) fn write_sorted<T>(&self, items: &[T]) -> MergeResult<SortedRun, C::Error>
     where
-        C: KeyedCodec<Item = T> + EncodeKeyedRun<T>,
+        C: EncodeKeyedRun<T>,
     {
         let named = self.create_temp_file()?;
         let file = named.reopen().map_err(MergeError::Io)?;
@@ -364,18 +245,11 @@ where
     }
 }
 
-impl<T: 'static, C: Codec<Item = T> + Copy + 'static, Cmp: Compare<T> + Copy + 'static>
-    RunMerger<T, C, Cmp>
-{
+impl<C: Codec, Cmp> RunMerger<C, Cmp> {
     /// Create a new merger.
     #[must_use]
     pub fn new(codec: C, cmp: Cmp, config: MergeConfig) -> Self {
-        Self {
-            codec,
-            cmp,
-            config,
-            _item: std::marker::PhantomData,
-        }
+        Self { codec, cmp, config }
     }
 
     fn create_temp_file(&self) -> MergeResult<tempfile::NamedTempFile, C::Error> {
@@ -385,16 +259,10 @@ impl<T: 'static, C: Codec<Item = T> + Copy + 'static, Cmp: Compare<T> + Copy + '
         };
         Ok(file)
     }
-}
 
-impl<T: 'static, C: Codec<Item = T> + Copy + 'static, Cmp: Compare<T> + Copy + 'static>
-    RunMerger<T, C, Cmp>
-{
     /// Write a pre-sorted iterator of items to a temporary file.
     ///
-    /// The write-side item type may differ from [`Codec::Item`]. This is useful
-    /// for callers that can expose borrowed or view-shaped records while the
-    /// codec cursor still materializes owned items when the run is read back.
+    /// The write-side item type may differ from the cursor's borrowed record.
     /// The caller is responsible for providing items in sorted order.
     ///
     /// # Errors
@@ -424,8 +292,7 @@ impl<T: 'static, C: Codec<Item = T> + Copy + 'static, Cmp: Compare<T> + Copy + '
         })
     }
 
-    /// Merge sorted runs using the record path (full record
-    /// deserialization for comparison).
+    /// Consume this merger to merge runs by their borrowed current records.
     ///
     /// When there are more runs than [`MergeConfig::max_fan_in`],
     /// intermediate merge passes spill to temp files automatically.
@@ -433,50 +300,31 @@ impl<T: 'static, C: Codec<Item = T> + Copy + 'static, Cmp: Compare<T> + Copy + '
     /// # Errors
     ///
     /// Returns an error if reading or merging fails.
-    pub fn merge(&self, mut runs: Vec<SortedRun>) -> MergeResult<RunMerge<T, C, Cmp>, C::Error>
+    pub fn merge(self, runs: Vec<SortedRun>) -> MergeResult<RunMerge<C, Cmp>, C::Error>
     where
-        C: EncodeRun<T>,
+        C: EncodeRun<<<C as Codec>::Cursor<RunReader> as CodecCursor>::Record>,
+        Cmp: Compare<<C::Cursor<RunReader> as CodecCursor>::Record>,
     {
-        let codec = self.codec;
-        let cmp = self.cmp;
         let fan_in = self.config.max_fan_in.get();
-
-        while runs.len() > fan_in {
-            let mut intermediate = Vec::new();
-            while !runs.is_empty() {
-                let chunk_end = runs.len().min(fan_in);
-                let group: Vec<SortedRun> = runs.drain(..chunk_end).collect();
-                let readers = open_unkeyed_readers(group, codec, &self.config)?;
-                let mut heap = HeapMerge::new(readers, cmp)?;
-                let run = self.spill_heap_to_disk(&mut heap, codec)?;
-                intermediate.push(run);
-            }
-            runs = intermediate;
-        }
-
-        Ok(RunMerge::new(runs, codec, cmp, self.config.clone()))
+        let final_runs = reduce_runs(runs, fan_in, |group| self.spill_group(group))?;
+        let execution = Execution::new(self, final_runs);
+        Ok(RunMerge { execution })
     }
 
-    /// Drain a heap merge into a temp file via the unkeyed codec writer.
-    fn spill_heap_to_disk<
-        MR: MergeSource<Output = T, Error = C::Error>,
-        HCmp: Compare<MR::HeapItem> + Copy,
-    >(
-        &self,
-        heap: &mut HeapMerge<MR, HCmp>,
-        codec: C,
-    ) -> MergeResult<SortedRun, C::Error>
+    fn spill_group(&self, runs: Vec<SortedRun>) -> MergeResult<SortedRun, C::Error>
     where
-        C: EncodeRun<T>,
+        C: EncodeRun<<<C as Codec>::Cursor<RunReader> as CodecCursor>::Record>,
+        Cmp: Compare<<C::Cursor<RunReader> as CodecCursor>::Record>,
     {
         let named = self.create_temp_file()?;
         let file = named.reopen().map_err(MergeError::Io)?;
         let mut run_writer = self.config.run_writer(file);
-        let mut writer = codec.writer(&mut run_writer);
-        while let Some(item) = heap.next_output()? {
-            writer.write(&item).map_err(MergeError::Codec)?;
-        }
-        CodecWriter::<T>::finish(writer).map_err(MergeError::Codec)?;
+        let mut writer = self.codec.writer(&mut run_writer);
+        let execution = Execution::new(self, runs);
+        execution
+            .visit_items(|record| writer.write(record))
+            .map_err(intermediate_error)?;
+        writer.finish().map_err(MergeError::Codec)?;
         std::io::Write::flush(&mut run_writer).map_err(MergeError::Io)?;
         Ok(SortedRun {
             path: named.into_temp_path(),
@@ -485,12 +333,10 @@ impl<T: 'static, C: Codec<Item = T> + Copy + 'static, Cmp: Compare<T> + Copy + '
 }
 
 // Keyed merge — only available when the codec supports keys.
-impl<T: 'static, C: KeyedCodec<Item = T> + Copy + 'static, Cmp: Compare<T> + Copy + 'static>
-    RunMerger<T, C, Cmp>
-{
+impl<C: KeyedCodec, Cmp> RunMerger<C, Cmp> {
     /// Write a pre-sorted iterator of items and stored keys to a temporary file.
     ///
-    /// The write-side item type may differ from [`Codec::Item`]. Keys are
+    /// The write-side item type may differ from the cursor's record. Keys are
     /// derived from each write-side item and stored alongside the record so the
     /// resulting run can be consumed by [`merge_keyed`](Self::merge_keyed).
     /// The caller is responsible for providing items in sorted order.
@@ -523,68 +369,203 @@ impl<T: 'static, C: KeyedCodec<Item = T> + Copy + 'static, Cmp: Compare<T> + Cop
         })
     }
 
-    /// Merge sorted runs using the keyed path (key-only
-    /// comparison, full deserialization only for the winner).
+    /// Consume this merger to merge runs by stored key, comparing borrowed
+    /// records when keys tie.
     ///
     /// When there are more runs than [`MergeConfig::max_fan_in`],
     /// intermediate merge passes spill to temp files automatically.
-    /// Intermediate files are written with record keys so the next
-    /// merge level can use keyed comparison.
+    /// Intermediate files preserve each winning entry's original stored key.
     ///
     /// # Errors
     ///
     /// Returns an error if reading or merging fails.
-    pub fn merge_keyed<KeyCmp: Compare<C::Key> + Copy>(
-        &self,
-        mut runs: Vec<SortedRun>,
+    pub fn merge_keyed<KeyCmp: Compare<C::Key>>(
+        self,
+        runs: Vec<SortedRun>,
         key_cmp: KeyCmp,
-    ) -> MergeResult<KeyedRunMerge<T, C, KeyCmp, Cmp>, C::Error>
+    ) -> MergeResult<KeyedRunMerge<C, KeyCmp, Cmp>, C::Error>
     where
-        C: EncodeKeyedRun<T>,
+        C: EncodeKeyedRun<<<C as KeyedCodec>::KeyedCursor<RunReader> as CodecCursor>::Record>,
+        Cmp: Compare<<C::KeyedCursor<RunReader> as CodecCursor>::Record>,
     {
-        let codec = self.codec;
         let fan_in = self.config.max_fan_in.get();
-
-        while runs.len() > fan_in {
-            let mut intermediate = Vec::new();
-            while !runs.is_empty() {
-                let chunk_end = runs.len().min(fan_in);
-                let group: Vec<SortedRun> = runs.drain(..chunk_end).collect();
-
-                let readers = open_keyed_readers(group, codec, &self.config)?;
-                let mut heap = KeyedHeapMerge::new(readers, key_cmp, self.cmp)?;
-                let run = self.spill_keyed_heap_to_disk(&mut heap, codec)?;
-                intermediate.push(run);
-            }
-            runs = intermediate;
-        }
-
-        Ok(KeyedRunMerge::new(
-            runs,
-            codec,
+        let context = KeyedContext {
+            merger: self,
             key_cmp,
-            self.cmp,
-            self.config.clone(),
-        ))
+        };
+        let final_runs = reduce_runs(runs, fan_in, |group| context.spill_group(group))?;
+        let execution = Execution::new(context, final_runs);
+        Ok(KeyedRunMerge { execution })
+    }
+}
+
+fn reduce_runs<CE>(
+    mut runs: Vec<SortedRun>,
+    fan_in: usize,
+    mut spill_group: impl FnMut(Vec<SortedRun>) -> MergeResult<SortedRun, CE>,
+) -> MergeResult<Vec<SortedRun>, CE> {
+    while runs.len() > fan_in {
+        let mut intermediate = Vec::new();
+        while !runs.is_empty() {
+            let chunk_end = runs.len().min(fan_in);
+            let group = runs.drain(..chunk_end).collect();
+            let run = spill_group(group)?;
+            intermediate.push(run);
+        }
+        runs = intermediate;
+    }
+    Ok(runs)
+}
+
+fn intermediate_error<CE>(error: SortedItemsError<MergeError<CE>, CE>) -> MergeError<CE> {
+    match error {
+        SortedItemsError::Source(error) => error,
+        SortedItemsError::Sink(error) => MergeError::Codec(error),
+    }
+}
+
+// These are the only mode-specific operations. Selection, progress, and delivery
+// are shared. A borrowed context lets intermediate passes use the final owner's
+// configuration without copying its comparators.
+trait MergeContext {
+    type Error: std::error::Error + Send + Sync + 'static;
+    type Cursor: CodecCursor<Error = Self::Error>;
+    type Key;
+
+    fn config(&self) -> &MergeConfig;
+    fn open(&self, reader: RunReader) -> Result<Self::Cursor, Self::Error>;
+    fn current_key(&self, cursor: &Self::Cursor) -> Result<Self::Key, Self::Error>;
+    fn compare(
+        &self,
+        readers: &mut [Self::Cursor],
+        left: &HeapEntry<Self::Key>,
+        right: &HeapEntry<Self::Key>,
+    ) -> Result<Ordering, Self::Error>;
+}
+
+impl<M: MergeContext> MergeContext for &M {
+    type Error = M::Error;
+    type Cursor = M::Cursor;
+    type Key = M::Key;
+
+    fn config(&self) -> &MergeConfig {
+        M::config(self)
     }
 
-    /// Drain a keyed heap merge into a temp file, re-deriving
-    /// record keys so the next merge level can use keyed comparison.
-    fn spill_keyed_heap_to_disk<KeyCmp: Compare<C::Key> + Copy>(
+    fn open(&self, reader: RunReader) -> Result<Self::Cursor, Self::Error> {
+        M::open(self, reader)
+    }
+
+    fn current_key(&self, cursor: &Self::Cursor) -> Result<Self::Key, Self::Error> {
+        M::current_key(self, cursor)
+    }
+
+    fn compare(
         &self,
-        heap: &mut KeyedHeapMerge<T, C, KeyCmp, Cmp>,
-        codec: C,
-    ) -> MergeResult<SortedRun, C::Error>
-    where
-        C: EncodeKeyedRun<T>,
-    {
-        let named = self.create_temp_file()?;
+        readers: &mut [Self::Cursor],
+        left: &HeapEntry<Self::Key>,
+        right: &HeapEntry<Self::Key>,
+    ) -> Result<Ordering, Self::Error> {
+        M::compare(self, readers, left, right)
+    }
+}
+
+impl<C, Cmp> MergeContext for RunMerger<C, Cmp>
+where
+    C: Codec,
+    Cmp: Compare<<C::Cursor<RunReader> as CodecCursor>::Record>,
+{
+    type Error = C::Error;
+    type Cursor = C::Cursor<RunReader>;
+    type Key = ();
+
+    fn config(&self) -> &MergeConfig {
+        &self.config
+    }
+
+    fn open(&self, reader: RunReader) -> Result<Self::Cursor, Self::Error> {
+        self.codec.cursor(reader)
+    }
+
+    fn current_key(&self, _cursor: &Self::Cursor) -> Result<(), Self::Error> {
+        Ok(())
+    }
+
+    fn compare(
+        &self,
+        readers: &mut [Self::Cursor],
+        left: &HeapEntry<()>,
+        right: &HeapEntry<()>,
+    ) -> Result<Ordering, Self::Error> {
+        let ordering = compare_records(readers, left.source, right.source, &self.cmp)?;
+        Ok(ordering.then_with(|| left.source.cmp(&right.source)))
+    }
+}
+
+struct KeyedContext<C: KeyedCodec, KeyCmp, ItemCmp> {
+    merger: RunMerger<C, ItemCmp>,
+    key_cmp: KeyCmp,
+}
+
+impl<C, KeyCmp, ItemCmp> MergeContext for KeyedContext<C, KeyCmp, ItemCmp>
+where
+    C: KeyedCodec,
+    KeyCmp: Compare<C::Key>,
+    ItemCmp: Compare<<C::KeyedCursor<RunReader> as CodecCursor>::Record>,
+{
+    type Error = C::Error;
+    type Cursor = C::KeyedCursor<RunReader>;
+    type Key = C::Key;
+
+    fn config(&self) -> &MergeConfig {
+        &self.merger.config
+    }
+
+    fn open(&self, reader: RunReader) -> Result<Self::Cursor, Self::Error> {
+        self.merger.codec.keyed_cursor(reader)
+    }
+
+    fn current_key(&self, cursor: &Self::Cursor) -> Result<Self::Key, Self::Error> {
+        cursor.current_key()
+    }
+
+    fn compare(
+        &self,
+        readers: &mut [Self::Cursor],
+        left: &HeapEntry<Self::Key>,
+        right: &HeapEntry<Self::Key>,
+    ) -> Result<Ordering, Self::Error> {
+        let key_ordering = self.key_cmp.compare(&left.key, &right.key);
+        if !key_ordering.is_eq() {
+            return Ok(key_ordering);
+        }
+        let ordering = compare_records(readers, left.source, right.source, &self.merger.cmp)?;
+        Ok(ordering.then_with(|| left.source.cmp(&right.source)))
+    }
+}
+
+impl<C, KeyCmp, ItemCmp> KeyedContext<C, KeyCmp, ItemCmp>
+where
+    C: KeyedCodec
+        + EncodeKeyedRun<<<C as KeyedCodec>::KeyedCursor<RunReader> as CodecCursor>::Record>,
+    KeyCmp: Compare<C::Key>,
+    ItemCmp: Compare<<C::KeyedCursor<RunReader> as CodecCursor>::Record>,
+{
+    fn spill_group(&self, runs: Vec<SortedRun>) -> MergeResult<SortedRun, C::Error> {
+        let named = self.merger.create_temp_file()?;
         let file = named.reopen().map_err(MergeError::Io)?;
-        let mut run_writer = self.config.run_writer(file);
-        let mut writer = codec.keyed_writer(&mut run_writer);
-        while let Some(item) = heap.next_output()? {
-            let key = codec.derive_key(&item);
-            writer.write_keyed(&item, &key).map_err(MergeError::Codec)?;
+        let mut run_writer = self.merger.config.run_writer(file);
+        let mut writer = self.merger.codec.keyed_writer(&mut run_writer);
+        let mut execution = Execution::new(self, runs);
+        loop {
+            let delivered = execution
+                .next_with(|state, winner| {
+                    state.with_record(winner, |record| writer.write_keyed(record, &winner.key))
+                })
+                .map_err(intermediate_error)?;
+            if delivered.is_none() {
+                break;
+            }
         }
         writer.finish().map_err(MergeError::Codec)?;
         std::io::Write::flush(&mut run_writer).map_err(MergeError::Io)?;
@@ -594,545 +575,333 @@ impl<T: 'static, C: KeyedCodec<Item = T> + Copy + 'static, Cmp: Compare<T> + Cop
     }
 }
 
-// ── Reader construction helpers ──────────────────────────
-
-fn open_unkeyed_readers<T, C: Codec<Item = T> + Copy>(
-    runs: Vec<SortedRun>,
-    codec: C,
-    config: &MergeConfig,
-) -> MergeResult<Vec<MergeReader<T, C>>, C::Error> {
-    runs.into_iter()
-        .map(|run| {
-            let reader = config.run_reader(&run)?;
-            Ok(MergeReader::new(codec, reader))
-        })
-        .collect()
-}
-
-fn open_keyed_readers<T, C: KeyedCodec<Item = T> + Copy>(
-    runs: Vec<SortedRun>,
-    codec: C,
-    config: &MergeConfig,
-) -> MergeResult<Vec<KeyedMergeReader<T, C>>, C::Error> {
-    runs.into_iter()
-        .map(|run| {
-            let reader = config.run_reader(&run)?;
-            Ok(KeyedMergeReader::new(codec, reader))
-        })
-        .collect()
-}
-
-// ── Heap merge engine ────────────────────────────────────
-
-struct HeapEntry<MR: MergeSource, Cmp: Compare<MR::HeapItem> + Copy> {
-    item: WithOrd<MR::HeapItem, Cmp>,
-    source_idx: usize,
-}
-
-impl<MR: MergeSource, Cmp: Compare<MR::HeapItem> + Copy> Eq for HeapEntry<MR, Cmp> {}
-
-impl<MR: MergeSource, Cmp: Compare<MR::HeapItem> + Copy> PartialEq for HeapEntry<MR, Cmp> {
-    fn eq(&self, other: &Self) -> bool {
-        self.item == other.item && self.source_idx == other.source_idx
-    }
-}
-
-impl<MR: MergeSource, Cmp: Compare<MR::HeapItem> + Copy> Ord for HeapEntry<MR, Cmp> {
-    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        self.item
-            .cmp(&other.item)
-            .then(self.source_idx.cmp(&other.source_idx))
-    }
-}
-
-impl<MR: MergeSource, Cmp: Compare<MR::HeapItem> + Copy> PartialOrd for HeapEntry<MR, Cmp> {
-    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
-        Some(self.cmp(other))
-    }
-}
-
-/// The k-way merge engine. Holds N readers and a min-heap
-/// with at most one entry per reader.
-struct HeapMerge<MR: MergeSource, Cmp: Compare<MR::HeapItem> + Copy> {
-    readers: Vec<MR>,
-    heap: BinaryHeap<Reverse<HeapEntry<MR, Cmp>>>,
-    cmp: Cmp,
-}
-
-impl<MR: MergeSource, Cmp: Compare<MR::HeapItem> + Copy> HeapMerge<MR, Cmp> {
-    /// Seed the heap by reading one item from each reader.
-    fn new(mut readers: Vec<MR>, cmp: Cmp) -> Result<Self, MergeError<MR::Error>> {
-        let mut heap = BinaryHeap::with_capacity(readers.len());
-
-        for (idx, reader) in readers.iter_mut().enumerate() {
-            if let Some(item) = reader.next().map_err(MergeError::Codec)? {
-                heap.push(Reverse(HeapEntry {
-                    item: WithOrd::new(item, cmp),
-                    source_idx: idx,
-                }));
-            }
-        }
-
-        Ok(Self { readers, heap, cmp })
-    }
-
-    /// Pop the smallest entry, produce the output, and advance.
-    fn next_output(&mut self) -> Result<Option<MR::Output>, MergeError<MR::Error>> {
-        let Some(Reverse(entry)) = self.heap.pop() else {
-            return Ok(None);
-        };
-
-        let output = self.readers[entry.source_idx]
-            .output(entry.item.into_inner())
-            .map_err(MergeError::Codec)?;
-
-        if let Some(next) = self.readers[entry.source_idx]
-            .next()
-            .map_err(MergeError::Codec)?
-        {
-            self.heap.push(Reverse(HeapEntry {
-                item: WithOrd::new(next, self.cmp),
-                source_idx: entry.source_idx,
-            }));
-        }
-
-        Ok(Some(output))
-    }
-}
-
-/// Keyed k-way merge engine. Heap compares record keys, and when
-/// keys tie across runs it falls back to full-record comparison.
-struct KeyedHeapMerge<
-    T,
-    C: KeyedCodec<Item = T>,
-    KeyCmp: Compare<C::Key> + Copy,
-    ItemCmp: Compare<T> + Copy,
-> {
-    readers: Vec<KeyedMergeReader<T, C>>,
-    heap: BinaryHeap<Reverse<HeapEntry<KeyedMergeReader<T, C>, KeyCmp>>>,
-    key_cmp: KeyCmp,
-    item_cmp: ItemCmp,
-}
-
-impl<T, C, KeyCmp, ItemCmp> KeyedHeapMerge<T, C, KeyCmp, ItemCmp>
+// Both indices identify positioned cursors. The split keeps their short-lived
+// mutable loans disjoint even when record access performs lazy decoding.
+fn compare_records<R, Cmp>(
+    readers: &mut [R],
+    left: usize,
+    right: usize,
+    cmp: &Cmp,
+) -> Result<Ordering, R::Error>
 where
-    C: KeyedCodec<Item = T>,
-    KeyCmp: Compare<C::Key> + Copy,
-    ItemCmp: Compare<T> + Copy,
+    R: CodecCursor,
+    Cmp: Compare<R::Record>,
 {
-    fn new(
-        mut readers: Vec<KeyedMergeReader<T, C>>,
-        key_cmp: KeyCmp,
-        item_cmp: ItemCmp,
-    ) -> Result<Self, MergeError<C::Error>> {
-        let mut heap = BinaryHeap::with_capacity(readers.len());
+    if left == right {
+        return Ok(Ordering::Equal);
+    }
+    let (left_reader, right_reader) = if left < right {
+        let (before, after) = readers.split_at_mut(right);
+        (&mut before[left], &mut after[0])
+    } else {
+        let (before, after) = readers.split_at_mut(left);
+        (&mut after[0], &mut before[right])
+    };
+    left_reader.with_current(|left_record| {
+        right_reader.with_current(|right_record| cmp.compare(left_record, right_record))
+    })?
+}
 
-        for (idx, reader) in readers.iter_mut().enumerate() {
-            if let Some(key) = reader.next().map_err(MergeError::Codec)? {
-                heap.push(Reverse(HeapEntry {
-                    item: WithOrd::new(key, key_cmp),
-                    source_idx: idx,
-                }));
-            }
+struct HeapEntry<K> {
+    source: usize,
+    key: K,
+}
+
+struct Selection<R, K> {
+    readers: Vec<R>,
+    heap: Vec<HeapEntry<K>>,
+}
+
+impl<R: CodecCursor, K> Selection<R, K> {
+    fn open<M>(context: &M, runs: Vec<SortedRun>) -> MergeResult<Self, R::Error>
+    where
+        M: MergeContext<Cursor = R, Key = K, Error = R::Error>,
+    {
+        let mut readers = Vec::with_capacity(runs.len());
+        let heap = Vec::with_capacity(runs.len());
+        for run in runs {
+            let transport = context.config().run_reader(&run)?;
+            let cursor = context.open(transport).map_err(MergeError::Codec)?;
+            readers.push(cursor);
         }
-
-        Ok(Self {
-            readers,
-            heap,
-            key_cmp,
-            item_cmp,
-        })
-    }
-
-    fn next_output(&mut self) -> Result<Option<T>, MergeError<C::Error>> {
-        let Some(Reverse(first)) = self.heap.pop() else {
-            return Ok(None);
-        };
-
-        if !self.has_key_tie(&first) {
-            let source_idx = first.source_idx;
-            let output = self.readers[source_idx]
-                .output(first.item.into_inner())
-                .map_err(MergeError::Codec)?;
-
-            self.advance_source(source_idx)?;
-
-            return Ok(Some(output));
+        let mut state = Self { readers, heap };
+        for source in 0..state.readers.len() {
+            state.refill(source, context)?;
         }
-
-        let tied = self.collect_key_ties(first);
-        let (winner, winner_record) = self.select_tied_winner(&tied)?;
-        let winner_source = tied[winner].source_idx;
-
-        self.reinsert_tied_losers(tied, winner);
-        self.advance_source(winner_source)?;
-
-        Ok(Some(winner_record))
+        Ok(state)
     }
 
-    fn has_key_tie(&self, first: &HeapEntry<KeyedMergeReader<T, C>, KeyCmp>) -> bool {
-        self.heap
-            .peek()
-            .is_some_and(|Reverse(next)| self.key_cmp.eq(next.item.as_ref(), first.item.as_ref()))
-    }
-
-    fn collect_key_ties(
-        &mut self,
-        first: HeapEntry<KeyedMergeReader<T, C>, KeyCmp>,
-    ) -> Vec<HeapEntry<KeyedMergeReader<T, C>, KeyCmp>> {
-        let mut tied = vec![first];
-        while let Some(Reverse(peek)) = self.heap.peek() {
-            if self.key_cmp.eq(peek.item.as_ref(), tied[0].item.as_ref()) {
-                let Reverse(entry) = self
-                    .heap
-                    .pop()
-                    .expect("heap.peek returned Some but pop failed");
-                tied.push(entry);
-            } else {
-                break;
-            }
-        }
-
-        tied
-    }
-
-    fn select_tied_winner(
-        &mut self,
-        tied: &[HeapEntry<KeyedMergeReader<T, C>, KeyCmp>],
-    ) -> Result<(usize, T), MergeError<C::Error>> {
-        let mut winner = 0usize;
-        let mut winner_record = self.readers[tied[0].source_idx]
-            .current()
+    fn refill<M>(&mut self, source: usize, context: &M) -> MergeResult<(), R::Error>
+    where
+        M: MergeContext<Cursor = R, Key = K, Error = R::Error>,
+    {
+        let cursor = &mut self.readers[source];
+        let positioned = cursor.advance().map_err(MergeError::Codec)?;
+        if positioned {
+            let key = context.current_key(cursor).map_err(MergeError::Codec)?;
+            let entry = HeapEntry { source, key };
+            heap_push_by(&mut self.heap, entry, |left, right| {
+                context.compare(&mut self.readers, left, right)
+            })
             .map_err(MergeError::Codec)?;
-
-        for (idx, entry) in tied.iter().enumerate().skip(1) {
-            let candidate = self.readers[entry.source_idx]
-                .current()
-                .map_err(MergeError::Codec)?;
-            let ordering = self.item_cmp.compare(&candidate, &winner_record);
-
-            if ordering.is_lt() || (ordering.is_eq() && entry.source_idx < tied[winner].source_idx)
-            {
-                winner = idx;
-                winner_record = candidate;
-            }
         }
-
-        Ok((winner, winner_record))
-    }
-
-    fn reinsert_tied_losers(
-        &mut self,
-        tied: Vec<HeapEntry<KeyedMergeReader<T, C>, KeyCmp>>,
-        winner: usize,
-    ) {
-        for (idx, entry) in tied.into_iter().enumerate() {
-            if idx != winner {
-                self.heap.push(Reverse(entry));
-            }
-        }
-    }
-
-    fn advance_source(&mut self, source_idx: usize) -> Result<(), MergeError<C::Error>> {
-        if let Some(next_key) = self.readers[source_idx].next().map_err(MergeError::Codec)? {
-            self.heap.push(Reverse(HeapEntry {
-                item: WithOrd::new(next_key, self.key_cmp),
-                source_idx,
-            }));
-        }
-
         Ok(())
     }
 
-    fn visit_next<F, FE>(
-        &mut self,
-        mut visit_item: F,
-    ) -> Result<bool, SortedItemsError<MergeError<C::Error>, FE>>
+    fn take_winner<M>(&mut self, context: &M) -> MergeResult<Option<HeapEntry<K>>, R::Error>
     where
-        F: for<'a> FnMut(
-            <C::KeyedCursor<RunReader> as CodecCursor<T>>::Current<'a>,
-        ) -> Result<(), FE>,
+        M: MergeContext<Cursor = R, Key = K, Error = R::Error>,
     {
-        let Some(Reverse(first)) = self.heap.pop() else {
-            return Ok(false);
-        };
+        heap_pop_by(&mut self.heap, |left, right| {
+            context.compare(&mut self.readers, left, right)
+        })
+        .map_err(MergeError::Codec)
+    }
 
-        if !self.has_key_tie(&first) {
-            let source_idx = first.source_idx;
-            self.readers[source_idx]
-                .with_current(&mut visit_item)
-                .map_err(MergeError::Codec)
-                .map_err(SortedItemsError::Source)?
-                .map_err(SortedItemsError::Sink)?;
-
-            self.advance_source(source_idx)
-                .map_err(SortedItemsError::Source)?;
-
-            return Ok(true);
-        }
-
-        let tied = self.collect_key_ties(first);
-        let (winner, winner_record) = self
-            .select_tied_winner(&tied)
-            .map_err(SortedItemsError::Source)?;
-        let winner_source = tied[winner].source_idx;
-
-        self.reinsert_tied_losers(tied, winner);
-
-        drop(winner_record);
-
-        self.readers[winner_source]
-            .with_current(visit_item)
+    fn with_record<Output, FE>(
+        &mut self,
+        winner: &HeapEntry<K>,
+        visit: impl FnOnce(&R::Record) -> Result<Output, FE>,
+    ) -> Result<Output, SortedItemsError<MergeError<R::Error>, FE>> {
+        let visited = self.readers[winner.source]
+            .with_current(visit)
             .map_err(MergeError::Codec)
-            .map_err(SortedItemsError::Source)?
-            .map_err(SortedItemsError::Sink)?;
-
-        self.advance_source(winner_source)
             .map_err(SortedItemsError::Source)?;
+        visited.map_err(SortedItemsError::Sink)
+    }
+}
 
-        Ok(true)
+// The caller supplies a min-heap and a consistent ordering for its live entries.
+// Failed comparisons may leave the heap unordered; the execution then drops it.
+fn heap_push_by<T, E>(
+    heap: &mut Vec<T>,
+    entry: T,
+    mut compare: impl FnMut(&T, &T) -> Result<Ordering, E>,
+) -> Result<(), E> {
+    let mut child = heap.len();
+    heap.push(entry);
+    while child > 0 {
+        let parent = (child - 1) / 2;
+        let ordering = compare(&heap[child], &heap[parent])?;
+        if !ordering.is_lt() {
+            break;
+        }
+        heap.swap(child, parent);
+        child = parent;
+    }
+    Ok(())
+}
+
+fn heap_pop_by<T, E>(
+    heap: &mut Vec<T>,
+    mut compare: impl FnMut(&T, &T) -> Result<Ordering, E>,
+) -> Result<Option<T>, E> {
+    if heap.is_empty() {
+        return Ok(None);
+    }
+    let winner = heap.swap_remove(0);
+    let mut parent = 0;
+    // Indices below len / 2 are exactly the nodes with children.
+    while parent < heap.len() / 2 {
+        let mut child = parent * 2 + 1;
+        let right = child + 1;
+        if right < heap.len() {
+            let ordering = compare(&heap[right], &heap[child])?;
+            if ordering.is_lt() {
+                child = right;
+            }
+        }
+        let ordering = compare(&heap[child], &heap[parent])?;
+        if !ordering.is_lt() {
+            break;
+        }
+        heap.swap(parent, child);
+        parent = child;
+    }
+    Ok(Some(winner))
+}
+
+enum MergePhase<S> {
+    Pending(Vec<SortedRun>),
+    Active(S),
+    NeedsRefill { state: S, source: usize },
+    Exhausted,
+    Failed,
+}
+
+struct Execution<M, R, K> {
+    context: M,
+    phase: MergePhase<Selection<R, K>>,
+}
+
+impl<M: MergeContext> Execution<M, M::Cursor, M::Key> {
+    fn new(context: M, runs: Vec<SortedRun>) -> Self {
+        Self {
+            context,
+            phase: MergePhase::Pending(runs),
+        }
+    }
+
+    // Delivery may access only the removed winner. It never advances a cursor
+    // or changes selection. All fallible work runs with Failed already installed.
+    fn next_with<Output, FE>(
+        &mut self,
+        deliver: impl FnOnce(
+            &mut Selection<M::Cursor, M::Key>,
+            &HeapEntry<M::Key>,
+        ) -> Result<Output, SortedItemsError<MergeError<M::Error>, FE>>,
+    ) -> Result<Option<Output>, SortedItemsError<MergeError<M::Error>, FE>> {
+        loop {
+            let phase = std::mem::replace(&mut self.phase, MergePhase::Failed);
+            match phase {
+                MergePhase::Pending(runs) => {
+                    let state =
+                        Selection::open(&self.context, runs).map_err(SortedItemsError::Source)?;
+                    self.phase = MergePhase::Active(state);
+                }
+                MergePhase::NeedsRefill { mut state, source } => {
+                    state
+                        .refill(source, &self.context)
+                        .map_err(SortedItemsError::Source)?;
+                    self.phase = MergePhase::Active(state);
+                }
+                MergePhase::Active(mut state) => {
+                    let selected = state
+                        .take_winner(&self.context)
+                        .map_err(SortedItemsError::Source)?;
+                    let Some(winner) = selected else {
+                        self.phase = MergePhase::Exhausted;
+                        return Ok(None);
+                    };
+                    let source = winner.source;
+                    let output = deliver(&mut state, &winner)?;
+                    self.phase = MergePhase::NeedsRefill { state, source };
+                    return Ok(Some(output));
+                }
+                MergePhase::Exhausted => {
+                    self.phase = MergePhase::Exhausted;
+                    return Ok(None);
+                }
+                MergePhase::Failed => return Ok(None),
+            }
+        }
+    }
+
+    fn next_owned(&mut self) -> Option<MergeResult<<M::Cursor as TakeOwned>::Owned, M::Error>>
+    where
+        M::Cursor: TakeOwned,
+    {
+        let delivered: Result<_, SortedItemsError<_, Infallible>> =
+            self.next_with(|state, winner| {
+                let extracted = state.readers[winner.source]
+                    .take_owned()
+                    .map_err(MergeError::Codec)
+                    .map_err(SortedItemsError::Source)?;
+                let record = extracted
+                    .ok_or(MergeError::MissingCurrent)
+                    .map_err(SortedItemsError::Source)?;
+                Ok(record)
+            });
+        match delivered {
+            Ok(Some(record)) => Some(Ok(record)),
+            Ok(None) => None,
+            Err(SortedItemsError::Source(error)) => Some(Err(error)),
+            Err(SortedItemsError::Sink(impossible)) => match impossible {},
+        }
+    }
+
+    fn visit_items<F, FE>(
+        mut self,
+        mut visit: F,
+    ) -> Result<(), SortedItemsError<MergeError<M::Error>, FE>>
+    where
+        F: FnMut(&<M::Cursor as CodecCursor>::Record) -> Result<(), FE>,
+    {
+        loop {
+            let delivered =
+                self.next_with(|state, winner| state.with_record(winner, &mut visit))?;
+            if delivered.is_none() {
+                return Ok(());
+            }
+        }
     }
 }
 
 /// Lazy merge over sorted runs spilled to disk.
 ///
-/// `RunMerge` owns the final sorted runs and constructs merge state when it is
-/// consumed. Owned iteration materializes items through the codec.
-pub struct RunMerge<T, C: Codec<Item = T>, Cmp: Compare<T> + Copy> {
-    runs: Option<Vec<SortedRun>>,
-    heap: Option<RecordHeap<T, C, Cmp>>,
-    codec: C,
-    cmp: Cmp,
-    config: MergeConfig,
-    failed: bool,
+/// The final runs open on first consumption. Borrowed traversal visits cursor
+/// records; owned iteration is available only when the cursor implements
+/// [`TakeOwned`]. The merger owns its codec, comparator, and configuration.
+pub struct RunMerge<C: Codec, Cmp> {
+    execution: Execution<RunMerger<C, Cmp>, C::Cursor<RunReader>, ()>,
 }
 
-type RecordHeap<T, C, Cmp> = HeapMerge<MergeReader<T, C>, Cmp>;
-
-impl<T, C, Cmp> RunMerge<T, C, Cmp>
+impl<C, Cmp> Iterator for RunMerge<C, Cmp>
 where
-    C: Codec<Item = T> + Copy,
-    Cmp: Compare<T> + Copy,
+    C: Codec,
+    C::Cursor<RunReader>: TakeOwned,
+    Cmp: Compare<<C::Cursor<RunReader> as CodecCursor>::Record>,
 {
-    fn new(runs: Vec<SortedRun>, codec: C, cmp: Cmp, config: MergeConfig) -> Self {
-        Self {
-            runs: Some(runs),
-            heap: None,
-            codec,
-            cmp,
-            config,
-            failed: false,
-        }
-    }
+    type Item = MergeResult<<C::Cursor<RunReader> as TakeOwned>::Owned, C::Error>;
 
-    fn heap(&mut self) -> Result<&mut RecordHeap<T, C, Cmp>, MergeError<C::Error>> {
-        if self.heap.is_none() {
-            let runs = self.runs.take().expect("runs are initialized at most once");
-            let readers = open_unkeyed_readers(runs, self.codec, &self.config)?;
-            self.heap = Some(HeapMerge::new(readers, self.cmp)?);
-        }
-
-        Ok(self.heap.as_mut().expect("heap initialized before access"))
-    }
-}
-
-impl<T, C, Cmp> Iterator for RunMerge<T, C, Cmp>
-where
-    C: Codec<Item = T> + Copy,
-    Cmp: Compare<T> + Copy,
-{
-    type Item = Result<T, MergeError<C::Error>>;
-
-    #[inline]
     fn next(&mut self) -> Option<Self::Item> {
-        if self.failed {
-            return None;
-        }
-
-        let result = match self.heap() {
-            Ok(heap) => heap.next_output(),
-            Err(err) => {
-                self.failed = true;
-                return Some(Err(err));
-            }
-        };
-
-        match result {
-            Ok(Some(item)) => Some(Ok(item)),
-            Ok(None) => None,
-            Err(e) => {
-                self.failed = true;
-                Some(Err(e))
-            }
-        }
+        self.execution.next_owned()
     }
 }
 
-impl<T, C, Cmp> sealed::Sealed for RunMerge<T, C, Cmp>
+impl<C, Cmp> VisitSortedItems for RunMerge<C, Cmp>
 where
-    T: 'static,
-    C: Codec<Item = T> + Copy + 'static,
-    Cmp: Compare<T> + Copy + 'static,
+    C: Codec,
+    Cmp: Compare<<C::Cursor<RunReader> as CodecCursor>::Record>,
 {
-}
-
-impl<T, C, Cmp> VisitSortedItems for RunMerge<T, C, Cmp>
-where
-    T: 'static,
-    C: Codec<Item = T> + Copy + 'static,
-    Cmp: Compare<T> + Copy + 'static,
-{
-    type Item<'a>
-        = T
-    where
-        Self: 'a;
-
+    type Record = <C::Cursor<RunReader> as CodecCursor>::Record;
     type Error = MergeError<C::Error>;
 
-    fn visit_items<F, FE>(self, mut visit_item: F) -> Result<(), SortedItemsError<Self::Error, FE>>
+    fn visit_items<F, FE>(self, visit: F) -> Result<(), SortedItemsError<Self::Error, FE>>
     where
-        F: for<'a> FnMut(Self::Item<'a>) -> Result<(), FE>,
+        F: FnMut(&Self::Record) -> Result<(), FE>,
     {
-        for item in self {
-            let item = item.map_err(SortedItemsError::Source)?;
-            visit_item(item).map_err(SortedItemsError::Sink)?;
-        }
-
-        Ok(())
+        self.execution.visit_items(visit)
     }
 }
 
 /// Lazy keyed merge over sorted runs spilled to disk.
 ///
-/// `KeyedRunMerge` owns the final keyed runs and constructs keyed merge state
-/// when consumed. Owned iteration materializes records; current-item traversal
-/// can visit the winning cursor's current representation before advancing it.
-pub struct KeyedRunMerge<
-    T,
-    C: KeyedCodec<Item = T>,
-    KeyCmp: Compare<C::Key> + Copy,
-    ItemCmp: Compare<T> + Copy,
-> {
-    runs: Option<Vec<SortedRun>>,
-    heap: Option<KeyedHeapMerge<T, C, KeyCmp, ItemCmp>>,
-    codec: C,
-    key_cmp: KeyCmp,
-    item_cmp: ItemCmp,
-    config: MergeConfig,
-    failed: bool,
+/// Stored keys determine order, with borrowed record comparison on ties.
+/// Traversal borrows the winning record; owned iteration additionally requires
+/// the keyed cursor's [`TakeOwned`] capability.
+pub struct KeyedRunMerge<C: KeyedCodec, KeyCmp, ItemCmp> {
+    execution: Execution<KeyedContext<C, KeyCmp, ItemCmp>, C::KeyedCursor<RunReader>, C::Key>,
 }
 
-impl<T, C, KeyCmp, ItemCmp> KeyedRunMerge<T, C, KeyCmp, ItemCmp>
+impl<C, KeyCmp, ItemCmp> Iterator for KeyedRunMerge<C, KeyCmp, ItemCmp>
 where
-    C: KeyedCodec<Item = T>,
-    KeyCmp: Compare<C::Key> + Copy,
-    ItemCmp: Compare<T> + Copy,
+    C: KeyedCodec,
+    C::KeyedCursor<RunReader>: TakeOwned,
+    KeyCmp: Compare<C::Key>,
+    ItemCmp: Compare<<C::KeyedCursor<RunReader> as CodecCursor>::Record>,
 {
-    fn new(
-        runs: Vec<SortedRun>,
-        codec: C,
-        key_cmp: KeyCmp,
-        item_cmp: ItemCmp,
-        config: MergeConfig,
-    ) -> Self {
-        Self {
-            runs: Some(runs),
-            heap: None,
-            codec,
-            key_cmp,
-            item_cmp,
-            config,
-            failed: false,
-        }
-    }
+    type Item = MergeResult<<C::KeyedCursor<RunReader> as TakeOwned>::Owned, C::Error>;
 
-    fn heap(&mut self) -> Result<&mut KeyedHeapMerge<T, C, KeyCmp, ItemCmp>, MergeError<C::Error>> {
-        if self.heap.is_none() {
-            let runs = self
-                .runs
-                .take()
-                .expect("keyed runs are initialized at most once");
-            let readers = open_keyed_readers(runs, self.codec, &self.config)?;
-            self.heap = Some(KeyedHeapMerge::new(readers, self.key_cmp, self.item_cmp)?);
-        }
-
-        Ok(self
-            .heap
-            .as_mut()
-            .expect("keyed heap is initialized before access"))
-    }
-}
-
-impl<T, C, KeyCmp, ItemCmp> Iterator for KeyedRunMerge<T, C, KeyCmp, ItemCmp>
-where
-    C: KeyedCodec<Item = T>,
-    KeyCmp: Compare<C::Key> + Copy,
-    ItemCmp: Compare<T> + Copy,
-{
-    type Item = Result<T, MergeError<C::Error>>;
-
-    #[inline]
     fn next(&mut self) -> Option<Self::Item> {
-        if self.failed {
-            return None;
-        }
-
-        let result = match self.heap() {
-            Ok(heap) => heap.next_output(),
-            Err(err) => {
-                self.failed = true;
-                return Some(Err(err));
-            }
-        };
-
-        match result {
-            Ok(Some(item)) => Some(Ok(item)),
-            Ok(None) => None,
-            Err(e) => {
-                self.failed = true;
-                Some(Err(e))
-            }
-        }
+        self.execution.next_owned()
     }
 }
 
-impl<T, C, KeyCmp, ItemCmp> sealed::Sealed for KeyedRunMerge<T, C, KeyCmp, ItemCmp>
+impl<C, KeyCmp, ItemCmp> VisitSortedItems for KeyedRunMerge<C, KeyCmp, ItemCmp>
 where
-    T: 'static,
-    C: KeyedCodec<Item = T> + 'static,
-    KeyCmp: Compare<C::Key> + Copy + 'static,
-    ItemCmp: Compare<T> + Copy + 'static,
+    C: KeyedCodec,
+    KeyCmp: Compare<C::Key>,
+    ItemCmp: Compare<<C::KeyedCursor<RunReader> as CodecCursor>::Record>,
 {
-}
-
-impl<T, C, KeyCmp, ItemCmp> VisitSortedItems for KeyedRunMerge<T, C, KeyCmp, ItemCmp>
-where
-    T: 'static,
-    C: KeyedCodec<Item = T> + 'static,
-    KeyCmp: Compare<C::Key> + Copy + 'static,
-    ItemCmp: Compare<T> + Copy + 'static,
-{
-    type Item<'a>
-        = <C::KeyedCursor<RunReader> as CodecCursor<T>>::Current<'a>
-    where
-        Self: 'a;
-
+    type Record = <C::KeyedCursor<RunReader> as CodecCursor>::Record;
     type Error = MergeError<C::Error>;
 
-    fn visit_items<F, FE>(mut self, mut f: F) -> Result<(), SortedItemsError<Self::Error, FE>>
+    fn visit_items<F, FE>(self, visit: F) -> Result<(), SortedItemsError<Self::Error, FE>>
     where
-        F: for<'a> FnMut(Self::Item<'a>) -> Result<(), FE>,
+        F: FnMut(&Self::Record) -> Result<(), FE>,
     {
-        loop {
-            let visited = {
-                let heap = self.heap().map_err(SortedItemsError::Source)?;
-                heap.visit_next(|item| f(item))?
-            };
-
-            if !visited {
-                return Ok(());
-            }
-        }
+        self.execution.visit_items(visit)
     }
 }
 
@@ -1185,12 +954,9 @@ mod tests {
         current: Option<u64>,
     }
 
-    impl<R: Read> CodecCursor<u64> for U64Reader<R> {
+    impl<R: Read> CodecCursor for U64Reader<R> {
         type Error = std::io::Error;
-        type Current<'a>
-            = u64
-        where
-            Self: 'a;
+        type Record = u64;
 
         fn advance(&mut self) -> Result<bool, Self::Error> {
             let mut buf = [0u8; 8];
@@ -1208,29 +974,35 @@ mod tests {
             }
         }
 
-        fn current(&mut self) -> Result<u64, Self::Error> {
-            self.current
-                .ok_or_else(|| std::io::Error::other("current called before advance"))
-        }
-
-        fn with_current<'a, F>(
-            &'a mut self,
-            f: impl FnOnce(Self::Current<'a>) -> F,
+        fn with_current<F>(
+            &mut self,
+            f: impl FnOnce(&Self::Record) -> F,
         ) -> Result<F, Self::Error> {
-            self.current().map(f)
+            let record = self
+                .current
+                .as_ref()
+                .ok_or_else(|| std::io::Error::other("current called before advance"))?;
+            Ok(f(record))
+        }
+    }
+
+    impl<R: Read> TakeOwned for U64Reader<R> {
+        type Owned = u64;
+
+        fn take_owned(&mut self) -> Result<Option<Self::Owned>, Self::Error> {
+            Ok(self.current.take())
         }
     }
 
     impl Codec for U64Codec {
-        type Item = u64;
         type Error = std::io::Error;
         type Cursor<R: Read> = U64Reader<R>;
 
-        fn cursor<R: Read>(&self, source: R) -> U64Reader<R> {
-            U64Reader {
+        fn cursor<R: Read>(&self, source: R) -> Result<U64Reader<R>, Self::Error> {
+            Ok(U64Reader {
                 inner: source,
                 current: None,
-            }
+            })
         }
     }
 
@@ -1259,12 +1031,9 @@ mod tests {
         current: Option<u64>,
     }
 
-    impl<R: Read> CodecCursor<u64> for U64KeyedReader<R> {
+    impl<R: Read> CodecCursor for U64KeyedReader<R> {
         type Error = std::io::Error;
-        type Current<'a>
-            = u64
-        where
-            Self: 'a;
+        type Record = u64;
 
         fn advance(&mut self) -> Result<bool, Self::Error> {
             let mut buf = [0u8; 8];
@@ -1282,29 +1051,35 @@ mod tests {
             }
         }
 
-        fn current(&mut self) -> Result<u64, Self::Error> {
-            self.current
-                .ok_or_else(|| std::io::Error::other("current called before advance"))
-        }
-
-        fn with_current<'a, F>(
-            &'a mut self,
-            f: impl FnOnce(Self::Current<'a>) -> F,
+        fn with_current<F>(
+            &mut self,
+            f: impl FnOnce(&Self::Record) -> F,
         ) -> Result<F, Self::Error> {
-            self.current().map(f)
+            let record = self
+                .current
+                .as_ref()
+                .ok_or_else(|| std::io::Error::other("current called before advance"))?;
+            Ok(f(record))
+        }
+    }
+
+    impl<R: Read> TakeOwned for U64KeyedReader<R> {
+        type Owned = u64;
+
+        fn take_owned(&mut self) -> Result<Option<Self::Owned>, Self::Error> {
+            Ok(self.current.take())
         }
     }
 
     impl Codec for U64KeyedCodec {
-        type Item = u64;
         type Error = std::io::Error;
         type Cursor<R: Read> = U64KeyedReader<R>;
 
-        fn cursor<R: Read>(&self, source: R) -> U64KeyedReader<R> {
-            U64KeyedReader {
+        fn cursor<R: Read>(&self, source: R) -> Result<U64KeyedReader<R>, Self::Error> {
+            Ok(U64KeyedReader {
                 inner: source,
                 current: None,
-            }
+            })
         }
     }
 
@@ -1344,12 +1119,9 @@ mod tests {
         current: Option<u64>,
     }
 
-    impl<R: Read> CodecCursor<u64> for U64OnlyKeyedReader<R> {
+    impl<R: Read> CodecCursor for U64OnlyKeyedReader<R> {
         type Error = std::io::Error;
-        type Current<'a>
-            = u64
-        where
-            Self: 'a;
+        type Record = u64;
 
         fn advance(&mut self) -> Result<bool, Self::Error> {
             let mut key = [0u8; 1];
@@ -1370,20 +1142,27 @@ mod tests {
             }
         }
 
-        fn current(&mut self) -> Result<u64, Self::Error> {
-            self.current
-                .ok_or_else(|| std::io::Error::other("current called before advance"))
-        }
-
-        fn with_current<'a, T>(
-            &'a mut self,
-            f: impl FnOnce(Self::Current<'a>) -> T,
+        fn with_current<T>(
+            &mut self,
+            f: impl FnOnce(&Self::Record) -> T,
         ) -> Result<T, Self::Error> {
-            self.current().map(f)
+            let record = self
+                .current
+                .as_ref()
+                .ok_or_else(|| std::io::Error::other("current called before advance"))?;
+            Ok(f(record))
         }
     }
 
-    impl<R: Read> KeyedCodecCursor<u64, u8> for U64OnlyKeyedReader<R> {
+    impl<R: Read> TakeOwned for U64OnlyKeyedReader<R> {
+        type Owned = u64;
+
+        fn take_owned(&mut self) -> Result<Option<Self::Owned>, Self::Error> {
+            Ok(self.current.take())
+        }
+    }
+
+    impl<R: Read> KeyedCodecCursor<u8> for U64OnlyKeyedReader<R> {
         fn current_key(&self) -> Result<u8, Self::Error> {
             self.current_key
                 .ok_or_else(|| std::io::Error::other("current_key called before advance"))
@@ -1394,12 +1173,12 @@ mod tests {
         type Key = u8;
         type KeyedCursor<R: Read> = U64OnlyKeyedReader<R>;
 
-        fn keyed_cursor<R: Read>(&self, source: R) -> Self::KeyedCursor<R> {
-            U64OnlyKeyedReader {
+        fn keyed_cursor<R: Read>(&self, source: R) -> Result<Self::KeyedCursor<R>, Self::Error> {
+            Ok(U64OnlyKeyedReader {
                 inner: source,
                 current_key: None,
                 current: None,
-            }
+            })
         }
     }
 
@@ -1436,7 +1215,7 @@ mod tests {
         }
     }
 
-    fn default_merger() -> RunMerger<u64, U64Codec, Natural> {
+    fn default_merger() -> RunMerger<U64Codec, Natural> {
         RunMerger::new(U64Codec, Natural, MergeConfig::default())
     }
 
@@ -1704,7 +1483,7 @@ mod tests {
         }
 
         fn spill_runs(
-            merger: &RunMerger<u64, U64Codec, Natural>,
+            merger: &RunMerger<U64Codec, Natural>,
             batches: &[Vec<u64>],
         ) -> Vec<SortedRun> {
             batches
@@ -1717,10 +1496,7 @@ mod tests {
                 .collect()
         }
 
-        fn collect_merged(
-            merger: &RunMerger<u64, U64Codec, Natural>,
-            runs: Vec<SortedRun>,
-        ) -> Vec<u64> {
+        fn collect_merged(merger: RunMerger<U64Codec, Natural>, runs: Vec<SortedRun>) -> Vec<u64> {
             merger
                 .merge(runs)
                 .expect("merge in proptest")
@@ -1735,7 +1511,7 @@ mod tests {
             ) {
                 let merger = RunMerger::new(U64Codec, Natural, MergeConfig::default());
                 let runs = spill_runs(&merger, &batches);
-                let results = collect_merged(&merger, runs);
+                let results = collect_merged(merger, runs);
 
                 prop_assert!(
                     results.windows(2).all(|w| w[0] <= w[1]),
@@ -1750,7 +1526,7 @@ mod tests {
                 let merger = RunMerger::new(U64Codec, Natural, MergeConfig::default());
                 let total_input: usize = batches.iter().map(Vec::len).sum();
                 let runs = spill_runs(&merger, &batches);
-                let output_count = collect_merged(&merger, runs).len();
+                let output_count = collect_merged(merger, runs).len();
 
                 prop_assert_eq!(total_input, output_count);
             }
@@ -1765,7 +1541,7 @@ mod tests {
                 reference.sort_unstable();
 
                 let runs = spill_runs(&merger, &batches);
-                let results = collect_merged(&merger, runs);
+                let results = collect_merged(merger, runs);
 
                 prop_assert_eq!(results, reference);
             }
