@@ -261,6 +261,42 @@ fn sorted_record_stream_writes_to_custom_sink() {
 }
 
 #[test]
+fn mixed_output_preserves_name_history() {
+    let mut sorter = Builder::new()
+        .sort_by_name()
+        .dedup_by_name()
+        .codec(DryIceCodec::new())
+        .max_buffer_items(1)
+        .build();
+
+    let records = [
+        make_record(b"a", b"AAAA", b"!!!!"),
+        make_record(b"a", b"AAAA", b"!!!!"),
+        make_record(b"b", b"CCCC", b"####"),
+    ];
+    for record in records {
+        sorter.push(record).expect("push should succeed");
+    }
+
+    let mut stream = sorter.finish().expect("finish should succeed");
+    let first = stream
+        .next()
+        .expect("first record should exist")
+        .expect("first record should decode");
+    assert_eq!(first.name(), b"a");
+    assert_eq!(first.sequence(), b"AAAA");
+    assert_eq!(first.quality(), b"!!!!");
+
+    let mut sink = VecSink::default();
+    stream.write_to(&mut sink).expect("write_to should succeed");
+
+    assert_eq!(sink.records.len(), 1);
+    assert_eq!(sink.records[0].name(), b"b");
+    assert_eq!(sink.records[0].sequence(), b"CCCC");
+    assert_eq!(sink.records[0].quality(), b"####");
+}
+
+#[test]
 fn sorted_record_stream_applies_dedup_when_writing_to_sink() {
     let mut sorter = Builder::new()
         .sort_by_illumina()

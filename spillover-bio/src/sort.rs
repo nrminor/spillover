@@ -584,6 +584,50 @@ impl SeqRecordParts for PreviousRecord {
     }
 }
 
+struct RecordDedupState {
+    mode: RecordDedup,
+    previous: Option<PreviousRecord>,
+}
+
+impl RecordDedupState {
+    fn new(mode: RecordDedup) -> Self {
+        Self {
+            mode,
+            previous: None,
+        }
+    }
+
+    fn is_enabled(&self) -> bool {
+        self.mode.is_enabled()
+    }
+
+    fn accept<R: SeqRecordParts + ?Sized>(&mut self, record: &R) -> bool {
+        if !self.is_enabled() {
+            return true;
+        }
+        if self.mode.is_duplicate(self.previous.as_ref(), record) {
+            return false;
+        }
+        let previous = self.previous.get_or_insert_with(PreviousRecord::default);
+        previous.copy_from(record);
+        true
+    }
+
+    fn write<R, W>(&mut self, record: &R, writer: &mut W) -> Result<(), W::Error>
+    where
+        R: SeqRecordParts + ?Sized,
+        W: SeqRecordSink,
+    {
+        if !self.accept(record) {
+            return Ok(());
+        }
+        match &self.previous {
+            Some(previous) => writer.write_record(previous),
+            None => writer.write_record(record),
+        }
+    }
+}
+
 /// Builder marker: no sort order chosen yet.
 pub struct NeedsOrder;
 /// Builder marker: keyed sort order has been chosen.
@@ -778,9 +822,18 @@ pub struct ArenaBackend<'a, SK, Cod, KeyCmp, RecCmp, CS, M> {
 /// ordinary `.collect()` callsites continue to work.
 pub struct SortedRecordStream<I> {
     inner: I,
-    dedup: RecordDedup,
-    previous: Option<PreviousRecord>,
+    dedup: RecordDedupState,
     fused: bool,
+}
+
+impl<I> SortedRecordStream<I> {
+    fn new(inner: I, dedup: RecordDedupState) -> Self {
+        Self {
+            inner,
+            dedup,
+            fused: false,
+        }
+    }
 }
 
 /// Destination for sequence records produced by a sorted stream.
@@ -981,14 +1034,9 @@ where
         loop {
             match self.inner.next() {
                 Some(Ok(record)) => {
-                    if self.dedup.is_duplicate(self.previous.as_ref(), &record) {
-                        continue;
+                    if self.dedup.accept(&record) {
+                        return Some(Ok(record));
                     }
-
-                    self.previous
-                        .get_or_insert_with(PreviousRecord::default)
-                        .copy_from(&record);
-                    return Some(Ok(record));
                 }
                 Some(Err(err)) => {
                     self.fused = true;
@@ -1023,8 +1071,7 @@ where
     {
         let Self {
             inner,
-            dedup,
-            mut previous,
+            mut dedup,
             fused,
         } = self;
 
@@ -1033,19 +1080,7 @@ where
         }
 
         inner
-            .visit_items(|record| {
-                if dedup.is_duplicate(previous.as_ref(), &record) {
-                    return Ok(());
-                }
-
-                if dedup.is_enabled() {
-                    let previous = previous.get_or_insert_with(PreviousRecord::default);
-                    previous.copy_from(&record);
-                    writer.write_record(previous)
-                } else {
-                    writer.write_record(&record)
-                }
-            })
+            .visit_items(|record| dedup.write(&record, writer))
             .map_err(|err| match err {
                 SortedItemsError::Source(err) => SortedRecordStreamError::Source(err),
                 SortedItemsError::Sink(err) => SortedRecordStreamError::Sink(err),
@@ -1116,12 +1151,9 @@ where
         SortedRecordStream<spillover::Sorted<RunMerge<SeqRecord, Cod, KeyCompare<SK, Cmp>>>>,
         MergeError<Cod::Error>,
     > {
-        Ok(SortedRecordStream {
-            inner: self.inner.inner.finish()?,
-            dedup: self.dedup,
-            previous: None,
-            fused: false,
-        })
+        let inner = self.inner.inner.finish()?;
+        let dedup = RecordDedupState::new(self.dedup);
+        Ok(SortedRecordStream::new(inner, dedup))
     }
 }
 
@@ -1187,12 +1219,8 @@ where
             RunMerger::new(self.inner.codec, item_cmp, self.inner.merge_config.clone());
         let merged = run_merger.merge(std::mem::take(&mut self.inner.spilled_runs))?;
 
-        Ok(SortedRecordStream {
-            inner: merged,
-            dedup: self.dedup,
-            previous: None,
-            fused: false,
-        })
+        let dedup = RecordDedupState::new(self.dedup);
+        Ok(SortedRecordStream::new(merged, dedup))
     }
 }
 
@@ -1265,12 +1293,8 @@ where
             self.inner.key_comparator,
         )?;
 
-        Ok(SortedRecordStream {
-            inner: merged,
-            dedup: self.dedup,
-            previous: None,
-            fused: false,
-        })
+        let dedup = RecordDedupState::new(self.dedup);
+        Ok(SortedRecordStream::new(merged, dedup))
     }
 }
 
@@ -1312,12 +1336,9 @@ where
         >,
         MergeError<Cod::Error>,
     > {
-        Ok(SortedRecordStream {
-            inner: self.inner.inner.finish()?,
-            dedup: self.dedup,
-            previous: None,
-            fused: false,
-        })
+        let inner = self.inner.inner.finish()?;
+        let dedup = RecordDedupState::new(self.dedup);
+        Ok(SortedRecordStream::new(inner, dedup))
     }
 }
 
