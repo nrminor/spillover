@@ -191,7 +191,7 @@ where
 /// let a = WithOrd::new(1, Reverse(Natural));
 /// let b = WithOrd::new(2, Reverse(Natural));
 /// // Under Reverse ordering, 2 < 1:
-/// assert!(a < b);
+/// assert!(b < a);
 /// ```
 #[derive(Clone)]
 pub struct WithOrd<T, C> {
