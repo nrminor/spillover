@@ -554,6 +554,46 @@ impl<O, Cod, D, CS> Builder<HasOrder<O>, HasKeyedCodec<Cod>, ItemLimit, (), D, C
             _marker: std::marker::PhantomData,
         }
     }
+    /// Build a keyed item-limited sorter over cleared borrowed storage.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn build_keyed_in<'arena, B>(
+        self,
+        storage: &'arena mut B,
+    ) -> BorrowedKeyed<'arena, B, O, Cod, D, CS>
+    where
+        B: Buffer,
+        for<'items> &'items mut B: ChunkBuffer,
+        Cod: KeyedCodec + EncodeKeyedRun<KeyedRecord<Cod>>,
+        O: Compare<KeyedRecord<Cod>>,
+        for<'items> Cod: EncodeKeyedRun<<&'items mut B as ChunkBuffer>::Item>,
+        for<'items> O: DeriveKey<<&'items mut B as ChunkBuffer>::Item, StoredKey = Cod::Key>
+            + Compare<<&'items mut B as ChunkBuffer>::Item>,
+        for<'items, 'order> CS: ChunkSorter<
+                crate::key::Keyed<usize, Cod::Key>,
+                KeyedEntryCompare<'order, <&'items mut B as ChunkBuffer>::Item, O>,
+            >,
+    {
+        ChunkBuffer::clear(&mut *storage);
+        let holder = ArenaBuffer { storage };
+        let accumulator = OrderedAccumulator {
+            order: self.sort_key.0,
+            codec: self.codec.0,
+            chunk_sort: self.chunk_sort,
+            merge_config: self.config.merge,
+            runs: Vec::new(),
+            pending: Vec::new(),
+            accounting: (),
+        };
+        Sorter {
+            session: Session::new(holder, accumulator),
+            dedup: self.dedup,
+            flush: FlushStrategy::Items {
+                max_items: self.flush.max_items,
+            },
+            _marker: std::marker::PhantomData,
+        }
+    }
 }
 
 impl<O, Cod, D, CS> Builder<HasOrder<O>, HasKeyedCodec<Cod>, ByteLimit, (), D, CS> {
@@ -636,6 +676,9 @@ type SorterSession<T, SK, Cod, Cmp, CS, M> =
 type BorrowedUnkeyed<'arena, B, O, C, D, CS> =
     Sorter<(), O, C, (), D, CS, Unkeyed, ArenaBuffer<'arena, B>>;
 
+type BorrowedKeyed<'arena, B, O, C, D, CS> =
+    Sorter<(), O, C, (), D, CS, Keyed, ArenaBuffer<'arena, B>>;
+
 /// An exclusive loan of reusable storage, held by a sorter.
 #[doc(hidden)]
 pub struct ArenaBuffer<'arena, B> {
@@ -710,6 +753,11 @@ mod binding {
     }
     impl<B, O, C, CS> Binding<(), O, C, (), CS, super::Unkeyed> for super::ArenaBuffer<'_, B> {
         type Session = Session<Self, UnkeyedAccumulator<O, C, CS>>;
+    }
+    impl<B, O, C: crate::codec::KeyedCodec, CS> Binding<(), O, C, (), CS, super::Keyed>
+        for super::ArenaBuffer<'_, B>
+    {
+        type Session = Session<Self, OrderedAccumulator<O, C, CS>>;
     }
     impl<T, O, Cod: crate::codec::KeyedCodec, CS> Binding<T, O, Cod, (), CS, super::Keyed>
         for super::ByteLimit
@@ -1022,6 +1070,47 @@ where
     pub fn finish(self) -> Result<UnkeyedOutput<C, O, D>, MergeError<C::Error>>
     where
         D: Dedup<RunMerge<C, O>>,
+    {
+        let merged = self.session.finish()?;
+        Ok(Sorted::new(self.dedup.dedup(merged)))
+    }
+}
+
+impl<B, O, C, D, CS> BorrowedKeyed<'_, B, O, C, D, CS>
+where
+    B: Buffer,
+    for<'items> &'items mut B: ChunkBuffer,
+    C: KeyedCodec + EncodeKeyedRun<KeyedRecord<C>>,
+    O: Compare<KeyedRecord<C>>,
+    for<'items> C: EncodeKeyedRun<<&'items mut B as ChunkBuffer>::Item>,
+    for<'items> O: DeriveKey<<&'items mut B as ChunkBuffer>::Item, StoredKey = C::Key>
+        + Compare<<&'items mut B as ChunkBuffer>::Item>,
+    for<'items, 'order> CS: ChunkSorter<
+            crate::key::Keyed<usize, C::Key>,
+            KeyedEntryCompare<'order, <&'items mut B as ChunkBuffer>::Item, O>,
+        >,
+{
+    /// Insert an input into borrowed storage.
+    ///
+    /// # Errors
+    /// Returns a run completion error.
+    pub fn push<I>(&mut self, input: I) -> Result<(), MergeError<C::Error>>
+    where
+        B: Extend<I>,
+    {
+        let FlushStrategy::Items { max_items } = self.flush else {
+            unreachable!("borrowed item-limited sorter requires an item limit");
+        };
+        self.session.push_borrowed_item(input, max_items)
+    }
+
+    /// Finish and return output independent of the storage loan.
+    ///
+    /// # Errors
+    /// Returns a spill or merge error.
+    pub fn finish(self) -> Result<OrderedOutput<C, O, D>, MergeError<C::Error>>
+    where
+        D: Dedup<KeyedRunMerge<C, O, (), Keyed>>,
     {
         let merged = self.session.finish()?;
         Ok(Sorted::new(self.dedup.dedup(merged)))
