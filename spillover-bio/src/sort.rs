@@ -1691,6 +1691,8 @@ where
     for<'v> O::Comparator: Compare<SeqRecordView<'v>>,
 {
     /// Build an arena-backed sorter (keyed merge path).
+    ///
+    /// Clears the arena's logical contents while retaining its allocated capacity.
     #[allow(clippy::type_complexity)]
     #[must_use]
     pub fn build(
@@ -1714,10 +1716,12 @@ where
         let order = self.order.0;
         let codec = self.codec.resolve();
         let keyed_codec = codec.with_record_keyer(order);
+        let arena = self.storage.arena;
+        arena.clear();
 
         Sorter {
             inner: ArenaBackend {
-                arena: self.storage.arena,
+                arena,
                 handles: Vec::new(),
                 spilled_runs: Vec::new(),
                 sort_key: order.sort_key(),
@@ -1806,6 +1810,8 @@ where
     for<'v> O::Comparator: Compare<SeqRecordView<'v>>,
 {
     /// Build an arena-backed sorter (unkeyed merge path, no stored record keys).
+    ///
+    /// Clears the arena's logical contents while retaining its allocated capacity.
     #[allow(clippy::type_complexity)]
     #[must_use]
     pub fn build(
@@ -1827,10 +1833,12 @@ where
         >,
     > {
         let order = self.order.0;
+        let arena = self.storage.arena;
+        arena.clear();
 
         Sorter {
             inner: ArenaBackend {
-                arena: self.storage.arena,
+                arena,
                 handles: Vec::new(),
                 spilled_runs: Vec::new(),
                 sort_key: order.sort_key(),

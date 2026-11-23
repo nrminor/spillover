@@ -1124,6 +1124,36 @@ fn arena_unkeyed_sorter_sorts_borrowed_record_views() {
 }
 
 #[test]
+fn terminal_build_clears_preexisting_arena_records() {
+    let mut arena = SeqRecordArena::new();
+    let order = ILLUMINA_ORDER.unkeyed();
+    let codec = DryIceCodec::new();
+    let mut seeding_sorter = Builder::new()
+        .sort_by_unkeyed(order)
+        .codec(codec)
+        .arena(&mut arena)
+        .max_buffer_items(2)
+        .build();
+
+    let old_record = SeqRecordView::new(b"old", b"A", b"I");
+    seeding_sorter
+        .push(&old_record)
+        .expect("seed should succeed");
+    drop(seeding_sorter);
+    assert_eq!(arena.byte_len(), 5, "fixture must retain the old record");
+
+    let fresh_sorter = Builder::new()
+        .sort_by_unkeyed(order)
+        .codec(codec)
+        .arena(&mut arena)
+        .max_buffer_items(2)
+        .build();
+    drop(fresh_sorter);
+
+    assert_eq!(arena.byte_len(), 0);
+}
+
+#[test]
 fn arena_sorter_clears_arena_after_finish() {
     let mut arena = SeqRecordArena::new();
     {
