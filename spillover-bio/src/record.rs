@@ -11,7 +11,7 @@
 
 use dryice::SeqRecordLike;
 use get_size2::GetSize;
-use spillover::sorter::Buffer;
+use spillover::sorter::{Buffer, ChunkBuffer};
 
 /// Read-only access to sequence record fields.
 ///
@@ -281,6 +281,27 @@ impl SeqRecordArena {
 impl Buffer for SeqRecordArena {
     fn len(&self) -> usize {
         self.records.len()
+    }
+}
+
+impl<'input, R: SeqRecordParts + ?Sized> Extend<&'input R> for SeqRecordArena {
+    fn extend<I: IntoIterator<Item = &'input R>>(&mut self, inputs: I) {
+        for record in inputs {
+            self.store(record);
+        }
+    }
+}
+
+impl<'items> ChunkBuffer for &'items mut SeqRecordArena {
+    type Item = SeqRecordView<'items>;
+    type Items = Vec<Self::Item>;
+
+    fn items(self) -> Self::Items {
+        self.views()
+    }
+
+    fn clear(self) {
+        SeqRecordArena::clear(self);
     }
 }
 

@@ -2050,61 +2050,154 @@ where
     }
 }
 
-impl<'a, O, C, F, CS> Builder<HasUnkeyedOrder<O>, C, F, CS, ArenaStorage<'a>>
-where
-    O: SortOrder<Strategy = Unkeyed>,
-    O::SortKey: Send + Sync + 'static,
-    O::KeyComparator:
-        for<'r> Compare<<O::SortKey as SortKey<SeqRecord>>::Key<'r>> + Send + Sync + 'static,
-    C: sealed::ResolveCodec,
-    F: sealed::ResolveFlush,
-    CS: sealed::CompatibleChunkSorter<O> + sealed::ArenaSortMemory,
-    for<'v> CS: ChunkSorter<SeqRecordView<'v>, O::Comparator>,
-    for<'v> O::Comparator: Compare<SeqRecordView<'v>>,
-{
-    /// Build an arena-backed sorter (unkeyed merge path, no stored record keys).
-    ///
-    /// Clears the arena's logical contents while retaining its allocated capacity.
-    #[allow(clippy::type_complexity)]
-    #[must_use]
-    pub fn build(
-        self,
-    ) -> Sorter<
-        O::SortKey,
-        DryIceCodec<C::S, C::Q, C::N>,
-        O::KeyComparator,
-        CS,
-        spillover::sorter::Unkeyed,
-        ArenaBackend<
-            'a,
-            O::SortKey,
-            DryIceCodec<C::S, C::Q, C::N>,
-            O::KeyComparator,
-            O::Comparator,
-            CS,
-            spillover::sorter::Unkeyed,
-        >,
-    > {
-        let order = self.order.0;
-        let arena = self.storage.arena;
-        arena.clear();
+macro_rules! legacy_unkeyed_arena_builder {
+    ($flush:ty) => {
+        impl<'a, O, C, CS> Builder<HasUnkeyedOrder<O>, C, $flush, CS, ArenaStorage<'a>>
+        where
+            O: SortOrder<Strategy = Unkeyed>,
+            O::SortKey: Send + Sync + 'static,
+            O::KeyComparator: for<'r> Compare<<O::SortKey as SortKey<SeqRecord>>::Key<'r>>
+                + Send
+                + Sync
+                + 'static,
+            C: sealed::ResolveCodec,
+            CS: sealed::CompatibleChunkSorter<O> + sealed::ArenaSortMemory,
+            for<'v> CS: ChunkSorter<SeqRecordView<'v>, O::Comparator>,
+            for<'v> O::Comparator: Compare<SeqRecordView<'v>>,
+        {
+            /// Build an arena-backed sorter (unkeyed merge path, no stored record keys).
+            ///
+            /// Clears the arena's logical contents while retaining its allocated capacity.
+            #[allow(clippy::type_complexity)]
+            #[must_use]
+            pub fn build(
+                self,
+            ) -> Sorter<
+                O::SortKey,
+                DryIceCodec<C::S, C::Q, C::N>,
+                O::KeyComparator,
+                CS,
+                spillover::sorter::Unkeyed,
+                ArenaBackend<
+                    'a,
+                    O::SortKey,
+                    DryIceCodec<C::S, C::Q, C::N>,
+                    O::KeyComparator,
+                    O::Comparator,
+                    CS,
+                    spillover::sorter::Unkeyed,
+                >,
+            > {
+                let order = self.order.0;
+                let arena = self.storage.arena;
+                arena.clear();
 
+                Sorter {
+                    inner: ArenaBackend {
+                        arena,
+                        spilled_runs: Vec::new(),
+                        sort_key: order.sort_key(),
+                        codec: self.codec.resolve(),
+                        key_comparator: order.key_comparator(),
+                        comparator: order.comparator(),
+                        chunk_sort: self.chunk_sort,
+                        flush: sealed::ResolveFlush::resolve(self.flush),
+                        merge_config: self.merge_config,
+                        _mode: std::marker::PhantomData,
+                    },
+                    dedup: self.dedup,
+                    _types: std::marker::PhantomData,
+                }
+            }
+        }
+    };
+}
+
+legacy_unkeyed_arena_builder!(NeedsFlush);
+legacy_unkeyed_arena_builder!(HasFlush<spillover::sorter::ByteLimit>);
+
+type ArenaUnkeyedCore<'a, O, C, CS> = spillover::sorter::Sorter<
+    (),
+    O,
+    C,
+    (),
+    Identity,
+    CS,
+    spillover::sorter::Unkeyed,
+    spillover::sorter::ArenaBuffer<'a, SeqRecordArena>,
+>;
+type NativeArenaUnkeyed<'a, O, C, CS> =
+    Sorter<O, C, (), CS, spillover::sorter::Unkeyed, ArenaUnkeyedCore<'a, O, C, CS>>;
+type NativeArenaBuilt<'a, O, C, CS> = NativeArenaUnkeyed<
+    'a,
+    O,
+    DryIceCodec<
+        <C as sealed::ResolveCodec>::S,
+        <C as sealed::ResolveCodec>::Q,
+        <C as sealed::ResolveCodec>::N,
+    >,
+    CS,
+>;
+
+impl<'a, O, C, CS>
+    Builder<HasUnkeyedOrder<O>, C, HasFlush<spillover::sorter::ItemLimit>, CS, ArenaStorage<'a>>
+where
+    C: sealed::ResolveCodec,
+    O: SortOrder<Strategy = Unkeyed> + Compare<NativeOrdinaryRecord<DryIceCodec<C::S, C::Q, C::N>>>,
+    for<'v> O: Compare<SeqRecordView<'v>>,
+    CS: sealed::CompatibleChunkSorter<O>,
+    for<'v> CS: ChunkSorter<SeqRecordView<'v>, O>,
+{
+    /// Build an item-limited sorter over the selected arena.
+    #[must_use]
+    pub fn build(self) -> NativeArenaBuilt<'a, O, C, CS> {
+        let order = self.order.0;
+        let codec = self.codec.resolve();
+        let max_items = self.flush.0.max_items();
+        let storage = self.storage.arena;
+        let builder = spillover::sorter::Builder::new()
+            .order(order)
+            .codec(codec)
+            .chunk_sort(self.chunk_sort)
+            .merge_config(self.merge_config)
+            .max_buffer_items(max_items);
+        let build_in: fn(_, &'a mut SeqRecordArena) -> _ = spillover::sorter::Builder::build_in;
+        let inner = build_in(builder, storage);
         Sorter {
-            inner: ArenaBackend {
-                arena,
-                spilled_runs: Vec::new(),
-                sort_key: order.sort_key(),
-                codec: self.codec.resolve(),
-                key_comparator: order.key_comparator(),
-                comparator: order.comparator(),
-                chunk_sort: self.chunk_sort,
-                flush: self.flush.resolve(),
-                merge_config: self.merge_config,
-                _mode: std::marker::PhantomData,
-            },
+            inner,
             dedup: self.dedup,
             _types: std::marker::PhantomData,
         }
+    }
+}
+
+impl<O, C, CS> NativeArenaUnkeyed<'_, O, C, CS>
+where
+    C: Codec + EncodeRun<NativeOrdinaryRecord<C>>,
+    for<'v> C: EncodeRun<SeqRecordView<'v>>,
+    O: Compare<NativeOrdinaryRecord<C>>,
+    for<'v> O: Compare<SeqRecordView<'v>>,
+    for<'v> CS: ChunkSorter<SeqRecordView<'v>, O>,
+{
+    /// Add a borrowed record to the arena-backed sorter.
+    ///
+    /// # Errors
+    /// Returns an error if spilling fails.
+    pub fn push<R: SeqRecordParts + ?Sized>(
+        &mut self,
+        record: &R,
+    ) -> Result<(), MergeError<C::Error>> {
+        self.inner.push(record)
+    }
+
+    /// Finish the sorter and return its sorted record stream.
+    ///
+    /// # Errors
+    /// Returns an error if spilling or merging fails.
+    pub fn finish(self) -> Result<NativeUnkeyedOutput<C, O>, MergeError<C::Error>> {
+        let inner = self.inner.finish()?;
+        let dedup = RecordDedupState::new(self.dedup);
+        Ok(SortedRecordStream::new(inner, dedup))
     }
 }
 

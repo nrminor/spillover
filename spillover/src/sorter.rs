@@ -486,6 +486,40 @@ impl<O, Cod, D, CS> Builder<HasOrder<O>, HasCodec<Cod>, ItemLimit, (), D, CS> {
             _marker: std::marker::PhantomData,
         }
     }
+    /// Build an unkeyed item-limited sorter and clear the selected storage.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn build_in<'arena, B>(
+        self,
+        storage: &'arena mut B,
+    ) -> BorrowedUnkeyed<'arena, B, O, Cod, D, CS>
+    where
+        B: Buffer,
+        for<'items> &'items mut B: ChunkBuffer,
+        Cod: Codec + EncodeRun<OrdinaryRecord<Cod>>,
+        O: Compare<OrdinaryRecord<Cod>>,
+        for<'items> Cod: EncodeRun<<&'items mut B as ChunkBuffer>::Item>,
+        for<'items> O: Compare<<&'items mut B as ChunkBuffer>::Item>,
+        for<'items> CS: ChunkSorter<<&'items mut B as ChunkBuffer>::Item, O>,
+    {
+        ChunkBuffer::clear(&mut *storage);
+        let holder = ArenaBuffer { storage };
+        let accumulator = UnkeyedAccumulator {
+            order: self.sort_key.0,
+            codec: self.codec.0,
+            chunk_sort: self.chunk_sort,
+            merge_config: self.config.merge,
+            runs: Vec::new(),
+        };
+        Sorter {
+            session: Session::new(holder, accumulator),
+            dedup: self.dedup,
+            flush: FlushStrategy::Items {
+                max_items: self.flush.max_items,
+            },
+            _marker: std::marker::PhantomData,
+        }
+    }
 }
 
 impl<O, Cod, D, CS> Builder<HasOrder<O>, HasKeyedCodec<Cod>, ItemLimit, (), D, CS> {
@@ -599,6 +633,15 @@ where
 type SorterSession<T, SK, Cod, Cmp, CS, M> =
     Session<OwnedBuffer<T>, RunAccumulator<SK, Cod, Cmp, CS, M>>;
 
+type BorrowedUnkeyed<'arena, B, O, C, D, CS> =
+    Sorter<(), O, C, (), D, CS, Unkeyed, ArenaBuffer<'arena, B>>;
+
+/// An exclusive loan of reusable storage, held by a sorter.
+#[doc(hidden)]
+pub struct ArenaBuffer<'arena, B> {
+    storage: &'arena mut B,
+}
+
 mod binding {
     use super::{KeyedCodec, MaybeItemSize, MergeConfig, SortedRun};
 
@@ -664,6 +707,9 @@ mod binding {
     }
     impl<T, O, Cod, CS> Binding<T, O, Cod, (), CS, super::Unkeyed> for super::ItemLimit {
         type Session = Session<OwnedBuffer<T>, UnkeyedAccumulator<O, Cod, CS>>;
+    }
+    impl<B, O, C, CS> Binding<(), O, C, (), CS, super::Unkeyed> for super::ArenaBuffer<'_, B> {
+        type Session = Session<Self, UnkeyedAccumulator<O, C, CS>>;
     }
     impl<T, O, Cod: crate::codec::KeyedCodec, CS> Binding<T, O, Cod, (), CS, super::Keyed>
         for super::ByteLimit
@@ -827,11 +873,35 @@ impl<T> StorageOwner for OwnedBuffer<T> {
     }
 }
 
-trait ChunkBuffer {
+impl<B> StorageOwner for ArenaBuffer<'_, B> {
+    type Storage = B;
+
+    fn storage(&self) -> &Self::Storage {
+        self.storage
+    }
+
+    fn storage_mut(&mut self) -> &mut Self::Storage {
+        self.storage
+    }
+}
+
+impl<B: Extend<I>, I> Extend<I> for ArenaBuffer<'_, B> {
+    fn extend<Input: IntoIterator<Item = I>>(&mut self, inputs: Input) {
+        self.storage.extend(inputs);
+    }
+}
+
+/// Scoped representation of the current chunk, implemented for a short mutable borrow.
+#[doc(hidden)]
+pub trait ChunkBuffer {
+    /// Item seen by the chunk sorter and initial writer.
     type Item;
+    /// Mutable contiguous view of the current items.
     type Items: AsMut<[Self::Item]>;
 
+    /// Expose exactly the current logical items without clearing storage.
     fn items(self) -> Self::Items;
+    /// Clear logical items while allowing reusable backing storage to remain.
     fn clear(self);
 }
 
@@ -915,6 +985,65 @@ impl<T, A> Session<OwnedBuffer<T>, A> {
             unreachable!("item-limited session requires an item limit");
         };
         if self.buffer.len() >= *max_items {
+            self.commit()?;
+        }
+        Ok(())
+    }
+}
+
+impl<B, O, C, D, CS> BorrowedUnkeyed<'_, B, O, C, D, CS>
+where
+    B: Buffer,
+    for<'items> &'items mut B: ChunkBuffer,
+    C: Codec + EncodeRun<OrdinaryRecord<C>>,
+    O: Compare<OrdinaryRecord<C>>,
+    for<'items> C: EncodeRun<<&'items mut B as ChunkBuffer>::Item>,
+    for<'items> O: Compare<<&'items mut B as ChunkBuffer>::Item>,
+    for<'items> CS: ChunkSorter<<&'items mut B as ChunkBuffer>::Item, O>,
+{
+    /// Insert an input and spill when the borrowed storage reaches its item limit.
+    ///
+    /// # Errors
+    /// Returns any error from completing a run.
+    pub fn push<I>(&mut self, input: I) -> Result<(), MergeError<C::Error>>
+    where
+        B: Extend<I>,
+    {
+        let FlushStrategy::Items { max_items } = self.flush else {
+            unreachable!("borrowed item-limited sorter requires an item limit");
+        };
+        self.session.push_borrowed_item(input, max_items)
+    }
+
+    /// Commit any residual items and return output that does not borrow storage.
+    ///
+    /// # Errors
+    /// Returns an error if spilling or initializing the merge fails.
+    pub fn finish(self) -> Result<UnkeyedOutput<C, O, D>, MergeError<C::Error>>
+    where
+        D: Dedup<RunMerge<C, O>>,
+    {
+        let merged = self.session.finish()?;
+        Ok(Sorted::new(self.dedup.dedup(merged)))
+    }
+}
+
+impl<B, A> Session<ArenaBuffer<'_, B>, A>
+where
+    B: Buffer,
+    for<'items> &'items mut B: ChunkBuffer,
+{
+    fn push_borrowed_item<I, E>(&mut self, input: I, max_items: usize) -> Result<(), E>
+    where
+        B: Extend<I>,
+        for<'items> A: AccumulateItems<<&'items mut B as ChunkBuffer>::Item, Error = E>,
+    {
+        let current = self.buffer().len();
+        if current != 0 && current >= max_items {
+            self.commit()?;
+        }
+        self.buffer.extend([input]);
+        if self.buffer().len() >= max_items {
             self.commit()?;
         }
         Ok(())
