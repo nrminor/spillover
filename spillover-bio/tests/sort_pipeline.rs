@@ -1,6 +1,7 @@
 //! End-to-end integration tests for the spillover-bio sort pipeline.
 
 use std::{
+    cell::Cell,
     cmp::Ordering,
     convert::Infallible,
     io::{self, Read, Write},
@@ -9,7 +10,7 @@ use std::{
 
 use dryice::SeqRecordLike;
 use spillover::SortedItemsError;
-use spillover::chunk::Sequential;
+use spillover::chunk::{ChunkSorter, Sequential};
 use spillover::codec::{
     Codec, CodecCursor, CodecWriter, DecodeRun, DeriveKey, EncodeKeyedRun, EncodeRun, KeyedCodec,
     KeyedCodecCursor, KeyedCodecWriter, TakeOwned,
@@ -31,6 +32,27 @@ use spillover_bio::{
 use thiserror::Error;
 
 struct Number(u8);
+
+struct BorrowedNumberOrder<'a>(&'a Cell<bool>);
+
+impl Compare<Number> for BorrowedNumberOrder<'_> {
+    fn compare(&self, left: &Number, right: &Number) -> Ordering {
+        let ordering = left.0.cmp(&right.0);
+        if self.0.get() {
+            ordering.reverse()
+        } else {
+            ordering
+        }
+    }
+}
+
+struct ComparisonSort;
+
+impl<T, Cmp: Compare<T> + ?Sized> ChunkSorter<T, Cmp> for ComparisonSort {
+    fn sort(&self, items: &mut [T], cmp: &Cmp) {
+        items.sort_unstable_by(|left, right| cmp.compare(left, right));
+    }
+}
 
 #[derive(Clone, Copy)]
 struct NumberCodec;
@@ -80,6 +102,26 @@ impl<W: Write> CodecWriter<Number> for NumberWriter<W> {
     fn finish(mut self) -> io::Result<()> {
         self.0.flush()
     }
+}
+
+#[test]
+fn unkeyed_item_spills_keep_locally_borrowed_whole_order() {
+    let descending = Cell::new(true);
+    let order = BorrowedNumberOrder(&descending);
+    let mut sorter = spillover::sorter::Builder::new()
+        .order(order)
+        .codec(NumberCodec)
+        .chunk_sort(ComparisonSort)
+        .max_buffer_items(2)
+        .build();
+
+    for value in [1, 3, 2] {
+        sorter.push(Number(value)).expect("push");
+    }
+
+    let output = sorter.finish().expect("finish");
+    let values: Vec<u8> = output.map(|record| record.expect("decode").0).collect();
+    assert_eq!(values, [3, 2, 1]);
 }
 
 #[test]

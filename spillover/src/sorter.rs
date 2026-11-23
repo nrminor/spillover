@@ -461,6 +461,33 @@ where
     }
 }
 
+impl<O, Cod, D, CS> Builder<HasOrder<O>, HasCodec<Cod>, ItemLimit, (), D, CS> {
+    /// Build an item-limited sorter using the complete order.
+    #[must_use]
+    pub fn build<T>(self) -> Sorter<T, O, Cod, (), D, CS, Unkeyed, ItemLimit>
+    where
+        Cod: Codec + EncodeRun<T> + EncodeRun<OrdinaryRecord<Cod>>,
+        O: Compare<T> + Compare<OrdinaryRecord<Cod>>,
+        CS: ChunkSorter<T, O>,
+    {
+        let accumulator = UnkeyedAccumulator {
+            order: self.sort_key.0,
+            codec: self.codec.0,
+            chunk_sort: self.chunk_sort,
+            merge_config: self.config.merge,
+            runs: Vec::new(),
+        };
+        Sorter {
+            session: Session::new(OwnedBuffer::new(None), accumulator),
+            dedup: self.dedup,
+            flush: FlushStrategy::Items {
+                max_items: self.flush.max_items,
+            },
+            _marker: std::marker::PhantomData,
+        }
+    }
+}
+
 impl<O, Cod, D, CS> Builder<HasOrder<O>, HasKeyedCodec<Cod>, ItemLimit, (), D, CS> {
     /// Build an item-limited sorter using the complete order.
     #[must_use]
@@ -529,6 +556,7 @@ impl<O, Cod, D, CS> Builder<HasOrder<O>, HasKeyedCodec<Cod>, ByteLimit, (), D, C
     }
 }
 
+type OrdinaryRecord<C> = <<C as Codec>::Cursor<BufReader<File>> as CodecCursor>::Record;
 type KeyedRecord<C> = <<C as KeyedCodec>::KeyedCursor<BufReader<File>> as CodecCursor>::Record;
 
 /// A disk-spilling external sorter.
@@ -605,6 +633,14 @@ mod binding {
         pub(super) accounting: A,
     }
 
+    pub struct UnkeyedAccumulator<O, C, CS> {
+        pub(super) order: O,
+        pub(super) codec: C,
+        pub(super) chunk_sort: CS,
+        pub(super) merge_config: MergeConfig,
+        pub(super) runs: Vec<SortedRun>,
+    }
+
     #[derive(Clone)]
     pub struct ByteAccounting {
         pub(super) payload_heap: Option<usize>,
@@ -626,6 +662,9 @@ mod binding {
     {
         type Session = Session<OwnedBuffer<T>, OrderedAccumulator<O, Cod, CS>>;
     }
+    impl<T, O, Cod, CS> Binding<T, O, Cod, (), CS, super::Unkeyed> for super::ItemLimit {
+        type Session = Session<OwnedBuffer<T>, UnkeyedAccumulator<O, Cod, CS>>;
+    }
     impl<T, O, Cod: crate::codec::KeyedCodec, CS> Binding<T, O, Cod, (), CS, super::Keyed>
         for super::ByteLimit
     {
@@ -633,7 +672,9 @@ mod binding {
     }
 }
 
-use binding::{ByteAccounting, OrderedAccumulator, OwnedBuffer, RunAccumulator, Session};
+use binding::{
+    ByteAccounting, OrderedAccumulator, OwnedBuffer, RunAccumulator, Session, UnkeyedAccumulator,
+};
 
 type ItemSize<T> = Box<dyn Fn(&T) -> usize + Send + Sync>;
 type MaybeItemSize<T> = Option<ItemSize<T>>;
@@ -864,6 +905,22 @@ impl<B, A> Session<B, A> {
     }
 }
 
+impl<T, A> Session<OwnedBuffer<T>, A> {
+    fn push_item(&mut self, item: T, policy: &FlushStrategy) -> Result<(), A::Error>
+    where
+        A: AccumulateItems<T>,
+    {
+        self.buffer.extend([item]);
+        let FlushStrategy::Items { max_items } = policy else {
+            unreachable!("item-limited session requires an item limit");
+        };
+        if self.buffer.len() >= *max_items {
+            self.commit()?;
+        }
+        Ok(())
+    }
+}
+
 trait AccumulateItems<I> {
     type Error;
     type Final;
@@ -945,6 +1002,29 @@ impl<SK, Cod, Cmp, CS, M> RunAccumulator<SK, Cod, Cmp, CS, M> {
             runs: Vec::new(),
             _marker: std::marker::PhantomData,
         }
+    }
+}
+
+impl<T, O, C, CS> AccumulateItems<T> for UnkeyedAccumulator<O, C, CS>
+where
+    C: Codec + EncodeRun<T> + EncodeRun<OrdinaryRecord<C>>,
+    O: Compare<T> + Compare<OrdinaryRecord<C>>,
+    CS: ChunkSorter<T, O>,
+{
+    type Error = MergeError<C::Error>;
+    type Final = RunMerge<C, O>;
+
+    fn accumulate(&mut self, items: &mut [T]) -> Result<(), Self::Error> {
+        self.chunk_sort.sort(items, &self.order);
+        let writer = RunWriter::new_unkeyed(self.codec, &self.merge_config);
+        let run = writer.write_sorted(items)?;
+        self.runs.push(run);
+        Ok(())
+    }
+
+    fn finish(self) -> Result<Self::Final, Self::Error> {
+        let merger = RunMerger::new(self.codec, self.order, self.merge_config);
+        merger.merge(self.runs)
     }
 }
 
@@ -1393,7 +1473,36 @@ where
     }
 }
 
+type UnkeyedOutput<C, O, D> = Sorted<<D as Dedup<RunMerge<C, O>>>::Deduped>;
 type OrderedOutput<C, O, D> = Sorted<<D as Dedup<KeyedRunMerge<C, O, (), Keyed>>>::Deduped>;
+
+impl<T, O, C, D, CS> Sorter<T, O, C, (), D, CS, Unkeyed, ItemLimit>
+where
+    C: Codec + EncodeRun<T> + EncodeRun<OrdinaryRecord<C>>,
+    O: Compare<T> + Compare<OrdinaryRecord<C>>,
+    CS: ChunkSorter<T, O>,
+{
+    /// Add an item, spilling when the configured count is reached.
+    ///
+    /// # Errors
+    /// Returns an error if spilling fails.
+    pub fn push(&mut self, item: T) -> Result<(), MergeError<C::Error>> {
+        self.session.push_item(item, &self.flush)
+    }
+
+    /// Finish the remaining run and return the merged output.
+    ///
+    /// # Errors
+    /// Returns an error if spilling or merging fails.
+    pub fn finish(self) -> Result<UnkeyedOutput<C, O, D>, MergeError<C::Error>>
+    where
+        D: Dedup<RunMerge<C, O>>,
+    {
+        let dedup = self.dedup;
+        let merged = self.session.finish()?;
+        Ok(Sorted::new(dedup.dedup(merged)))
+    }
+}
 
 impl<T, O, C, D, CS> Sorter<T, O, C, (), D, CS, Keyed, ItemLimit>
 where
@@ -1410,14 +1519,7 @@ where
     /// # Errors
     /// Returns an error if spilling fails.
     pub fn push(&mut self, item: T) -> Result<(), MergeError<C::Error>> {
-        self.session.buffer.extend([item]);
-        if self.flush.should_flush_after_push(
-            &self.session.buffer,
-            self.session.accumulator.merge_config.write_buffer_bytes,
-        ) {
-            self.session.commit()?;
-        }
-        Ok(())
+        self.session.push_item(item, &self.flush)
     }
 
     /// Finish the remaining run and return the merged output.
