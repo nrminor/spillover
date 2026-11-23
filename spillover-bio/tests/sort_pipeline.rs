@@ -1166,6 +1166,33 @@ fn arena_unkeyed_sorter_sorts_borrowed_record_views() {
 }
 
 #[test]
+fn arena_unkeyed_item_retry_does_not_admit_on_failed_spill() {
+    let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("Cargo.toml");
+    assert!(manifest.is_file());
+    let mut merge_config = MergeConfig::default();
+    merge_config.temp_dir = Some(manifest);
+    let mut arena = SeqRecordArena::new();
+    let mut sorter = Builder::new()
+        .sort_by_unkeyed(ILLUMINA_ORDER.unkeyed())
+        .codec(DryIceCodec::new())
+        .merge_config(merge_config)
+        .arena(&mut arena)
+        .max_buffer_items(1)
+        .build();
+
+    let first = SeqRecordView::new(b"a", b"AC", b"!!");
+    let first_result = sorter.push(&first);
+    assert!(matches!(first_result, Err(MergeError::Io(_))));
+
+    let second = SeqRecordView::new(b"second", b"G", b"#");
+    let second_result = sorter.push(&second);
+    assert!(matches!(second_result, Err(MergeError::Io(_))));
+
+    drop(sorter);
+    assert_eq!(arena.byte_len(), 5);
+}
+
+#[test]
 fn terminal_build_clears_preexisting_arena_records() {
     let mut arena = SeqRecordArena::new();
     let order = ILLUMINA_ORDER.unkeyed();
