@@ -767,6 +767,25 @@ impl<T> Extend<T> for OwnedBuffer<T> {
     }
 }
 
+trait StorageOwner {
+    type Storage;
+
+    fn storage(&self) -> &Self::Storage;
+    fn storage_mut(&mut self) -> &mut Self::Storage;
+}
+
+impl<T> StorageOwner for OwnedBuffer<T> {
+    type Storage = Self;
+
+    fn storage(&self) -> &Self::Storage {
+        self
+    }
+
+    fn storage_mut(&mut self) -> &mut Self::Storage {
+        self
+    }
+}
+
 trait ChunkBuffer {
     type Item;
     type Items: AsMut<[Self::Item]>;
@@ -836,6 +855,13 @@ impl<B, A> Session<B, A> {
             accumulator,
         }
     }
+
+    fn buffer(&self) -> &B::Storage
+    where
+        B: StorageOwner,
+    {
+        self.buffer.storage()
+    }
 }
 
 trait AccumulateItems<I> {
@@ -849,31 +875,36 @@ trait AccumulateItems<I> {
 impl<B, A> Session<B, A> {
     fn commit<E>(&mut self) -> Result<(), E>
     where
-        B: Buffer,
-        for<'items> &'items mut B: ChunkBuffer,
-        for<'items> A: AccumulateItems<<&'items mut B as ChunkBuffer>::Item, Error = E>,
+        B: StorageOwner,
+        B::Storage: Buffer,
+        for<'items> &'items mut B::Storage: ChunkBuffer,
+        for<'items> A: AccumulateItems<<&'items mut B::Storage as ChunkBuffer>::Item, Error = E>,
     {
-        if self.buffer.is_empty() {
+        if self.buffer().is_empty() {
             return Ok(());
         }
 
+        let storage = self.buffer.storage_mut();
         {
-            let mut items = ChunkBuffer::items(&mut self.buffer);
+            let mut items = ChunkBuffer::items(&mut *storage);
             self.accumulator.accumulate(items.as_mut())?;
         }
 
-        ChunkBuffer::clear(&mut self.buffer);
+        ChunkBuffer::clear(storage);
         Ok(())
     }
 
     fn finish<E, F>(mut self) -> Result<F, E>
     where
-        B: Buffer,
-        for<'items> &'items mut B: ChunkBuffer,
-        for<'items> A: AccumulateItems<<&'items mut B as ChunkBuffer>::Item, Error = E, Final = F>,
+        B: StorageOwner,
+        B::Storage: Buffer,
+        for<'items> &'items mut B::Storage: ChunkBuffer,
+        for<'items> A:
+            AccumulateItems<<&'items mut B::Storage as ChunkBuffer>::Item, Error = E, Final = F>,
     {
         self.commit()?;
-        let finish_accumulator = <A as AccumulateItems<<&mut B as ChunkBuffer>::Item>>::finish;
+        let finish_accumulator =
+            <A as AccumulateItems<<&mut B::Storage as ChunkBuffer>::Item>>::finish;
         finish_accumulator(self.accumulator)
     }
 }
