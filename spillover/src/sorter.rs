@@ -388,7 +388,7 @@ pub struct Sorter<T, SK, Cod, Cmp, D, CS, M = Unkeyed> {
 }
 
 type SorterSession<T, SK, Cod, Cmp, CS, M> =
-    Session<OwnedBuffer<T>, RunAccumulator<T, SK, Cod, Cmp, CS, M>>;
+    Session<OwnedBuffer<T>, RunAccumulator<SK, Cod, Cmp, CS, M>>;
 
 type ItemSize<T> = Box<dyn Fn(&T) -> usize + Send + Sync>;
 type MaybeItemSize<T> = Option<ItemSize<T>>;
@@ -602,14 +602,15 @@ where
         for<'items> A: AccumulateItems<<&'items mut B as ChunkBuffer>::Item, Error = E, Final = F>,
     {
         self.commit()?;
-        self.accumulator.finish()
+        let finish_accumulator = <A as AccumulateItems<<&mut B as ChunkBuffer>::Item>>::finish;
+        finish_accumulator(self.accumulator)
     }
 }
 
-impl<T, SK, Cod, Cmp, CS, M> Session<OwnedBuffer<T>, RunAccumulator<T, SK, Cod, Cmp, CS, M>> {
+impl<T, SK, Cod, Cmp, CS, M> Session<OwnedBuffer<T>, RunAccumulator<SK, Cod, Cmp, CS, M>> {
     fn push<E>(&mut self, item: T, policy: &FlushStrategy) -> Result<(), E>
     where
-        RunAccumulator<T, SK, Cod, Cmp, CS, M>: AccumulateItems<T, Error = E>,
+        RunAccumulator<SK, Cod, Cmp, CS, M>: AccumulateItems<T, Error = E>,
     {
         let write_buffer_bytes = self.accumulator.merge_config.write_buffer_bytes;
         if !self.buffer.items.is_empty()
@@ -631,17 +632,17 @@ impl<T, SK, Cod, Cmp, CS, M> Session<OwnedBuffer<T>, RunAccumulator<T, SK, Cod, 
     }
 }
 
-struct RunAccumulator<T, SK, Cod, Cmp, CS, M> {
+struct RunAccumulator<SK, Cod, Cmp, CS, M> {
     sort_key: SK,
     codec: Cod,
     compare: Cmp,
     chunk_sort: CS,
     merge_config: MergeConfig,
     runs: Vec<SortedRun>,
-    _marker: std::marker::PhantomData<fn() -> (T, M)>,
+    _marker: std::marker::PhantomData<fn() -> M>,
 }
 
-impl<T, SK, Cod, Cmp, CS, M> RunAccumulator<T, SK, Cod, Cmp, CS, M> {
+impl<SK, Cod, Cmp, CS, M> RunAccumulator<SK, Cod, Cmp, CS, M> {
     fn new(sort_key: SK, codec: Cod, compare: Cmp, chunk_sort: CS, config: MergeConfig) -> Self {
         Self {
             sort_key,
@@ -655,7 +656,7 @@ impl<T, SK, Cod, Cmp, CS, M> RunAccumulator<T, SK, Cod, Cmp, CS, M> {
     }
 }
 
-impl<T, SK, Cod, Cmp, CS> AccumulateItems<T> for RunAccumulator<T, SK, Cod, Cmp, CS, Unkeyed>
+impl<T, SK, Cod, Cmp, CS> AccumulateItems<T> for RunAccumulator<SK, Cod, Cmp, CS, Unkeyed>
 where
     T: 'static,
     SK: SortKey<T> + Copy + Send + Sync + 'static,
@@ -693,7 +694,7 @@ where
     }
 }
 
-impl<T, SK, Cod, Cmp, CS> AccumulateItems<T> for RunAccumulator<T, SK, Cod, Cmp, CS, Keyed>
+impl<T, SK, Cod, Cmp, CS> AccumulateItems<T> for RunAccumulator<SK, Cod, Cmp, CS, Keyed>
 where
     T: 'static,
     SK: SortKey<T> + Copy + Send + Sync + 'static,
@@ -1176,7 +1177,7 @@ mod tests {
     #[allow(clippy::type_complexity)]
     fn u64_accumulator(
         config: MergeConfig,
-    ) -> RunAccumulator<u64, Owned<fn(&u64) -> u64>, U64Codec, Natural, Sequential, Unkeyed> {
+    ) -> RunAccumulator<Owned<fn(&u64) -> u64>, U64Codec, Natural, Sequential, Unkeyed> {
         RunAccumulator::new(
             Owned((|v: &u64| *v) as fn(&u64) -> u64),
             U64Codec,
@@ -1189,8 +1190,7 @@ mod tests {
     #[allow(clippy::type_complexity)]
     fn u64_keyed_accumulator(
         config: MergeConfig,
-    ) -> RunAccumulator<u64, Owned<fn(&u64) -> u64>, U64KeyedCodec, Natural, Sequential, Keyed>
-    {
+    ) -> RunAccumulator<Owned<fn(&u64) -> u64>, U64KeyedCodec, Natural, Sequential, Keyed> {
         RunAccumulator::new(
             Owned((|v: &u64| *v) as fn(&u64) -> u64),
             U64KeyedCodec,
@@ -1205,7 +1205,7 @@ mod tests {
         config: MergeConfig,
     ) -> Session<
         OwnedBuffer<u64>,
-        RunAccumulator<u64, Owned<fn(&u64) -> u64>, U64Codec, Natural, Sequential, Unkeyed>,
+        RunAccumulator<Owned<fn(&u64) -> u64>, U64Codec, Natural, Sequential, Unkeyed>,
     > {
         Session::new(
             OwnedBuffer::new(Some(Box::new(|_| 8))),
