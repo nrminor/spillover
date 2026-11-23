@@ -111,17 +111,12 @@ pub struct SeqRecord {
 ///
 /// `SeqRecordArena` is storage, not a record type. It lets arena-backed sorter
 /// internals copy incoming record-shaped values into one reusable byte buffer for
-/// the current spill window, then resolve private handles back into
+/// the current spill window, then use record metadata to borrow
 /// [`SeqRecordView`] values while flushing that window.
 #[derive(Debug, Default)]
 pub struct SeqRecordArena {
     bytes: Vec<u8>,
     records: Vec<ArenaRecord>,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct SeqRecordHandle {
-    index: usize,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -244,7 +239,7 @@ impl SeqRecordArena {
         self.records.len()
     }
 
-    pub(crate) fn store<R: SeqRecordParts + ?Sized>(&mut self, record: &R) -> SeqRecordHandle {
+    pub(crate) fn store<R: SeqRecordParts + ?Sized>(&mut self, record: &R) {
         let start = self.bytes.len();
         let name_len = record.name().len();
         let sequence_len = record.sequence().len();
@@ -254,29 +249,30 @@ impl SeqRecordArena {
         self.bytes.extend_from_slice(record.sequence());
         self.bytes.extend_from_slice(record.quality());
 
-        let index = self.records.len();
         self.records.push(ArenaRecord {
             start,
             name_len,
             sequence_len,
             quality_len,
         });
-
-        SeqRecordHandle { index }
     }
 
-    pub(crate) fn view(&self, handle: SeqRecordHandle) -> SeqRecordView<'_> {
-        let record = self.records[handle.index];
-        let name_start = record.start;
-        let sequence_start = name_start + record.name_len;
-        let quality_start = sequence_start + record.sequence_len;
-        let end = quality_start + record.quality_len;
+    pub(crate) fn views(&self) -> Vec<SeqRecordView<'_>> {
+        self.records
+            .iter()
+            .map(|record| {
+                let name_start = record.start;
+                let sequence_start = name_start + record.name_len;
+                let quality_start = sequence_start + record.sequence_len;
+                let end = quality_start + record.quality_len;
 
-        SeqRecordView::new(
-            &self.bytes[name_start..sequence_start],
-            &self.bytes[sequence_start..quality_start],
-            &self.bytes[quality_start..end],
-        )
+                SeqRecordView::new(
+                    &self.bytes[name_start..sequence_start],
+                    &self.bytes[sequence_start..quality_start],
+                    &self.bytes[quality_start..end],
+                )
+            })
+            .collect()
     }
 
     pub(crate) fn clear(&mut self) {
@@ -425,18 +421,19 @@ mod tests {
     fn arena_stores_records_and_returns_views() {
         let mut arena = SeqRecordArena::new();
 
-        let first = arena.store(&SeqRecordView::new(b"r1", b"ACGT", b"!!!!"));
-        let second = arena.store(&SeqRecordView::new(b"r2", b"TGCA", b"####"));
+        arena.store(&SeqRecordView::new(b"r1", b"ACGT", b"!!!!"));
+        arena.store(&SeqRecordView::new(b"r2", b"TGCA", b"####"));
 
         assert_eq!(arena.record_count(), 2);
         assert_eq!(arena.byte_len(), 20);
 
-        let first_view = arena.view(first);
+        let views = arena.views();
+        let first_view = &views[0];
         assert_eq!(first_view.name(), b"r1");
         assert_eq!(first_view.sequence(), b"ACGT");
         assert_eq!(first_view.quality(), b"!!!!");
 
-        let second_view = arena.view(second);
+        let second_view = &views[1];
         assert_eq!(second_view.name(), b"r2");
         assert_eq!(second_view.sequence(), b"TGCA");
         assert_eq!(second_view.quality(), b"####");
@@ -447,10 +444,11 @@ mod tests {
         let mut arena = SeqRecordArena::new();
         let mut sequence = b"ACGT".to_vec();
 
-        let handle = arena.store(&SeqRecordView::new(b"r1", &sequence, b"!!!!"));
+        arena.store(&SeqRecordView::new(b"r1", &sequence, b"!!!!"));
         sequence.copy_from_slice(b"TGCA");
 
-        assert_eq!(arena.view(handle).sequence(), b"ACGT");
+        let views = arena.views();
+        assert_eq!(views[0].sequence(), b"ACGT");
     }
 
     #[test]
