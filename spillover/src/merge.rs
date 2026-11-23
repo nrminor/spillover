@@ -222,9 +222,13 @@ impl<C> RunWriter<'_, C, Keyed>
 where
     C: KeyedCodec,
 {
-    pub(crate) fn write_sorted<T>(&self, items: &[T]) -> MergeResult<SortedRun, C::Error>
+    pub(crate) fn write_sorted<Yield, Record>(
+        &self,
+        items: impl IntoIterator<Item = Yield>,
+        project_record: impl Fn(&Yield) -> &Record,
+    ) -> MergeResult<SortedRun, C::Error>
     where
-        C: EncodeKeyedRun<T>,
+        C: EncodeKeyedRun<Record>,
     {
         let named = self.create_temp_file()?;
         let file = named.reopen().map_err(MergeError::Io)?;
@@ -232,8 +236,11 @@ where
         let mut writer = self.codec.keyed_writer(&mut run_writer);
 
         for item in items {
-            let key = self.codec.derive_key(item);
-            writer.write_keyed(item, &key).map_err(MergeError::Codec)?;
+            let record = project_record(&item);
+            let key = self.codec.derive_key(record);
+            writer
+                .write_keyed(record, &key)
+                .map_err(MergeError::Codec)?;
         }
 
         writer.finish().map_err(MergeError::Codec)?;
@@ -351,22 +358,8 @@ impl<C: KeyedCodec, Cmp> RunMerger<C, Cmp> {
     where
         C: EncodeKeyedRun<I>,
     {
-        let named = self.create_temp_file()?;
-        let file = named.reopen().map_err(MergeError::Io)?;
-        let mut run_writer = self.config.run_writer(file);
-        let mut writer = self.codec.keyed_writer(&mut run_writer);
-
-        for item in items {
-            let key = self.codec.derive_key(&item);
-            writer.write_keyed(&item, &key).map_err(MergeError::Codec)?;
-        }
-
-        KeyedCodecWriter::<I, C::Key>::finish(writer).map_err(MergeError::Codec)?;
-        std::io::Write::flush(&mut run_writer).map_err(MergeError::Io)?;
-
-        Ok(SortedRun {
-            path: named.into_temp_path(),
-        })
+        let run_writer = RunWriter::new_keyed(self.codec, &self.config);
+        run_writer.write_sorted(items, |item| item)
     }
 
     /// Consume this merger to merge runs by stored key, comparing borrowed

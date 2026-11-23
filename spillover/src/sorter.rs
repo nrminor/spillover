@@ -718,7 +718,8 @@ where
         self.chunk_sort.sort(items, compare_items);
 
         let run_writer = RunWriter::new_keyed(self.codec, &self.merge_config);
-        let run = run_writer.write_sorted(items)?;
+        let records = items.iter();
+        let run = run_writer.write_sorted(records, |item| *item)?;
         self.runs.push(run);
 
         Ok(())
