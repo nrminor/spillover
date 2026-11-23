@@ -1202,6 +1202,44 @@ fn arena_unkeyed_sorter_sorts_borrowed_record_views() {
 }
 
 #[test]
+fn arena_unkeyed_measured_preflushes_before_payload_replacement() {
+    let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("Cargo.toml");
+    assert!(manifest.is_file());
+    let mut merge_config = MergeConfig::default();
+    merge_config.temp_dir = Some(manifest);
+    merge_config.write_buffer_bytes = 64;
+
+    let mut arena = SeqRecordArena::with_capacity(4096);
+    let capacity = arena.capacity();
+    assert!(capacity >= 4096);
+    let budget = capacity.checked_mul(2).expect("budget should fit");
+    let name_length = capacity.checked_add(1).expect("name length should fit");
+    let name = vec![b'n'; name_length];
+
+    let mut sorter = Builder::new()
+        .sort_by_unkeyed(ILLUMINA_ORDER.unkeyed())
+        .codec(DryIceCodec::new())
+        .chunk_sort(Sequential)
+        .merge_config(merge_config)
+        .arena(&mut arena)
+        .measured_budget(budget)
+        .build();
+
+    let first = SeqRecordView::new(b"a", b"AC", b"!!");
+    sorter.push(&first).expect("first push should succeed");
+
+    let second = SeqRecordView::new(&name, b"A", b"!");
+    let second_result = sorter.push(&second);
+    assert!(
+        matches!(second_result, Err(MergeError::Io(_))),
+        "second push should fail during preflush, got {second_result:?}"
+    );
+
+    drop(sorter);
+    assert_eq!(arena.byte_len(), 5);
+}
+
+#[test]
 fn arena_unkeyed_item_retry_does_not_admit_on_failed_spill() {
     let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("Cargo.toml");
     assert!(manifest.is_file());

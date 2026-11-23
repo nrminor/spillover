@@ -9,9 +9,13 @@
 //! `From` impls, so records move between spillover-bio and dryice
 //! without manual field copying.
 
+use std::alloc::Layout;
+
 use dryice::SeqRecordLike;
 use get_size2::GetSize;
-use spillover::sorter::{Buffer, ChunkBuffer};
+use spillover::sorter::{
+    Buffer, BufferMemory, ChunkBuffer, EstimateBufferMemory, ProjectBufferMemory,
+};
 
 /// Read-only access to sequence record fields.
 ///
@@ -128,6 +132,21 @@ struct ArenaRecord {
     quality_len: usize,
 }
 
+fn growth_target<T>(items: &Vec<T>, required: usize) -> Option<usize> {
+    let layout = Layout::array::<T>(required).ok()?;
+    let capacity = items.capacity();
+    if layout.size() == 0 || required <= capacity {
+        return Some(required);
+    }
+    let doubled = capacity.checked_mul(2).unwrap_or(required);
+    let requested = doubled.max(required);
+    if Layout::array::<T>(requested).is_ok() {
+        Some(requested)
+    } else {
+        Some(required)
+    }
+}
+
 impl SeqRecord {
     /// Create a new record by copying field bytes into one
     /// contiguous backing allocation.
@@ -238,13 +257,36 @@ impl SeqRecordArena {
 
     pub(crate) fn store<R: SeqRecordParts + ?Sized>(&mut self, record: &R) {
         let start = self.bytes.len();
-        let name_len = record.name().len();
-        let sequence_len = record.sequence().len();
-        let quality_len = record.quality().len();
+        let name = record.name();
+        let sequence = record.sequence();
+        let quality = record.quality();
+        let name_len = name.len();
+        let sequence_len = sequence.len();
+        let quality_len = quality.len();
+        let payload_len = start
+            .checked_add(name_len)
+            .and_then(|len| len.checked_add(sequence_len))
+            .and_then(|len| len.checked_add(quality_len))
+            .expect("capacity overflow");
+        let item_count = self
+            .records
+            .len()
+            .checked_add(1)
+            .expect("capacity overflow");
+        let payload_target = growth_target(&self.bytes, payload_len).expect("capacity overflow");
+        let metadata_target = growth_target(&self.records, item_count).expect("capacity overflow");
 
-        self.bytes.extend_from_slice(record.name());
-        self.bytes.extend_from_slice(record.sequence());
-        self.bytes.extend_from_slice(record.quality());
+        if payload_target > self.bytes.capacity() {
+            self.bytes.reserve_exact(payload_target - self.bytes.len());
+        }
+        self.bytes.extend_from_slice(name);
+        self.bytes.extend_from_slice(sequence);
+        self.bytes.extend_from_slice(quality);
+
+        if metadata_target > self.records.capacity() {
+            self.records
+                .reserve_exact(metadata_target - self.records.len());
+        }
 
         self.records.push(ArenaRecord {
             start,
@@ -255,21 +297,54 @@ impl SeqRecordArena {
     }
 
     pub(crate) fn views(&self) -> Vec<SeqRecordView<'_>> {
-        self.records
-            .iter()
-            .map(|record| {
-                let name_start = record.start;
-                let sequence_start = name_start + record.name_len;
-                let quality_start = sequence_start + record.sequence_len;
-                let end = quality_start + record.quality_len;
+        let mut views = Vec::with_capacity(self.records.len());
+        views.extend(self.records.iter().map(|record| {
+            let name_start = record.start;
+            let sequence_start = name_start + record.name_len;
+            let quality_start = sequence_start + record.sequence_len;
+            let end = quality_start + record.quality_len;
 
-                SeqRecordView::new(
-                    &self.bytes[name_start..sequence_start],
-                    &self.bytes[sequence_start..quality_start],
-                    &self.bytes[quality_start..end],
-                )
-            })
-            .collect()
+            SeqRecordView::new(
+                &self.bytes[name_start..sequence_start],
+                &self.bytes[sequence_start..quality_start],
+                &self.bytes[quality_start..end],
+            )
+        }));
+        views
+    }
+
+    fn memory_for_lengths(&self, payload_bytes: Option<usize>, item_count: usize) -> BufferMemory {
+        let costs = (|| {
+            let payload_bytes = payload_bytes?;
+            let payload_target = growth_target(&self.bytes, payload_bytes)?;
+            let metadata_target = growth_target(&self.records, item_count)?;
+            let metadata_item_bytes = std::mem::size_of::<ArenaRecord>();
+            let metadata_before = self.records.len().checked_mul(metadata_item_bytes)?;
+            let metadata_after = item_count.checked_mul(metadata_item_bytes)?;
+            let payload_storage = if payload_target > self.bytes.capacity() {
+                self.bytes.capacity().checked_add(payload_target)?
+            } else {
+                payload_bytes
+            };
+            let payload_phase = payload_storage.checked_add(metadata_before)?;
+            let metadata_storage = if metadata_target > self.records.capacity() {
+                let overlapping_slots = self.records.capacity().checked_add(metadata_target)?;
+                overlapping_slots.checked_mul(metadata_item_bytes)?
+            } else {
+                metadata_after
+            };
+            let metadata_phase = payload_bytes.checked_add(metadata_storage)?;
+            let insertion_peak_bytes = payload_phase.max(metadata_phase);
+            let view_bytes = Layout::array::<SeqRecordView<'_>>(item_count).ok()?.size();
+            let spill_peak_bytes = payload_bytes
+                .checked_add(metadata_after)?
+                .checked_add(view_bytes)?;
+            Some((insertion_peak_bytes, spill_peak_bytes))
+        })();
+        match costs {
+            Some((insertion, spill)) => BufferMemory::new(item_count, insertion, spill),
+            None => BufferMemory::new(item_count, usize::MAX, usize::MAX),
+        }
     }
 
     pub(crate) fn clear(&mut self) {
@@ -281,6 +356,25 @@ impl SeqRecordArena {
 impl Buffer for SeqRecordArena {
     fn len(&self) -> usize {
         self.records.len()
+    }
+}
+
+impl EstimateBufferMemory for SeqRecordArena {
+    fn memory(&self) -> BufferMemory {
+        self.memory_for_lengths(Some(self.bytes.len()), self.records.len())
+    }
+}
+
+impl<R: SeqRecordParts + ?Sized> ProjectBufferMemory<&R> for SeqRecordArena {
+    fn memory_after(&self, record: &&R) -> BufferMemory {
+        let payload_bytes = self
+            .bytes
+            .len()
+            .checked_add(record.name().len())
+            .and_then(|bytes| bytes.checked_add(record.sequence().len()))
+            .and_then(|bytes| bytes.checked_add(record.quality().len()));
+        let item_count = self.records.len().saturating_add(1);
+        self.memory_for_lengths(payload_bytes, item_count)
     }
 }
 

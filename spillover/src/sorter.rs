@@ -522,6 +522,44 @@ impl<O, Cod, D, CS> Builder<HasOrder<O>, HasCodec<Cod>, ItemLimit, (), D, CS> {
     }
 }
 
+impl<O, Cod, D, CS> Builder<HasOrder<O>, HasCodec<Cod>, ByteLimit, (), D, CS> {
+    /// Build a measured unkeyed sorter and clear the selected storage.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn build_measured_in<'arena, B>(
+        self,
+        storage: &'arena mut B,
+    ) -> MeasuredUnkeyed<'arena, B, O, Cod, D, CS>
+    where
+        B: Buffer + EstimateBufferMemory,
+        for<'items> &'items mut B: ChunkBuffer,
+        Cod: Codec + EncodeRun<OrdinaryRecord<Cod>>,
+        O: Compare<OrdinaryRecord<Cod>>,
+        for<'items> Cod: EncodeRun<<&'items mut B as ChunkBuffer>::Item>,
+        for<'items> O: Compare<<&'items mut B as ChunkBuffer>::Item>,
+        for<'items> CS: ChunkSorter<<&'items mut B as ChunkBuffer>::Item, O>
+            + EstimateSortMemory<<&'items mut B as ChunkBuffer>::Item>,
+    {
+        ChunkBuffer::clear(&mut *storage);
+        let holder = ArenaBuffer { storage };
+        let accumulator = UnkeyedAccumulator {
+            order: self.sort_key.0,
+            codec: self.codec.0,
+            chunk_sort: self.chunk_sort,
+            merge_config: self.config.merge,
+            runs: Vec::new(),
+        };
+        Sorter {
+            session: Session::new(holder, accumulator),
+            dedup: self.dedup,
+            flush: FlushStrategy::Bytes {
+                budget: self.flush.bytes,
+            },
+            _marker: std::marker::PhantomData,
+        }
+    }
+}
+
 impl<O, Cod, D, CS> Builder<HasOrder<O>, HasKeyedCodec<Cod>, ItemLimit, (), D, CS> {
     /// Build an item-limited sorter using the complete order.
     #[must_use]
@@ -676,6 +714,12 @@ type SorterSession<T, SK, Cod, Cmp, CS, M> =
 type BorrowedUnkeyed<'arena, B, O, C, D, CS> =
     Sorter<(), O, C, (), D, CS, Unkeyed, ArenaBuffer<'arena, B>>;
 
+type MeasuredUnkeyed<'arena, B, O, C, D, CS> =
+    Sorter<(), O, C, (), D, CS, Unkeyed, MeasuredArena<'arena, B>>;
+
+#[doc(hidden)]
+pub struct MeasuredArena<'arena, B>(std::marker::PhantomData<&'arena mut B>);
+
 type BorrowedKeyed<'arena, B, O, C, D, CS> =
     Sorter<(), O, C, (), D, CS, Keyed, ArenaBuffer<'arena, B>>;
 
@@ -754,6 +798,9 @@ mod binding {
     impl<B, O, C, CS> Binding<(), O, C, (), CS, super::Unkeyed> for super::ArenaBuffer<'_, B> {
         type Session = Session<Self, UnkeyedAccumulator<O, C, CS>>;
     }
+    impl<'a, B, O, C, CS> Binding<(), O, C, (), CS, super::Unkeyed> for super::MeasuredArena<'a, B> {
+        type Session = Session<super::ArenaBuffer<'a, B>, UnkeyedAccumulator<O, C, CS>>;
+    }
     impl<B, O, C: crate::codec::KeyedCodec, CS> Binding<(), O, C, (), CS, super::Keyed>
         for super::ArenaBuffer<'_, B>
     {
@@ -772,6 +819,38 @@ use binding::{
 
 type ItemSize<T> = Box<dyn Fn(&T) -> usize + Send + Sync>;
 type MaybeItemSize<T> = Option<ItemSize<T>>;
+
+/// Storage-only insertion and spill bounds for a logical window.
+#[doc(hidden)]
+pub struct BufferMemory {
+    item_count: usize,
+    insertion_peak_bytes: usize,
+    spill_peak_bytes: usize,
+}
+impl BufferMemory {
+    #[doc(hidden)]
+    #[must_use]
+    pub fn new(item_count: usize, insertion_peak_bytes: usize, spill_peak_bytes: usize) -> Self {
+        Self {
+            item_count,
+            insertion_peak_bytes,
+            spill_peak_bytes,
+        }
+    }
+    #[doc(hidden)]
+    #[must_use]
+    pub fn item_count(&self) -> usize {
+        self.item_count
+    }
+}
+#[doc(hidden)]
+pub trait EstimateBufferMemory {
+    fn memory(&self) -> BufferMemory;
+}
+#[doc(hidden)]
+pub trait ProjectBufferMemory<Input: ?Sized>: EstimateBufferMemory {
+    fn memory_after(&self, input: &Input) -> BufferMemory;
+}
 
 /// Shared observation of a buffer's logical contents.
 ///
@@ -1061,6 +1140,77 @@ where
             unreachable!("borrowed item-limited sorter requires an item limit");
         };
         self.session.push_borrowed_item(input, max_items)
+    }
+
+    /// Commit any residual items and return output that does not borrow storage.
+    ///
+    /// # Errors
+    /// Returns an error if spilling or initializing the merge fails.
+    pub fn finish(self) -> Result<UnkeyedOutput<C, O, D>, MergeError<C::Error>>
+    where
+        D: Dedup<RunMerge<C, O>>,
+    {
+        let merged = self.session.finish()?;
+        Ok(Sorted::new(self.dedup.dedup(merged)))
+    }
+}
+
+fn measured_peak<'items, B, O, C, CS>(
+    session: &'items Session<ArenaBuffer<'_, B>, UnkeyedAccumulator<O, C, CS>>,
+    report: &BufferMemory,
+) -> usize
+where
+    &'items mut B: ChunkBuffer,
+    CS: EstimateSortMemory<<&'items mut B as ChunkBuffer>::Item>,
+{
+    let sort = session
+        .accumulator
+        .chunk_sort
+        .sort_memory(report.item_count, &());
+    let retained = sort.retained_bytes();
+    let insertion = report.insertion_peak_bytes.saturating_add(retained);
+    if report.item_count == 0 {
+        return insertion;
+    }
+    let spill = report.spill_peak_bytes.saturating_add(retained);
+    let sorting = spill.saturating_add(sort.scratch_bytes());
+    let writing = spill.saturating_add(session.accumulator.merge_config.write_buffer_bytes);
+    insertion.max(sorting).max(writing)
+}
+
+impl<B, O, C, D, CS> MeasuredUnkeyed<'_, B, O, C, D, CS>
+where
+    B: Buffer + EstimateBufferMemory,
+    for<'items> &'items mut B: ChunkBuffer,
+    C: Codec + EncodeRun<OrdinaryRecord<C>>,
+    O: Compare<OrdinaryRecord<C>>,
+    for<'items> C: EncodeRun<<&'items mut B as ChunkBuffer>::Item>,
+    for<'items> O: Compare<<&'items mut B as ChunkBuffer>::Item>,
+    for<'items> CS: ChunkSorter<<&'items mut B as ChunkBuffer>::Item, O>
+        + EstimateSortMemory<<&'items mut B as ChunkBuffer>::Item>,
+{
+    /// Insert an input and spill when its measured window reaches the budget.
+    ///
+    /// # Errors
+    /// Returns any error from completing a run.
+    pub fn push<I>(&mut self, input: I) -> Result<(), MergeError<C::Error>>
+    where
+        B: Extend<I> + ProjectBufferMemory<I>,
+    {
+        let FlushStrategy::Bytes { budget } = self.flush else {
+            unreachable!("measured sorter requires a byte limit");
+        };
+        let report = self.session.buffer().memory_after(&input);
+        let peak = measured_peak(&self.session, &report);
+        if !self.session.buffer().is_empty() && peak >= budget {
+            self.session.commit()?;
+        }
+        self.session.buffer.extend([input]);
+        let report = self.session.buffer().memory();
+        if measured_peak(&self.session, &report) >= budget {
+            self.session.commit()?;
+        }
+        Ok(())
     }
 
     /// Commit any residual items and return output that does not borrow storage.
