@@ -25,7 +25,7 @@ use spillover::{
     dedup::Identity,
     key::{KeyCompare, SortKey},
     merge::{KeyedRunMerge, MergeConfig, MergeError, RunMerge, RunMerger, SortedRun},
-    sorter::VisitSortedItems,
+    sorter::{Buffer, VisitSortedItems},
 };
 
 use crate::{
@@ -895,18 +895,18 @@ impl<SK, Cod, KeyCmp, RecCmp, CS, M> ArenaBackend<'_, SK, Cod, KeyCmp, RecCmp, C
     fn estimated_flush_peak(&self) -> usize {
         self.arena
             .live_byte_len()
-            .saturating_add(self.estimated_non_arena_flush_bytes(self.arena.record_count()))
+            .saturating_add(self.estimated_non_arena_flush_bytes(self.arena.len()))
     }
 
     fn estimated_flush_peak_after_push(&self, incoming_record_bytes: usize) -> usize {
         self.estimated_flush_peak_for(
             self.arena.byte_len().saturating_add(incoming_record_bytes),
-            self.arena.record_count().saturating_add(1),
+            self.arena.len().saturating_add(1),
         )
     }
 
     fn should_flush_before_push(&self, incoming_record_bytes: usize) -> bool {
-        let record_count = self.arena.record_count();
+        let record_count = self.arena.len();
         match self.flush {
             FlushConfig::MeasuredBudget(budget) => {
                 record_count != 0
@@ -917,7 +917,7 @@ impl<SK, Cod, KeyCmp, RecCmp, CS, M> ArenaBackend<'_, SK, Cod, KeyCmp, RecCmp, C
     }
 
     fn should_flush(&self) -> bool {
-        let record_count = self.arena.record_count();
+        let record_count = self.arena.len();
         match self.flush {
             FlushConfig::MeasuredBudget(budget) => {
                 record_count != 0 && self.estimated_flush_peak() >= budget
@@ -943,7 +943,8 @@ where
     for<'v> CS: ChunkSorter<SeqRecordView<'v>>,
 {
     fn flush(&mut self) -> Result<(), MergeError<Cod::Error>> {
-        if self.arena.record_count() == 0 {
+        let record_count = self.arena.len();
+        if record_count == 0 {
             return Ok(());
         }
 
@@ -982,7 +983,8 @@ where
     for<'v> CS: ChunkSorter<SeqRecordView<'v>>,
 {
     fn flush(&mut self) -> Result<(), MergeError<Cod::Error>> {
-        if self.arena.record_count() == 0 {
+        let record_count = self.arena.len();
+        if record_count == 0 {
             return Ok(());
         }
 
@@ -2025,14 +2027,14 @@ mod tests {
             .push(&SeqRecordView::new(b"a", b"A", b"!"))
             .expect("first push should not flush");
         assert_eq!(sorter.inner.spilled_runs.len(), 0);
-        assert_eq!(sorter.inner.arena.record_count(), 1);
+        assert_eq!(sorter.inner.arena.len(), 1);
 
         sorter
             .push(&SeqRecordView::new(b"b", b"C", b"!"))
             .expect("second push should pre-flush the first record");
 
         assert_eq!(sorter.inner.spilled_runs.len(), 1);
-        assert_eq!(sorter.inner.arena.record_count(), 1);
+        assert_eq!(sorter.inner.arena.len(), 1);
         assert_eq!(sorter.inner.arena.byte_len(), 3);
     }
 
@@ -2052,7 +2054,7 @@ mod tests {
             .expect("oversized single record should be accepted and flushed");
 
         assert_eq!(sorter.inner.spilled_runs.len(), 1);
-        assert_eq!(sorter.inner.arena.record_count(), 0);
+        assert_eq!(sorter.inner.arena.len(), 0);
         assert!(sorter.inner.arena.is_empty());
     }
 
@@ -2074,14 +2076,14 @@ mod tests {
         let retained_capacity = sorter.inner.arena.capacity();
         assert!(retained_capacity >= 2048);
         assert_eq!(sorter.inner.spilled_runs.len(), 1);
-        assert_eq!(sorter.inner.arena.record_count(), 0);
+        assert_eq!(sorter.inner.arena.len(), 0);
 
         sorter
             .push(&SeqRecordView::new(b"s", b"A", b"!"))
             .expect("small record should not flush because of retained capacity");
 
         assert_eq!(sorter.inner.spilled_runs.len(), 1);
-        assert_eq!(sorter.inner.arena.record_count(), 1);
+        assert_eq!(sorter.inner.arena.len(), 1);
         assert_eq!(sorter.inner.arena.byte_len(), 3);
     }
 

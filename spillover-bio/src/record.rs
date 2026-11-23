@@ -11,6 +11,7 @@
 
 use dryice::SeqRecordLike;
 use get_size2::GetSize;
+use spillover::sorter::Buffer;
 
 /// Read-only access to sequence record fields.
 ///
@@ -222,7 +223,7 @@ impl SeqRecordArena {
 
     /// Estimated live bytes owned by the arena for the current spill window.
     pub(crate) fn live_byte_len(&self) -> usize {
-        Self::live_byte_len_for(self.byte_len(), self.record_count())
+        Self::live_byte_len_for(self.byte_len(), self.len())
     }
 
     /// Estimated live arena bytes for a projected spill window.
@@ -233,10 +234,6 @@ impl SeqRecordArena {
     /// Estimated live bytes used for private per-record boundary metadata.
     pub(crate) fn metadata_bytes_for(record_count: usize) -> usize {
         record_count.saturating_mul(std::mem::size_of::<ArenaRecord>())
-    }
-
-    pub(crate) fn record_count(&self) -> usize {
-        self.records.len()
     }
 
     pub(crate) fn store<R: SeqRecordParts + ?Sized>(&mut self, record: &R) {
@@ -278,6 +275,12 @@ impl SeqRecordArena {
     pub(crate) fn clear(&mut self) {
         self.bytes.clear();
         self.records.clear();
+    }
+}
+
+impl Buffer for SeqRecordArena {
+    fn len(&self) -> usize {
+        self.records.len()
     }
 }
 
@@ -424,7 +427,7 @@ mod tests {
         arena.store(&SeqRecordView::new(b"r1", b"ACGT", b"!!!!"));
         arena.store(&SeqRecordView::new(b"r2", b"TGCA", b"####"));
 
-        assert_eq!(arena.record_count(), 2);
+        assert_eq!(arena.len(), 2);
         assert_eq!(arena.byte_len(), 20);
 
         let views = arena.views();
@@ -460,7 +463,7 @@ mod tests {
         arena.clear();
 
         assert!(arena.is_empty());
-        assert_eq!(arena.record_count(), 0);
+        assert_eq!(arena.len(), 0);
         assert_eq!(arena.capacity(), initial_capacity);
     }
 

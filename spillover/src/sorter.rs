@@ -393,6 +393,44 @@ type SorterSession<T, SK, Cod, Cmp, CS, M> =
 type ItemSize<T> = Box<dyn Fn(&T) -> usize + Send + Sync>;
 type MaybeItemSize<T> = Option<ItemSize<T>>;
 
+/// Shared observation of a buffer's logical contents.
+///
+/// The count includes items with no payload bytes and must agree with the number
+/// of items exposed for the next commit. Observation must be cheap: use existing
+/// metadata rather than scanning records or constructing views.
+///
+/// This capability does not imply insertion, traversal, memory usage, allocation
+/// behavior, or lifecycle ownership.
+pub trait Buffer {
+    /// Return the number of logical items currently buffered.
+    fn len(&self) -> usize;
+
+    /// Return whether the logical item count is zero.
+    ///
+    /// Overrides must remain equivalent to `self.len() == 0`.
+    fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+}
+
+impl<T> Buffer for Vec<T> {
+    fn len(&self) -> usize {
+        Vec::len(self)
+    }
+}
+
+impl<T> Buffer for [T] {
+    fn len(&self) -> usize {
+        <[T]>::len(self)
+    }
+}
+
+impl<T, const N: usize> Buffer for [T; N] {
+    fn len(&self) -> usize {
+        N
+    }
+}
+
 struct OwnedBuffer<T> {
     items: Vec<T>,
     active_bytes: usize,
@@ -468,6 +506,12 @@ impl<T> OwnedBuffer<T> {
     }
 }
 
+impl<T> Buffer for OwnedBuffer<T> {
+    fn len(&self) -> usize {
+        self.items.len()
+    }
+}
+
 impl<T> Extend<T> for OwnedBuffer<T> {
     fn extend<I>(&mut self, iter: I)
     where
@@ -487,7 +531,6 @@ trait ChunkBuffer {
     type Items: AsMut<[Self::Item]>;
 
     fn items(self) -> Self::Items;
-    fn is_empty(&self) -> bool;
     fn clear(self);
 }
 
@@ -497,10 +540,6 @@ impl<'items, T> ChunkBuffer for &'items mut OwnedBuffer<T> {
 
     fn items(self) -> Self::Items {
         &mut self.items
-    }
-
-    fn is_empty(&self) -> bool {
-        self.items.is_empty()
     }
 
     fn clear(self) {
@@ -544,7 +583,7 @@ impl FlushStrategy {
                 let current_peak = Self::fixed_size_peak(&memory, write_buffer_bytes);
                 current_peak >= *budget
             }
-            FlushStrategy::Items { max_items } => buffer.items.len() >= *max_items,
+            FlushStrategy::Items { max_items } => buffer.len() >= *max_items,
         }
     }
 }
@@ -573,18 +612,14 @@ trait AccumulateItems<I> {
 
 impl<B, A> Session<B, A>
 where
+    B: Buffer,
     for<'items> &'items mut B: ChunkBuffer,
 {
     fn commit<E>(&mut self) -> Result<(), E>
     where
         for<'items> A: AccumulateItems<<&'items mut B as ChunkBuffer>::Item, Error = E>,
     {
-        let is_empty = {
-            let buffer = &mut self.buffer;
-            ChunkBuffer::is_empty(&buffer)
-        };
-
-        if is_empty {
+        if self.buffer.is_empty() {
             return Ok(());
         }
 
@@ -613,7 +648,7 @@ impl<T, SK, Cod, Cmp, CS, M> Session<OwnedBuffer<T>, RunAccumulator<SK, Cod, Cmp
         RunAccumulator<SK, Cod, Cmp, CS, M>: AccumulateItems<T, Error = E>,
     {
         let write_buffer_bytes = self.accumulator.merge_config.write_buffer_bytes;
-        if !self.buffer.items.is_empty()
+        if !self.buffer.is_empty()
             && policy.should_flush_before_push(&self.buffer, write_buffer_bytes)
         {
             self.commit()?;
