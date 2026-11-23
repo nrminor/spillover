@@ -1202,6 +1202,49 @@ fn arena_unkeyed_sorter_sorts_borrowed_record_views() {
 }
 
 #[test]
+fn arena_keyed_measured_ignores_retained_payload_after_clear() {
+    let mut arena = SeqRecordArena::with_capacity(8192);
+    let capacity = arena.capacity();
+    assert!(capacity >= 8192);
+
+    let mut merge_config = MergeConfig::default();
+    merge_config.write_buffer_bytes = 0;
+    let mut sorter = Builder::new()
+        .sort_by_illumina()
+        .sort_with_sequential()
+        .codec(DryIceCodec::new())
+        .merge_config(merge_config)
+        .arena(&mut arena)
+        .measured_budget(1)
+        .build();
+    let seed = SeqRecordView::new(b"seed", b"A", b"!");
+    sorter.push(&seed).expect("seed push should succeed");
+    drop(sorter);
+
+    assert_eq!(arena.byte_len(), 0);
+    assert_eq!(arena.capacity(), capacity);
+
+    let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("Cargo.toml");
+    assert!(manifest.is_file());
+    let mut merge_config = MergeConfig::default();
+    merge_config.temp_dir = Some(manifest);
+    merge_config.write_buffer_bytes = 0;
+    let mut sorter = Builder::new()
+        .sort_by_illumina()
+        .sort_with_sequential()
+        .codec(DryIceCodec::new())
+        .merge_config(merge_config)
+        .arena(&mut arena)
+        .measured_budget(capacity / 2)
+        .build();
+    let record = SeqRecordView::new(b"s", b"A", b"!");
+    sorter.push(&record).expect("tiny push should succeed");
+    drop(sorter);
+
+    assert_eq!(arena.byte_len(), 3);
+}
+
+#[test]
 fn arena_keyed_measured_admits_oversized_before_failed_commit() {
     let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("Cargo.toml");
     assert!(manifest.is_file());
