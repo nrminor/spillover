@@ -24,6 +24,184 @@
 
 use std::cmp::Ordering;
 
+/// An item associated with the stored key derived from it.
+pub struct Keyed<I, K> {
+    item: I,
+    stored_key: K,
+}
+
+impl<I, K> Keyed<I, K> {
+    fn new<Input, O>(input: Input, order: &O) -> Self
+    where
+        Input: std::ops::Deref + Into<I>,
+        O: DeriveKey<Input::Target, StoredKey = K> + ?Sized,
+    {
+        let stored_key = order.derive_key(&input);
+        let item = input.into();
+        Self { item, stored_key }
+    }
+
+    /// The associated item.
+    #[must_use]
+    pub fn item(&self) -> &I {
+        &self.item
+    }
+
+    /// The key derived from the associated item.
+    #[must_use]
+    pub fn stored_key(&self) -> &K {
+        &self.stored_key
+    }
+}
+
+impl<'item, I: ?Sized, K> Keyed<&'item I, K> {
+    /// Derive a stored key for this item under the given order.
+    #[must_use]
+    pub fn derive<O: DeriveKey<I, StoredKey = K> + ?Sized>(item: &'item I, order: &O) -> Self {
+        Self::new(item, order)
+    }
+}
+
+struct Located<'source, I> {
+    source: &'source [I],
+    source_slot: usize,
+}
+
+impl<I> std::ops::Deref for Located<'_, I> {
+    type Target = I;
+
+    fn deref(&self) -> &I {
+        &self.source[self.source_slot]
+    }
+}
+
+impl<I> From<Located<'_, I>> for usize {
+    fn from(located: Located<'_, I>) -> Self {
+        located.source_slot
+    }
+}
+
+/// Compares protected entries against their bound source and complete order.
+pub struct KeyedEntryCompare<'a, I, O> {
+    items: &'a [I],
+    order: &'a O,
+}
+
+impl<'a, I, O: KeyedOrder> KeyedEntryCompare<'a, I, O> {
+    pub(crate) fn new(items: &'a [I], order: &'a O) -> Self {
+        Self { items, order }
+    }
+
+    pub(crate) fn prepare_missing_keys(&self, entries: &mut Vec<Keyed<usize, O::StoredKey>>)
+    where
+        O: DeriveKey<I>,
+    {
+        let first_missing_slot = entries.len();
+        assert!(first_missing_slot <= self.items.len());
+        for source_slot in first_missing_slot..self.items.len() {
+            let located = Located {
+                source: self.items,
+                source_slot,
+            };
+            let entry = Keyed::new(located, self.order);
+            entries.push(entry);
+        }
+    }
+
+    pub(crate) fn ordered_records<'records>(
+        &'records self,
+        entries: &'records [Keyed<usize, O::StoredKey>],
+    ) -> impl Iterator<Item = (&'records I, &'records O::StoredKey)> + 'records {
+        entries.iter().map(|entry| {
+            let item = &self.items[*entry.item()];
+            (item, entry.stored_key())
+        })
+    }
+}
+
+impl<I, O> crate::compare::Compare<Keyed<usize, O::StoredKey>> for KeyedEntryCompare<'_, I, O>
+where
+    O: KeyedOrder + crate::compare::Compare<I>,
+{
+    fn compare(
+        &self,
+        left: &Keyed<usize, O::StoredKey>,
+        right: &Keyed<usize, O::StoredKey>,
+    ) -> Ordering {
+        let key_order = self
+            .order
+            .compare_keys(left.stored_key(), right.stored_key());
+        key_order.then_with(|| {
+            self.order
+                .compare(&self.items[*left.item()], &self.items[*right.item()])
+        })
+    }
+}
+
+/// The stored-key part of a complete order.
+pub trait KeyedOrder {
+    /// Key retained in temporary runs.
+    type StoredKey;
+
+    /// Compare two stored keys under this order.
+    fn compare_keys(&self, left: &Self::StoredKey, right: &Self::StoredKey) -> Ordering;
+}
+
+/// Derive the stored key used by a complete order.
+pub trait DeriveKey<I: ?Sized>: KeyedOrder {
+    /// Derive the stored key for an item.
+    fn derive_key(&self, item: &I) -> Self::StoredKey;
+
+    /// Associate an item with its derived stored key.
+    fn derive_keyed<'item>(&self, item: &'item I) -> Keyed<&'item I, Self::StoredKey> {
+        Keyed::derive(item, self)
+    }
+}
+
+/// An upper bound on a key's dynamic memory and its derivation scratch.
+pub struct KeyMemory {
+    retained_heap_bytes: usize,
+    derivation_scratch_bytes: usize,
+}
+
+impl KeyMemory {
+    /// No additional dynamic memory is required.
+    pub const NONE: Self = Self {
+        retained_heap_bytes: 0,
+        derivation_scratch_bytes: 0,
+    };
+
+    /// Bound the heap retained by a derived key.
+    #[must_use]
+    pub fn retained_heap(bytes: usize) -> Self {
+        Self {
+            retained_heap_bytes: bytes,
+            derivation_scratch_bytes: 0,
+        }
+    }
+
+    /// Bound additional temporary memory during key derivation.
+    #[must_use]
+    pub fn with_derivation_scratch(mut self, bytes: usize) -> Self {
+        self.derivation_scratch_bytes = bytes;
+        self
+    }
+
+    pub(crate) fn retained_heap_bytes(&self) -> usize {
+        self.retained_heap_bytes
+    }
+
+    pub(crate) fn derivation_scratch_bytes(&self) -> usize {
+        self.derivation_scratch_bytes
+    }
+}
+
+/// Estimate dynamic memory needed to derive and retain a key.
+pub trait EstimateKeyMemory<I: ?Sized>: KeyedOrder {
+    /// Return a conservative allowance for this input.
+    fn estimate_key_memory(&self, input: &I) -> KeyMemory;
+}
+
 /// Extract a sort key from an item.
 ///
 /// A sort key is the transient value that determines ordering

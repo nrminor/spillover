@@ -1372,6 +1372,36 @@ fn sort_with_disk_spilling() {
 }
 
 #[test]
+fn owned_keyed_spills_follow_complete_sequence_order() {
+    let mut sorter = Builder::new()
+        .sort_by(ILLUMINA_ORDER)
+        .chunk_sort(Sequential)
+        .codec(DryIceCodec::new())
+        .max_buffer_items(2)
+        .build();
+
+    // C and N must share the first initial run.
+    let records = [
+        SeqRecord::new(b"c", b"C", b"I"),
+        SeqRecord::new(b"n", b"N", b"I"),
+        SeqRecord::new(b"a", b"A", b"I"),
+    ];
+    for record in records {
+        sorter.push(record).expect("push should succeed");
+    }
+
+    let output = sorter.finish().expect("finish should succeed");
+    let sequences: Vec<Vec<u8>> = output
+        .map(|result| {
+            let record = result.expect("record should decode");
+            record.sequence().to_vec()
+        })
+        .collect();
+
+    assert_eq!(sequences, [b"A", b"N", b"C"]);
+}
+
+#[test]
 fn quality_tiebreaker_orders_identical_sequences() {
     let mut sorter = Builder::new()
         .sort_by_illumina()

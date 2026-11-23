@@ -114,6 +114,28 @@ impl<K: ?Sized, C: Compare<K>> Compare<K> for Reverse<C> {
     }
 }
 
+impl<O: crate::key::KeyedOrder> crate::key::KeyedOrder for Reverse<O> {
+    type StoredKey = O::StoredKey;
+
+    fn compare_keys(&self, left: &Self::StoredKey, right: &Self::StoredKey) -> Ordering {
+        self.0.compare_keys(left, right).reverse()
+    }
+}
+
+impl<I: ?Sized, O: crate::key::DeriveKey<I>> crate::key::DeriveKey<I> for Reverse<O> {
+    fn derive_key(&self, item: &I) -> Self::StoredKey {
+        self.0.derive_key(item)
+    }
+}
+
+impl<I: ?Sized, O: crate::key::EstimateKeyMemory<I>> crate::key::EstimateKeyMemory<I>
+    for Reverse<O>
+{
+    fn estimate_key_memory(&self, item: &I) -> crate::key::KeyMemory {
+        self.0.estimate_key_memory(item)
+    }
+}
+
 /// Compare keys through [`AsRef`], so that different key types
 /// that dereference to the same underlying type compare
 /// identically.

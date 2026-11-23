@@ -20,11 +20,11 @@ use get_size2::GetSize;
 
 use crate::{
     SortedItemsError,
-    chunk::{ChunkSorter, Sequential},
+    chunk::{ChunkSorter, EstimateSortMemory, Sequential},
     codec::{Codec, CodecCursor, EncodeKeyedRun, EncodeRun, KeyedCodec},
     compare::{Compare, Natural},
     dedup::{Dedup, Identity},
-    key::{KeyCompare, SortKey},
+    key::{DeriveKey, EstimateKeyMemory, KeyCompare, KeyMemory, KeyedEntryCompare, SortKey},
     merge::{KeyedRunMerge, MergeConfig, MergeError, RunMerge, RunMerger, RunWriter, SortedRun},
 };
 
@@ -55,6 +55,63 @@ pub struct SorterConfig {
 pub struct NeedsSortKey;
 /// Marker: sort key has been provided.
 pub struct HasSortKey<SK>(SK);
+
+/// Marker: a complete order has been selected.
+pub struct HasOrder<O>(O);
+/// Marker: the complete-order path needs a limit.
+pub struct NeedsLimit;
+/// Maximum number of buffered items on the complete-order path.
+pub struct ItemLimit {
+    max_items: usize,
+}
+
+impl ItemLimit {
+    /// Construct an item-count limit.
+    #[must_use]
+    pub const fn new(max_items: usize) -> Self {
+        Self { max_items }
+    }
+
+    /// Return the configured item limit.
+    #[must_use]
+    pub fn max_items(&self) -> usize {
+        self.max_items
+    }
+}
+
+/// Count-based algorithm workspace estimation.
+pub struct CountBased;
+
+/// A byte budget for the modeled active window and initial spill.
+pub struct ByteLimit<M = CountBased> {
+    bytes: usize,
+    mode: std::marker::PhantomData<fn() -> M>,
+}
+
+impl ByteLimit {
+    /// Construct a count-based byte budget.
+    #[must_use]
+    pub fn new(bytes: usize) -> Self {
+        Self {
+            bytes,
+            mode: std::marker::PhantomData,
+        }
+    }
+}
+
+impl<M> ByteLimit<M> {
+    /// Return the configured byte budget.
+    #[must_use]
+    pub fn max_bytes(&self) -> usize {
+        self.bytes
+    }
+}
+
+impl From<usize> for ByteLimit {
+    fn from(bytes: usize) -> Self {
+        Self::new(bytes)
+    }
+}
 
 /// Marker: no codec provided yet.
 pub struct NeedsCodec;
@@ -204,6 +261,57 @@ impl<SK, Cod, Flush, Cmp, D, CS> Builder<SK, Cod, Flush, Cmp, D, CS> {
     }
 }
 
+impl<Cod, D, CS> Builder<NeedsSortKey, Cod, NeedsFlushStrategy, Natural, D, CS> {
+    /// Select one complete order for initial runs and merging.
+    #[must_use]
+    pub fn order<O>(self, order: O) -> Builder<HasOrder<O>, Cod, NeedsLimit, (), D, CS> {
+        Builder {
+            sort_key: HasOrder(order),
+            codec: self.codec,
+            flush: NeedsLimit,
+            compare: (),
+            dedup: self.dedup,
+            chunk_sort: self.chunk_sort,
+            config: self.config,
+        }
+    }
+}
+
+impl<O, Cod, D, CS> Builder<HasOrder<O>, Cod, NeedsLimit, (), D, CS> {
+    /// Limit the number of buffered items.
+    #[must_use]
+    pub fn max_buffer_items(
+        self,
+        max_items: usize,
+    ) -> Builder<HasOrder<O>, Cod, ItemLimit, (), D, CS> {
+        Builder {
+            sort_key: self.sort_key,
+            codec: self.codec,
+            flush: ItemLimit { max_items },
+            compare: (),
+            dedup: self.dedup,
+            chunk_sort: self.chunk_sort,
+            config: self.config,
+        }
+    }
+    /// Set the modeled byte budget for the complete-order path.
+    #[must_use]
+    pub fn memory_budget(
+        self,
+        budget: impl Into<ByteLimit>,
+    ) -> Builder<HasOrder<O>, Cod, ByteLimit, (), D, CS> {
+        Builder {
+            sort_key: self.sort_key,
+            codec: self.codec,
+            flush: budget.into(),
+            compare: (),
+            dedup: self.dedup,
+            chunk_sort: self.chunk_sort,
+            config: self.config,
+        }
+    }
+}
+
 // Flush strategy methods.
 
 impl<SK, Cod, Cmp, D, CS> Builder<SK, Cod, NeedsFlushStrategy, Cmp, D, CS> {
@@ -291,7 +399,7 @@ where
     SK: SortKey<T> + Copy,
     Cod: Codec + Copy,
     Cmp: for<'a> Compare<SK::Key<'a>> + Copy,
-    CS: ChunkSorter<T>,
+    CS: ChunkSorter<T, KeyCompare<SK, Cmp>>,
 {
     /// Build the [`Sorter`] (unkeyed merge path).
     #[must_use]
@@ -321,7 +429,7 @@ where
     SK: SortKey<T> + Copy,
     Cod: KeyedCodec + Copy,
     Cmp: for<'a> Compare<SK::Key<'a>> + Compare<Cod::Key> + Copy,
-    CS: ChunkSorter<T>,
+    CS: ChunkSorter<T, KeyCompare<SK, Cmp>>,
 {
     /// Build the [`Sorter`] (keyed merge path).
     #[must_use]
@@ -353,6 +461,76 @@ where
     }
 }
 
+impl<O, Cod, D, CS> Builder<HasOrder<O>, HasKeyedCodec<Cod>, ItemLimit, (), D, CS> {
+    /// Build an item-limited sorter using the complete order.
+    #[must_use]
+    pub fn build<T>(self) -> Sorter<T, O, Cod, (), D, CS, Keyed, ItemLimit>
+    where
+        O: DeriveKey<T, StoredKey = Cod::Key> + Compare<T>,
+        Cod: KeyedCodec
+            + EncodeKeyedRun<T>
+            + EncodeKeyedRun<
+                <<Cod as KeyedCodec>::KeyedCursor<BufReader<File>> as CodecCursor>::Record,
+            >,
+        O: Compare<<<Cod as KeyedCodec>::KeyedCursor<BufReader<File>> as CodecCursor>::Record>,
+        for<'a> CS: ChunkSorter<crate::key::Keyed<usize, Cod::Key>, KeyedEntryCompare<'a, T, O>>,
+    {
+        let accumulator = OrderedAccumulator {
+            order: self.sort_key.0,
+            codec: self.codec.0,
+            chunk_sort: self.chunk_sort,
+            merge_config: self.config.merge,
+            runs: Vec::new(),
+            pending: Vec::new(),
+            accounting: (),
+        };
+        Sorter {
+            session: Session::new(OwnedBuffer::new(None), accumulator),
+            dedup: self.dedup,
+            flush: FlushStrategy::Items {
+                max_items: self.flush.max_items,
+            },
+            _marker: std::marker::PhantomData,
+        }
+    }
+}
+
+impl<O, Cod, D, CS> Builder<HasOrder<O>, HasKeyedCodec<Cod>, ByteLimit, (), D, CS> {
+    /// Build a byte-limited sorter using the complete order.
+    #[must_use]
+    pub fn build<T>(self) -> Sorter<T, O, Cod, (), D, CS, Keyed, ByteLimit>
+    where
+        T: GetSize,
+        Cod: KeyedCodec + EncodeKeyedRun<T> + EncodeKeyedRun<KeyedRecord<Cod>>,
+        O: DeriveKey<T, StoredKey = Cod::Key>
+            + EstimateKeyMemory<T>
+            + Compare<T>
+            + Compare<KeyedRecord<Cod>>,
+        CS: EstimateSortMemory<crate::key::Keyed<usize, Cod::Key>>,
+        for<'a> CS: ChunkSorter<crate::key::Keyed<usize, Cod::Key>, KeyedEntryCompare<'a, T, O>>,
+    {
+        let accumulator = OrderedAccumulator {
+            order: self.sort_key.0,
+            codec: self.codec.0,
+            chunk_sort: self.chunk_sort,
+            merge_config: self.config.merge,
+            runs: Vec::new(),
+            pending: Vec::new(),
+            accounting: ByteAccounting::empty(),
+        };
+        Sorter {
+            session: Session::new(OwnedBuffer::new(None), accumulator),
+            dedup: self.dedup,
+            flush: FlushStrategy::Bytes {
+                budget: self.flush.bytes,
+            },
+            _marker: std::marker::PhantomData,
+        }
+    }
+}
+
+type KeyedRecord<C> = <<C as KeyedCodec>::KeyedCursor<BufReader<File>> as CodecCursor>::Record;
+
 /// A disk-spilling external sorter.
 ///
 /// Push items via [`push`](Self::push), then call
@@ -380,8 +558,11 @@ where
 /// - `CS`: [`ChunkSorter`] — in-memory sort algorithm and
 ///   threading model
 /// - `M`: merge strategy marker ([`Unkeyed`] or [`Keyed`])
-pub struct Sorter<T, SK, Cod, Cmp, D, CS, M = Unkeyed> {
-    session: SorterSession<T, SK, Cod, Cmp, CS, M>,
+pub struct Sorter<T, SK, Cod, Cmp, D, CS, M = Unkeyed, L = ()>
+where
+    L: binding::Binding<T, SK, Cod, Cmp, CS, M>,
+{
+    session: <L as binding::Binding<T, SK, Cod, Cmp, CS, M>>::Session,
     dedup: D,
     flush: FlushStrategy,
     _marker: std::marker::PhantomData<M>,
@@ -389,6 +570,70 @@ pub struct Sorter<T, SK, Cod, Cmp, D, CS, M = Unkeyed> {
 
 type SorterSession<T, SK, Cod, Cmp, CS, M> =
     Session<OwnedBuffer<T>, RunAccumulator<SK, Cod, Cmp, CS, M>>;
+
+mod binding {
+    use super::{KeyedCodec, MaybeItemSize, MergeConfig, SortedRun};
+
+    pub struct OwnedBuffer<T> {
+        pub(super) items: Vec<T>,
+        pub(super) active_bytes: usize,
+        pub(super) item_size: MaybeItemSize<T>,
+    }
+
+    pub struct Session<B, A> {
+        pub(super) buffer: B,
+        pub(super) accumulator: A,
+    }
+
+    pub struct RunAccumulator<SK, Cod, Cmp, CS, M> {
+        pub(super) sort_key: SK,
+        pub(super) codec: Cod,
+        pub(super) compare: Cmp,
+        pub(super) chunk_sort: CS,
+        pub(super) merge_config: MergeConfig,
+        pub(super) runs: Vec<SortedRun>,
+        pub(super) _marker: std::marker::PhantomData<fn() -> M>,
+    }
+
+    pub struct OrderedAccumulator<O, C: KeyedCodec, CS, A = ()> {
+        pub(super) order: O,
+        pub(super) codec: C,
+        pub(super) chunk_sort: CS,
+        pub(super) merge_config: MergeConfig,
+        pub(super) runs: Vec<SortedRun>,
+        pub(super) pending: Vec<crate::key::Keyed<usize, C::Key>>,
+        pub(super) accounting: A,
+    }
+
+    #[derive(Clone)]
+    pub struct ByteAccounting {
+        pub(super) payload_heap: Option<usize>,
+        pub(super) retained_keys: Option<usize>,
+        pub(super) missing_keys: Option<usize>,
+        pub(super) derivation_scratch: usize,
+    }
+
+    pub trait Binding<T, SK, Cod, Cmp, CS, M> {
+        type Session;
+    }
+
+    impl<T, SK, Cod, Cmp, CS, M> Binding<T, SK, Cod, Cmp, CS, M> for () {
+        type Session = super::SorterSession<T, SK, Cod, Cmp, CS, M>;
+    }
+
+    impl<T, O, Cod: crate::codec::KeyedCodec, CS> Binding<T, O, Cod, (), CS, super::Keyed>
+        for super::ItemLimit
+    {
+        type Session = Session<OwnedBuffer<T>, OrderedAccumulator<O, Cod, CS>>;
+    }
+    impl<T, O, Cod: crate::codec::KeyedCodec, CS> Binding<T, O, Cod, (), CS, super::Keyed>
+        for super::ByteLimit
+    {
+        type Session = Session<OwnedBuffer<T>, OrderedAccumulator<O, Cod, CS, ByteAccounting>>;
+    }
+}
+
+use binding::{ByteAccounting, OrderedAccumulator, OwnedBuffer, RunAccumulator, Session};
 
 type ItemSize<T> = Box<dyn Fn(&T) -> usize + Send + Sync>;
 type MaybeItemSize<T> = Option<ItemSize<T>>;
@@ -431,10 +676,19 @@ impl<T, const N: usize> Buffer for [T; N] {
     }
 }
 
-struct OwnedBuffer<T> {
-    items: Vec<T>,
-    active_bytes: usize,
-    item_size: MaybeItemSize<T>,
+fn growth_target<T>(items: &Vec<T>, required: usize) -> Option<usize> {
+    let layout = Layout::array::<T>(required).ok()?;
+    let capacity = items.capacity();
+    if layout.size() == 0 || required <= capacity {
+        return Some(required);
+    }
+    let doubled = capacity.checked_mul(2).unwrap_or(required);
+    let requested = doubled.max(required);
+    if Layout::array::<T>(requested).is_ok() {
+        Some(requested)
+    } else {
+        Some(required)
+    }
 }
 
 struct OwnedStorageMemory {
@@ -453,20 +707,7 @@ impl<T> OwnedBuffer<T> {
     }
 
     fn growth_target(&self, required: usize) -> Option<usize> {
-        let required_layout = Layout::array::<T>(required).ok()?;
-        let current_capacity = self.items.capacity();
-        if required_layout.size() == 0 || required <= current_capacity {
-            return Some(required);
-        }
-
-        let doubled_capacity = current_capacity.checked_mul(2).unwrap_or(required);
-        let requested_capacity = doubled_capacity.max(required);
-        let requested_layout = Layout::array::<T>(requested_capacity);
-        if requested_layout.is_ok() {
-            Some(requested_capacity)
-        } else {
-            Some(required)
-        }
+        growth_target(&self.items, required)
     }
 
     fn storage_memory(&self, additional_items: usize) -> OwnedStorageMemory {
@@ -588,11 +829,6 @@ impl FlushStrategy {
     }
 }
 
-struct Session<B, A> {
-    buffer: B,
-    accumulator: A,
-}
-
 impl<B, A> Session<B, A> {
     fn new(buffer: B, accumulator: A) -> Self {
         Self {
@@ -610,13 +846,11 @@ trait AccumulateItems<I> {
     fn finish(self) -> Result<Self::Final, Self::Error>;
 }
 
-impl<B, A> Session<B, A>
-where
-    B: Buffer,
-    for<'items> &'items mut B: ChunkBuffer,
-{
+impl<B, A> Session<B, A> {
     fn commit<E>(&mut self) -> Result<(), E>
     where
+        B: Buffer,
+        for<'items> &'items mut B: ChunkBuffer,
         for<'items> A: AccumulateItems<<&'items mut B as ChunkBuffer>::Item, Error = E>,
     {
         if self.buffer.is_empty() {
@@ -634,6 +868,8 @@ where
 
     fn finish<E, F>(mut self) -> Result<F, E>
     where
+        B: Buffer,
+        for<'items> &'items mut B: ChunkBuffer,
         for<'items> A: AccumulateItems<<&'items mut B as ChunkBuffer>::Item, Error = E, Final = F>,
     {
         self.commit()?;
@@ -667,16 +903,6 @@ impl<T, SK, Cod, Cmp, CS, M> Session<OwnedBuffer<T>, RunAccumulator<SK, Cod, Cmp
     }
 }
 
-struct RunAccumulator<SK, Cod, Cmp, CS, M> {
-    sort_key: SK,
-    codec: Cod,
-    compare: Cmp,
-    chunk_sort: CS,
-    merge_config: MergeConfig,
-    runs: Vec<SortedRun>,
-    _marker: std::marker::PhantomData<fn() -> M>,
-}
-
 impl<SK, Cod, Cmp, CS, M> RunAccumulator<SK, Cod, Cmp, CS, M> {
     fn new(sort_key: SK, codec: Cod, compare: Cmp, chunk_sort: CS, config: MergeConfig) -> Self {
         Self {
@@ -702,17 +928,14 @@ where
         + 'static,
     Cmp: for<'a> Compare<SK::Key<'a>> + Copy + Send + Sync + 'static,
     KeyCompare<SK, Cmp>: Compare<<<Cod as Codec>::Cursor<BufReader<File>> as CodecCursor>::Record>,
-    CS: ChunkSorter<T>,
+    CS: ChunkSorter<T, KeyCompare<SK, Cmp>>,
 {
     type Error = MergeError<Cod::Error>;
     type Final = RunMerge<Cod, KeyCompare<SK, Cmp>>;
 
     fn accumulate(&mut self, items: &mut [T]) -> Result<(), MergeError<Cod::Error>> {
         let item_cmp = KeyCompare::new(self.sort_key, self.compare);
-        let compare_items = move |left: &T, right: &T| {
-            <KeyCompare<SK, Cmp> as Compare<T>>::compare(&item_cmp, left, right)
-        };
-        self.chunk_sort.sort(items, compare_items);
+        self.chunk_sort.sort(items, &item_cmp);
 
         let run_writer = RunWriter::new_unkeyed(self.codec, &self.merge_config);
         let run = run_writer.write_sorted(items)?;
@@ -741,17 +964,14 @@ where
     Cmp: for<'a> Compare<SK::Key<'a>> + Compare<Cod::Key> + Copy + Send + Sync + 'static,
     KeyCompare<SK, Cmp>:
         Compare<<<Cod as KeyedCodec>::KeyedCursor<BufReader<File>> as CodecCursor>::Record>,
-    CS: ChunkSorter<T>,
+    CS: ChunkSorter<T, KeyCompare<SK, Cmp>>,
 {
     type Error = MergeError<Cod::Error>;
     type Final = KeyedRunMerge<Cod, Cmp, KeyCompare<SK, Cmp>>;
 
     fn accumulate(&mut self, items: &mut [T]) -> Result<(), MergeError<Cod::Error>> {
         let item_cmp = KeyCompare::new(self.sort_key, self.compare);
-        let compare_items = move |left: &T, right: &T| {
-            <KeyCompare<SK, Cmp> as Compare<T>>::compare(&item_cmp, left, right)
-        };
-        self.chunk_sort.sort(items, compare_items);
+        self.chunk_sort.sort(items, &item_cmp);
 
         let run_writer = RunWriter::new_keyed(self.codec, &self.merge_config);
         let records = items.iter();
@@ -766,6 +986,87 @@ where
         let run_merger = RunMerger::new(self.codec, item_cmp, self.merge_config);
 
         run_merger.merge_keyed(self.runs, self.compare)
+    }
+}
+
+trait Accounting {
+    fn prepared(&mut self);
+    fn retire(&mut self);
+}
+
+impl Accounting for () {
+    fn prepared(&mut self) {}
+    fn retire(&mut self) {}
+}
+
+impl ByteAccounting {
+    fn empty() -> Self {
+        Self {
+            payload_heap: Some(0),
+            retained_keys: Some(0),
+            missing_keys: Some(0),
+            derivation_scratch: 0,
+        }
+    }
+
+    fn include(&mut self, heap: usize, key: &KeyMemory) {
+        self.payload_heap = self.payload_heap.and_then(|n| n.checked_add(heap));
+        self.missing_keys = self
+            .missing_keys
+            .and_then(|n| n.checked_add(key.retained_heap_bytes()));
+        self.derivation_scratch = self.derivation_scratch.max(key.derivation_scratch_bytes());
+    }
+}
+
+impl Accounting for ByteAccounting {
+    fn prepared(&mut self) {
+        self.retained_keys = self
+            .retained_keys
+            .and_then(|n| n.checked_add(self.missing_keys?));
+        self.missing_keys = Some(0);
+        self.derivation_scratch = 0;
+    }
+
+    fn retire(&mut self) {
+        *self = Self::empty();
+    }
+}
+
+impl<T, O, C, CS, A: Accounting> AccumulateItems<T> for OrderedAccumulator<O, C, CS, A>
+where
+    C: KeyedCodec
+        + EncodeKeyedRun<T>
+        + EncodeKeyedRun<<<C as KeyedCodec>::KeyedCursor<BufReader<File>> as CodecCursor>::Record>,
+    O: DeriveKey<T, StoredKey = C::Key>
+        + Compare<T>
+        + Compare<<<C as KeyedCodec>::KeyedCursor<BufReader<File>> as CodecCursor>::Record>,
+    for<'a> CS: ChunkSorter<crate::key::Keyed<usize, C::Key>, KeyedEntryCompare<'a, T, O>>,
+{
+    type Error = MergeError<C::Error>;
+    type Final = KeyedRunMerge<C, O, (), Keyed>;
+
+    fn accumulate(&mut self, items: &mut [T]) -> Result<(), Self::Error> {
+        let required = items.len();
+        let requested = growth_target(&self.pending, required).expect("entry capacity overflow");
+        if requested > self.pending.capacity() {
+            self.pending.reserve_exact(requested - self.pending.len());
+        }
+        let comparison = KeyedEntryCompare::new(items, &self.order);
+        comparison.prepare_missing_keys(&mut self.pending);
+        self.accounting.prepared();
+        self.chunk_sort.sort(&mut self.pending, &comparison);
+        let writer = RunWriter::new_keyed(self.codec, &self.merge_config);
+        let records = comparison.ordered_records(&self.pending);
+        let run = writer.write_supplied(records)?;
+        self.runs.push(run);
+        self.pending.clear();
+        self.accounting.retire();
+        Ok(())
+    }
+
+    fn finish(self) -> Result<Self::Final, Self::Error> {
+        let merger = RunMerger::new(self.codec, self.order, self.merge_config);
+        merger.merge_under_order(self.runs)
     }
 }
 
@@ -885,7 +1186,7 @@ where
         + 'static,
     Cmp: for<'a> Compare<SK::Key<'a>> + Copy + Send + Sync + 'static,
     KeyCompare<SK, Cmp>: Compare<<<Cod as Codec>::Cursor<BufReader<File>> as CodecCursor>::Record>,
-    CS: ChunkSorter<T>,
+    CS: ChunkSorter<T, KeyCompare<SK, Cmp>>,
 {
     /// Add an item to the sorter.
     ///
@@ -934,7 +1235,7 @@ where
     Cmp: for<'a> Compare<SK::Key<'a>> + Compare<Cod::Key> + Copy + Send + Sync + 'static,
     KeyCompare<SK, Cmp>:
         Compare<<<Cod as KeyedCodec>::KeyedCursor<BufReader<File>> as CodecCursor>::Record>,
-    CS: ChunkSorter<T>,
+    CS: ChunkSorter<T, KeyCompare<SK, Cmp>>,
 {
     /// Add an item to the sorter.
     ///
@@ -965,6 +1266,175 @@ where
         let dedup = self.dedup;
         let merged = self.session.finish()?;
 
+        Ok(Sorted::new(dedup.dedup(merged)))
+    }
+}
+
+impl<T, O, C, CS> Session<OwnedBuffer<T>, OrderedAccumulator<O, C, CS, ByteAccounting>>
+where
+    T: GetSize,
+    C: KeyedCodec + EncodeKeyedRun<T> + EncodeKeyedRun<KeyedRecord<C>>,
+    O: DeriveKey<T, StoredKey = C::Key>
+        + EstimateKeyMemory<T>
+        + Compare<T>
+        + Compare<KeyedRecord<C>>,
+    CS: EstimateSortMemory<crate::key::Keyed<usize, C::Key>>,
+    for<'a> CS: ChunkSorter<crate::key::Keyed<usize, C::Key>, KeyedEntryCompare<'a, T, O>>,
+{
+    fn peak(&self, additional: usize, accounting: &ByteAccounting) -> Option<usize> {
+        let count = self.buffer.items.len().checked_add(additional)?;
+        let occupied = Layout::array::<T>(count).ok()?.size();
+        let requested = self.buffer.growth_target(count)?;
+        let insertion_storage = if requested > self.buffer.items.capacity() {
+            let old = Layout::array::<T>(self.buffer.items.capacity())
+                .ok()?
+                .size();
+            let new = Layout::array::<T>(requested).ok()?.size();
+            old.checked_add(new)?
+        } else {
+            occupied
+        };
+        let entries = &self.accumulator.pending;
+        let existing_entries = Layout::array::<crate::key::Keyed<usize, C::Key>>(entries.len())
+            .ok()?
+            .size();
+        let retained_keys = accounting.retained_keys?;
+        let payload = accounting.payload_heap?;
+        let sort_memory = self.accumulator.chunk_sort.sort_memory(count, &());
+        let workspace = sort_memory.retained_bytes();
+        let insertion = insertion_storage
+            .checked_add(payload)?
+            .checked_add(existing_entries)?
+            .checked_add(retained_keys)?
+            .checked_add(workspace)?;
+        if count == 0 {
+            return Some(insertion);
+        }
+        let completed_entries = Layout::array::<crate::key::Keyed<usize, C::Key>>(count)
+            .ok()?
+            .size();
+        let entry_request = growth_target(entries, count)?;
+        let entry_preparation = if entry_request > entries.capacity() {
+            let old = Layout::array::<crate::key::Keyed<usize, C::Key>>(entries.capacity())
+                .ok()?
+                .size();
+            let new = Layout::array::<crate::key::Keyed<usize, C::Key>>(entry_request)
+                .ok()?
+                .size();
+            old.checked_add(new)?
+        } else {
+            completed_entries
+        };
+        let base = occupied.checked_add(payload)?.checked_add(workspace)?;
+        let existing_key_heap = retained_keys;
+        let all_key_heap = retained_keys.checked_add(accounting.missing_keys?)?;
+        let reserve = base
+            .checked_add(entry_preparation)?
+            .checked_add(existing_key_heap)?;
+        let completed = base
+            .checked_add(completed_entries)?
+            .checked_add(all_key_heap)?;
+        let derive = completed.checked_add(accounting.derivation_scratch)?;
+        let sorting = completed.checked_add(sort_memory.scratch_bytes())?;
+        let writing = completed.checked_add(self.accumulator.merge_config.write_buffer_bytes)?;
+        Some(insertion.max(reserve).max(derive).max(sorting).max(writing))
+    }
+
+    fn push_measured(&mut self, item: T, budget: usize) -> Result<(), MergeError<C::Error>> {
+        let heap = item.get_heap_size();
+        let key = self.accumulator.order.estimate_key_memory(&item);
+        let mut projected = self.accumulator.accounting.clone();
+        projected.include(heap, &key);
+        let peak = self.peak(1, &projected).unwrap_or(usize::MAX);
+        if !self.buffer.is_empty() && peak >= budget {
+            self.commit()?;
+        }
+        self.buffer.reserve_for_push();
+        self.buffer.extend([item]);
+        self.accumulator.accounting.include(heap, &key);
+        let peak = self
+            .peak(0, &self.accumulator.accounting)
+            .unwrap_or(usize::MAX);
+        if peak >= budget {
+            self.commit()?;
+        }
+        Ok(())
+    }
+}
+
+type OrderedOutput<C, O, D> = Sorted<<D as Dedup<KeyedRunMerge<C, O, (), Keyed>>>::Deduped>;
+
+impl<T, O, C, D, CS> Sorter<T, O, C, (), D, CS, Keyed, ItemLimit>
+where
+    C: KeyedCodec
+        + EncodeKeyedRun<T>
+        + EncodeKeyedRun<<<C as KeyedCodec>::KeyedCursor<BufReader<File>> as CodecCursor>::Record>,
+    O: DeriveKey<T, StoredKey = C::Key>
+        + Compare<T>
+        + Compare<<<C as KeyedCodec>::KeyedCursor<BufReader<File>> as CodecCursor>::Record>,
+    for<'a> CS: ChunkSorter<crate::key::Keyed<usize, C::Key>, KeyedEntryCompare<'a, T, O>>,
+{
+    /// Add an item, spilling when the configured count is reached.
+    ///
+    /// # Errors
+    /// Returns an error if spilling fails.
+    pub fn push(&mut self, item: T) -> Result<(), MergeError<C::Error>> {
+        self.session.buffer.extend([item]);
+        if self.flush.should_flush_after_push(
+            &self.session.buffer,
+            self.session.accumulator.merge_config.write_buffer_bytes,
+        ) {
+            self.session.commit()?;
+        }
+        Ok(())
+    }
+
+    /// Finish the remaining run and return the merged output.
+    ///
+    /// # Errors
+    /// Returns an error if spilling or merging fails.
+    pub fn finish(self) -> Result<OrderedOutput<C, O, D>, MergeError<C::Error>>
+    where
+        D: Dedup<KeyedRunMerge<C, O, (), Keyed>>,
+    {
+        let dedup = self.dedup;
+        let merged = self.session.finish()?;
+        Ok(Sorted::new(dedup.dedup(merged)))
+    }
+}
+
+impl<T, O, C, D, CS> Sorter<T, O, C, (), D, CS, Keyed, ByteLimit>
+where
+    T: GetSize,
+    C: KeyedCodec + EncodeKeyedRun<T> + EncodeKeyedRun<KeyedRecord<C>>,
+    O: DeriveKey<T, StoredKey = C::Key>
+        + EstimateKeyMemory<T>
+        + Compare<T>
+        + Compare<KeyedRecord<C>>,
+    CS: EstimateSortMemory<crate::key::Keyed<usize, C::Key>>,
+    for<'a> CS: ChunkSorter<crate::key::Keyed<usize, C::Key>, KeyedEntryCompare<'a, T, O>>,
+{
+    /// Add an item under the modeled byte budget.
+    ///
+    /// # Errors
+    /// Returns an error if spilling fails.
+    pub fn push(&mut self, item: T) -> Result<(), MergeError<C::Error>> {
+        let FlushStrategy::Bytes { budget } = self.flush else {
+            unreachable!()
+        };
+        self.session.push_measured(item, budget)
+    }
+
+    /// Finish remaining runs and return the merged output.
+    ///
+    /// # Errors
+    /// Returns an error if spilling or merging fails.
+    pub fn finish(self) -> Result<OrderedOutput<C, O, D>, MergeError<C::Error>>
+    where
+        D: Dedup<KeyedRunMerge<C, O, (), Keyed>>,
+    {
+        let dedup = self.dedup;
+        let merged = self.session.finish()?;
         Ok(Sorted::new(dedup.dedup(merged)))
     }
 }

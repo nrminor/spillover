@@ -230,19 +230,46 @@ where
     where
         C: EncodeKeyedRun<Record>,
     {
+        self.write_with(|writer: &mut C::KeyedWriter<&mut RunWriterStream>| {
+            for item in items {
+                let record = project_record(&item);
+                let key = self.codec.derive_key(record);
+                writer
+                    .write_keyed(record, &key)
+                    .map_err(MergeError::Codec)?;
+            }
+            Ok(())
+        })
+    }
+
+    pub(crate) fn write_supplied<'item, Record: ?Sized + 'item>(
+        &self,
+        items: impl IntoIterator<Item = (&'item Record, &'item C::Key)>,
+    ) -> MergeResult<SortedRun, C::Error>
+    where
+        C: EncodeKeyedRun<Record>,
+        C::Key: 'item,
+    {
+        self.write_with(|writer: &mut C::KeyedWriter<&mut RunWriterStream>| {
+            for (record, key) in items {
+                writer.write_keyed(record, key).map_err(MergeError::Codec)?;
+            }
+            Ok(())
+        })
+    }
+
+    fn write_with<Record: ?Sized>(
+        &self,
+        write: impl FnOnce(&mut C::KeyedWriter<&mut RunWriterStream>) -> MergeResult<(), C::Error>,
+    ) -> MergeResult<SortedRun, C::Error>
+    where
+        C: EncodeKeyedRun<Record>,
+    {
         let named = self.create_temp_file()?;
         let file = named.reopen().map_err(MergeError::Io)?;
         let mut run_writer = self.config.run_writer(file);
         let mut writer = self.codec.keyed_writer(&mut run_writer);
-
-        for item in items {
-            let record = project_record(&item);
-            let key = self.codec.derive_key(record);
-            writer
-                .write_keyed(record, &key)
-                .map_err(MergeError::Codec)?;
-        }
-
+        write(&mut writer)?;
         writer.finish().map_err(MergeError::Codec)?;
         std::io::Write::flush(&mut run_writer).map_err(MergeError::Io)?;
 
@@ -383,8 +410,32 @@ impl<C: KeyedCodec, Cmp> RunMerger<C, Cmp> {
     {
         let fan_in = self.config.max_fan_in.get();
         let context = KeyedContext {
-            merger: self,
-            key_cmp,
+            codec: self.codec,
+            config: self.config,
+            primary: key_cmp,
+            secondary: self.cmp,
+            mode: std::marker::PhantomData,
+        };
+        let final_runs = reduce_runs(runs, fan_in, |group| context.spill_group(group))?;
+        let execution = Execution::new(context, final_runs);
+        Ok(KeyedRunMerge { execution })
+    }
+    pub(crate) fn merge_under_order(
+        self,
+        runs: Vec<SortedRun>,
+    ) -> MergeResult<KeyedRunMerge<C, Cmp, (), crate::sorter::Keyed>, C::Error>
+    where
+        C: EncodeKeyedRun<<<C as KeyedCodec>::KeyedCursor<RunReader> as CodecCursor>::Record>,
+        Cmp: crate::key::KeyedOrder<StoredKey = C::Key>
+            + Compare<<C::KeyedCursor<RunReader> as CodecCursor>::Record>,
+    {
+        let fan_in = self.config.max_fan_in.get();
+        let context = KeyedContext {
+            codec: self.codec,
+            config: self.config,
+            primary: self.cmp,
+            secondary: (),
+            mode: std::marker::PhantomData,
         };
         let final_runs = reduce_runs(runs, fan_in, |group| context.spill_group(group))?;
         let execution = Execution::new(context, final_runs);
@@ -495,9 +546,12 @@ where
     }
 }
 
-struct KeyedContext<C: KeyedCodec, KeyCmp, ItemCmp> {
-    merger: RunMerger<C, ItemCmp>,
-    key_cmp: KeyCmp,
+struct KeyedContext<C: KeyedCodec, Primary, Secondary, M = ()> {
+    codec: C,
+    config: MergeConfig,
+    primary: Primary,
+    secondary: Secondary,
+    mode: std::marker::PhantomData<fn() -> M>,
 }
 
 impl<C, KeyCmp, ItemCmp> MergeContext for KeyedContext<C, KeyCmp, ItemCmp>
@@ -511,11 +565,11 @@ where
     type Key = C::Key;
 
     fn config(&self) -> &MergeConfig {
-        &self.merger.config
+        &self.config
     }
 
     fn open(&self, reader: RunReader) -> Result<Self::Cursor, Self::Error> {
-        self.merger.codec.keyed_cursor(reader)
+        self.codec.keyed_cursor(reader)
     }
 
     fn current_key(&self, cursor: &Self::Cursor) -> Result<Self::Key, Self::Error> {
@@ -528,27 +582,77 @@ where
         left: &HeapEntry<Self::Key>,
         right: &HeapEntry<Self::Key>,
     ) -> Result<Ordering, Self::Error> {
-        let key_ordering = self.key_cmp.compare(&left.key, &right.key);
-        if !key_ordering.is_eq() {
-            return Ok(key_ordering);
-        }
-        let ordering = compare_records(readers, left.source, right.source, &self.merger.cmp)?;
-        Ok(ordering.then_with(|| left.source.cmp(&right.source)))
+        let key_ordering = self.primary.compare(&left.key, &right.key);
+        compare_keyed_records(readers, left, right, key_ordering, &self.secondary)
     }
 }
 
-impl<C, KeyCmp, ItemCmp> KeyedContext<C, KeyCmp, ItemCmp>
+impl<C, O> MergeContext for KeyedContext<C, O, (), crate::sorter::Keyed>
+where
+    C: KeyedCodec,
+    O: crate::key::KeyedOrder<StoredKey = C::Key>
+        + Compare<<C::KeyedCursor<RunReader> as CodecCursor>::Record>,
+{
+    type Error = C::Error;
+    type Cursor = C::KeyedCursor<RunReader>;
+    type Key = C::Key;
+
+    fn config(&self) -> &MergeConfig {
+        &self.config
+    }
+
+    fn open(&self, reader: RunReader) -> Result<Self::Cursor, Self::Error> {
+        self.codec.keyed_cursor(reader)
+    }
+
+    fn current_key(&self, cursor: &Self::Cursor) -> Result<Self::Key, Self::Error> {
+        cursor.current_key()
+    }
+
+    fn compare(
+        &self,
+        readers: &mut [Self::Cursor],
+        left: &HeapEntry<Self::Key>,
+        right: &HeapEntry<Self::Key>,
+    ) -> Result<Ordering, Self::Error> {
+        let order = &self.primary;
+        let key_ordering = order.compare_keys(&left.key, &right.key);
+        compare_keyed_records(readers, left, right, key_ordering, order)
+    }
+}
+
+fn compare_keyed_records<R, K, Cmp>(
+    readers: &mut [R],
+    left: &HeapEntry<K>,
+    right: &HeapEntry<K>,
+    key_ordering: Ordering,
+    item_cmp: &Cmp,
+) -> Result<Ordering, R::Error>
+where
+    R: CodecCursor,
+    Cmp: Compare<R::Record>,
+{
+    if !key_ordering.is_eq() {
+        return Ok(key_ordering);
+    }
+    let ordering = compare_records(readers, left.source, right.source, item_cmp)?;
+    Ok(ordering.then_with(|| left.source.cmp(&right.source)))
+}
+
+impl<C, KeyCmp, ItemCmp, M> KeyedContext<C, KeyCmp, ItemCmp, M>
 where
     C: KeyedCodec
         + EncodeKeyedRun<<<C as KeyedCodec>::KeyedCursor<RunReader> as CodecCursor>::Record>,
-    KeyCmp: Compare<C::Key>,
-    ItemCmp: Compare<<C::KeyedCursor<RunReader> as CodecCursor>::Record>,
+    Self: MergeContext<Error = C::Error, Cursor = C::KeyedCursor<RunReader>, Key = C::Key>,
 {
     fn spill_group(&self, runs: Vec<SortedRun>) -> MergeResult<SortedRun, C::Error> {
-        let named = self.merger.create_temp_file()?;
+        let named = match &self.config.temp_dir {
+            Some(dir) => tempfile::NamedTempFile::new_in(dir)?,
+            None => tempfile::NamedTempFile::new()?,
+        };
         let file = named.reopen().map_err(MergeError::Io)?;
-        let mut run_writer = self.merger.config.run_writer(file);
-        let mut writer = self.merger.codec.keyed_writer(&mut run_writer);
+        let mut run_writer = self.config.run_writer(file);
+        let mut writer = self.codec.keyed_writer(&mut run_writer);
         let mut execution = Execution::new(self, runs);
         loop {
             let delivered = execution
@@ -858,21 +962,27 @@ where
     }
 }
 
+type KeyedExecution<C, K, I, M> = Execution<
+    KeyedContext<C, K, I, M>,
+    <C as KeyedCodec>::KeyedCursor<RunReader>,
+    <C as KeyedCodec>::Key,
+>;
+
 /// Lazy keyed merge over sorted runs spilled to disk.
 ///
 /// Stored keys determine order, with borrowed record comparison on ties.
 /// Traversal borrows the winning record; owned iteration additionally requires
 /// the keyed cursor's [`TakeOwned`] capability.
-pub struct KeyedRunMerge<C: KeyedCodec, KeyCmp, ItemCmp> {
-    execution: Execution<KeyedContext<C, KeyCmp, ItemCmp>, C::KeyedCursor<RunReader>, C::Key>,
+pub struct KeyedRunMerge<C: KeyedCodec, KeyCmp, ItemCmp, M = ()> {
+    execution: KeyedExecution<C, KeyCmp, ItemCmp, M>,
 }
 
-impl<C, KeyCmp, ItemCmp> Iterator for KeyedRunMerge<C, KeyCmp, ItemCmp>
+impl<C, KeyCmp, ItemCmp, M> Iterator for KeyedRunMerge<C, KeyCmp, ItemCmp, M>
 where
     C: KeyedCodec,
     C::KeyedCursor<RunReader>: TakeOwned,
-    KeyCmp: Compare<C::Key>,
-    ItemCmp: Compare<<C::KeyedCursor<RunReader> as CodecCursor>::Record>,
+    KeyedContext<C, KeyCmp, ItemCmp, M>:
+        MergeContext<Error = C::Error, Cursor = C::KeyedCursor<RunReader>, Key = C::Key>,
 {
     type Item = MergeResult<<C::KeyedCursor<RunReader> as TakeOwned>::Owned, C::Error>;
 
@@ -881,11 +991,11 @@ where
     }
 }
 
-impl<C, KeyCmp, ItemCmp> VisitSortedItems for KeyedRunMerge<C, KeyCmp, ItemCmp>
+impl<C, KeyCmp, ItemCmp, M> VisitSortedItems for KeyedRunMerge<C, KeyCmp, ItemCmp, M>
 where
     C: KeyedCodec,
-    KeyCmp: Compare<C::Key>,
-    ItemCmp: Compare<<C::KeyedCursor<RunReader> as CodecCursor>::Record>,
+    KeyedContext<C, KeyCmp, ItemCmp, M>:
+        MergeContext<Error = C::Error, Cursor = C::KeyedCursor<RunReader>, Key = C::Key>,
 {
     type Record = <C::KeyedCursor<RunReader> as CodecCursor>::Record;
     type Error = MergeError<C::Error>;

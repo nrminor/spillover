@@ -11,9 +11,12 @@
 
 use std::cmp::Ordering;
 
-use spillover::chunk::ChunkSorter;
+use spillover::{
+    chunk::{ChunkSorter, EstimateSortMemory, SortMemory},
+    compare::Compare,
+};
 
-use crate::record::SeqRecordParts;
+use crate::{key::PackedSequenceKey, record::SeqRecordParts};
 
 /// In-place MSD radix sort on packed sequence keys, with
 /// comparison-based refinement for tiebreaking.
@@ -25,7 +28,7 @@ use crate::record::SeqRecordParts;
 /// comparison sort.
 ///
 /// This is not a general-purpose comparator sort. It imposes
-/// ascending [`PackedSequenceKey`](crate::key::PackedSequenceKey)
+/// ascending [`PackedSequenceKey`]
 /// bucket order before calling the supplied comparator, and the
 /// comparator is used only to refine records whose packed keys tie.
 /// Use it only when ascending `PackedSequenceKey<N>` is the primary
@@ -45,106 +48,164 @@ pub struct RadixThenRefine<const N: usize>;
 /// of continuing the radix recursion. Tuned for the cost of
 /// a 256-bucket counting pass vs. a short comparison sort.
 const INSERTION_THRESHOLD: usize = 64;
+const BUCKETS: usize = 256;
+type BucketTable = [usize; BUCKETS];
 
-impl<const N: usize, R: SeqRecordParts> ChunkSorter<R> for RadixThenRefine<N> {
-    fn sort(&self, chunk: &mut [R], cmp: impl Fn(&R, &R) -> Ordering + Send + Sync) {
-        Self::sort_impl(chunk, &cmp);
+struct TemporaryEntry<const N: usize> {
+    source: usize,
+    key: PackedSequenceKey<N>,
+}
+
+impl<const N: usize, R: SeqRecordParts> ChunkSorter<R, crate::sort::SequenceOrder<N>>
+    for RadixThenRefine<N>
+{
+    fn sort(&self, chunk: &mut [R], cmp: &crate::sort::SequenceOrder<N>) {
+        Self::sort_impl(chunk, &|left, right| cmp.compare(left, right));
     }
 }
 
-/// Inner radix sort with const generic key width.
-fn msd_radix_sort_inner<const N: usize, R: SeqRecordParts>(
-    records: &mut [R],
-    keys: &mut [[u8; N]],
+impl<'a, const N: usize, I>
+    ChunkSorter<
+        spillover::key::Keyed<usize, PackedSequenceKey<N>>,
+        spillover::key::KeyedEntryCompare<'a, I, crate::sort::SequenceOrder<N>>,
+    > for RadixThenRefine<N>
+where
+    crate::sort::SequenceOrder<N>: Compare<I>,
+{
+    fn sort(
+        &self,
+        entries: &mut [spillover::key::Keyed<usize, PackedSequenceKey<N>>],
+        cmp: &spillover::key::KeyedEntryCompare<'a, I, crate::sort::SequenceOrder<N>>,
+    ) {
+        sort_entries(entries, 0, &|entry| entry.stored_key(), &|left, right| {
+            cmp.compare(left, right)
+        });
+    }
+}
+
+impl<const N: usize> EstimateSortMemory<spillover::key::Keyed<usize, PackedSequenceKey<N>>>
+    for RadixThenRefine<N>
+{
+    fn sort_memory(&self, count: usize, (): &()) -> SortMemory {
+        SortMemory::temporary(Self::partition_workspace(count).unwrap_or(usize::MAX))
+    }
+}
+
+impl<const N: usize, R: SeqRecordParts> EstimateSortMemory<R> for RadixThenRefine<N> {
+    fn sort_memory(&self, count: usize, (): &()) -> SortMemory {
+        let bytes = std::alloc::Layout::array::<TemporaryEntry<N>>(count)
+            .ok()
+            .and_then(|layout| layout.size().checked_add(Self::partition_workspace(count)?))
+            .unwrap_or(usize::MAX);
+        SortMemory::temporary(bytes)
+    }
+}
+
+fn sort_entries<const N: usize, E>(
+    entries: &mut [E],
     byte_pos: usize,
-    cmp: &impl Fn(&R, &R) -> Ordering,
+    key: &impl Fn(&E) -> &PackedSequenceKey<N>,
+    compare: &impl Fn(&E, &E) -> Ordering,
 ) {
-    if records.len() <= INSERTION_THRESHOLD || byte_pos >= N {
-        // Small group or exhausted key bytes: comparison sort
-        // handles tiebreaking (quality) and final ordering.
-        records.sort_unstable_by(|a, b| cmp(a, b));
+    if entries.len() <= INSERTION_THRESHOLD || byte_pos >= N {
+        entries.sort_unstable_by(compare);
         return;
     }
 
-    // Count occurrences of each byte value at this position.
-    let mut counts = [0usize; 256];
-    for key in keys.iter() {
-        counts[key[byte_pos] as usize] += 1;
+    let mut counts: BucketTable = [0; BUCKETS];
+    for entry in entries.iter() {
+        let bucket = usize::from(key(entry).0[byte_pos]);
+        counts[bucket] += 1;
     }
 
-    // Compute bucket start offsets (prefix sum).
-    let mut offsets = [0usize; 256];
+    let mut offsets: BucketTable = [0; BUCKETS];
     let mut running = 0;
-    for i in 0..256 {
-        offsets[i] = running;
-        running += counts[i];
+    for (offset, count) in offsets.iter_mut().zip(&counts) {
+        *offset = running;
+        running += count;
     }
 
-    // In-place permutation via cycle sort. For each bucket, walk
-    // its assigned range and swap any out-of-place items to their
-    // correct bucket until all items are in the right place.
     let mut cursors = offsets;
-    for bucket in 0..256 {
+    for bucket in 0..BUCKETS {
         let bucket_end = offsets[bucket] + counts[bucket];
         while cursors[bucket] < bucket_end {
-            let item_bucket = keys[cursors[bucket]][byte_pos] as usize;
+            let position = cursors[bucket];
+            let item_bucket = usize::from(key(&entries[position]).0[byte_pos]);
             if item_bucket == bucket {
                 cursors[bucket] += 1;
             } else {
                 let target = cursors[item_bucket];
-                records.swap(cursors[bucket], target);
-                keys.swap(cursors[bucket], target);
+                entries.swap(position, target);
                 cursors[item_bucket] += 1;
             }
         }
     }
 
-    // Recurse on each non-trivial bucket.
     let mut start = 0;
     for &count in &counts {
         let end = start + count;
-        if end - start > 1 {
-            msd_radix_sort_inner(
-                &mut records[start..end],
-                &mut keys[start..end],
-                byte_pos + 1,
-                cmp,
-            );
+        if count > 1 {
+            let bucket = &mut entries[start..end];
+            sort_entries(bucket, byte_pos + 1, key, compare);
         }
         start = end;
     }
 }
 
-// Fix the ChunkSorter impl to call msd_radix_sort_inner directly.
+fn apply_permutation<const N: usize, R>(records: &mut [R], entries: &mut [TemporaryEntry<N>]) {
+    for start in 0..entries.len() {
+        let mut destination = start;
+        loop {
+            let source = entries[destination].source;
+            entries[destination].source = destination;
+            if source == start {
+                break;
+            }
+            records.swap(destination, source);
+            destination = source;
+        }
+    }
+}
+
 impl<const N: usize> RadixThenRefine<N> {
     fn sort_impl<R: SeqRecordParts>(chunk: &mut [R], cmp: &impl Fn(&R, &R) -> Ordering) {
-        let mut keys: Vec<[u8; N]> = chunk
+        let mut entries: Vec<TemporaryEntry<N>> = chunk
             .iter()
-            .map(|rec| crate::key::PackedSequenceKey::<N>::from_sequence(rec.sequence()).0)
+            .enumerate()
+            .map(|(source, record)| {
+                let key = PackedSequenceKey::from_sequence(record.sequence());
+                TemporaryEntry { source, key }
+            })
             .collect();
 
-        msd_radix_sort_inner(chunk, &mut keys, 0, cmp);
+        let compare = |left: &TemporaryEntry<N>, right: &TemporaryEntry<N>| {
+            cmp(&chunk[left.source], &chunk[right.source])
+        };
+        sort_entries(&mut entries, 0, &|entry| &entry.key, &compare);
+        apply_permutation(chunk, &mut entries);
+    }
+
+    pub(crate) fn partition_workspace(count: usize) -> Option<usize> {
+        if count <= INSERTION_THRESHOLD {
+            return Some(0);
+        }
+        let tables = N.checked_mul(3)?;
+        let layout = std::alloc::Layout::array::<BucketTable>(tables).ok()?;
+        Some(layout.size())
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::record::{SeqRecord, SeqRecordView};
+    use crate::record::SeqRecord;
     use crate::sort::SequenceOrder;
-    use spillover::compare::Compare;
 
     fn make_record(name: &[u8], seq: &[u8], qual: &[u8]) -> SeqRecord {
         SeqRecord::new(name, seq, qual)
     }
 
     fn seq_qual_cmp(a: &SeqRecord, b: &SeqRecord) -> Ordering {
-        a.sequence()
-            .cmp(b.sequence())
-            .then_with(|| a.quality().cmp(b.quality()))
-    }
-
-    fn view_seq_qual_cmp(a: &SeqRecordView<'_>, b: &SeqRecordView<'_>) -> Ordering {
         a.sequence()
             .cmp(b.sequence())
             .then_with(|| a.quality().cmp(b.quality()))
@@ -174,7 +235,8 @@ mod tests {
         ];
         let mut views: Vec<_> = records.iter().map(SeqRecord::as_view).collect();
 
-        RadixThenRefine::<2>.sort(&mut views, view_seq_qual_cmp);
+        let order: SequenceOrder<2> = SequenceOrder;
+        RadixThenRefine.sort(&mut views, &order);
 
         assert_eq!(views[0].sequence(), b"AAAAAAAA");
         assert_eq!(views[1].sequence(), b"CCCCCCCC");
@@ -293,7 +355,7 @@ mod tests {
         // Use more than INSERTION_THRESHOLD records so this exercises radix
         // buckets rather than only the comparison-sort fallback.
         expected.sort_unstable_by(cmp);
-        RadixThenRefine::<3>.sort(&mut records, cmp);
+        RadixThenRefine::<3>.sort(&mut records, &order);
 
         for (i, (got, exp)) in records.iter().zip(expected.iter()).enumerate() {
             assert_eq!(
