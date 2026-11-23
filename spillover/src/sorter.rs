@@ -14,7 +14,7 @@
 //! [`Dedup`]: crate::dedup::Dedup
 //! [`ChunkSorter`]: crate::chunk::ChunkSorter
 
-use std::{fs::File, io::BufReader};
+use std::{alloc::Layout, fs::File, io::BufReader};
 
 use get_size2::GetSize;
 
@@ -33,6 +33,9 @@ use crate::{
 enum FlushStrategy {
     /// Flush when the estimated byte usage exceeds a budget.
     Bytes { budget: usize },
+
+    /// Account for fixed-size owned storage and the configured spill transport.
+    FixedSize { budget: usize },
 
     /// Flush when the item count exceeds a limit.
     Items { max_items: usize },
@@ -243,6 +246,11 @@ impl<SK, Cod, Cmp, D, CS> Builder<SK, Cod, NeedsFlushStrategy, Cmp, D, CS> {
     }
 
     /// Byte-based budget using `size_of` (fixed-size types only).
+    ///
+    /// The unkeyed path accounts for occupied inline storage, requested backing
+    /// replacement overlap, and the configured write buffer during spilling.
+    /// The keyed path retains its item-size-only byte threshold.
+    /// Neither path accounts for arbitrary sorting scratch or codec allocations.
     #[must_use]
     pub fn fixed_size_budget<T: 'static>(
         self,
@@ -251,10 +259,7 @@ impl<SK, Cod, Cmp, D, CS> Builder<SK, Cod, NeedsFlushStrategy, Cmp, D, CS> {
         Builder {
             sort_key: self.sort_key,
             codec: self.codec,
-            flush: HasFlushStrategy(
-                FlushStrategy::Bytes { budget },
-                Some(Box::new(|_| std::mem::size_of::<T>())),
-            ),
+            flush: HasFlushStrategy(FlushStrategy::FixedSize { budget }, None),
             compare: self.compare,
             dedup: self.dedup,
             chunk_sort: self.chunk_sort,
@@ -321,9 +326,18 @@ where
     /// Build the [`Sorter`] (keyed merge path).
     #[must_use]
     pub fn build(self) -> Sorter<T, SK, Cod, Cmp, D, CS, Keyed> {
+        let HasFlushStrategy(flush, item_size) = self.flush;
+        let (flush, item_size) = match flush {
+            FlushStrategy::FixedSize { budget } => {
+                let item_size: ItemSize<T> = Box::new(|_| std::mem::size_of::<T>());
+                (FlushStrategy::Bytes { budget }, Some(item_size))
+            }
+            legacy => (legacy, item_size),
+        };
+
         Sorter {
             session: Session::new(
-                OwnedBuffer::new(self.flush.1),
+                OwnedBuffer::new(item_size),
                 RunAccumulator::new(
                     self.sort_key.0,
                     self.codec.0,
@@ -333,7 +347,7 @@ where
                 ),
             ),
             dedup: self.dedup,
-            flush: self.flush.0,
+            flush,
             _marker: std::marker::PhantomData,
         }
     }
@@ -385,12 +399,71 @@ struct OwnedBuffer<T> {
     item_size: MaybeItemSize<T>,
 }
 
+struct OwnedStorageMemory {
+    item_count: usize,
+    insertion_peak_bytes: usize,
+    spill_peak_bytes: usize,
+}
+
 impl<T> OwnedBuffer<T> {
     fn new(item_size: MaybeItemSize<T>) -> Self {
         Self {
             items: Vec::new(),
             active_bytes: 0,
             item_size,
+        }
+    }
+
+    fn growth_target(&self, required: usize) -> Option<usize> {
+        let required_layout = Layout::array::<T>(required).ok()?;
+        let current_capacity = self.items.capacity();
+        if required_layout.size() == 0 || required <= current_capacity {
+            return Some(required);
+        }
+
+        let doubled_capacity = current_capacity.checked_mul(2).unwrap_or(required);
+        let requested_capacity = doubled_capacity.max(required);
+        let requested_layout = Layout::array::<T>(requested_capacity);
+        if requested_layout.is_ok() {
+            Some(requested_capacity)
+        } else {
+            Some(required)
+        }
+    }
+
+    fn storage_memory(&self, additional_items: usize) -> OwnedStorageMemory {
+        let item_count = self.items.len().checked_add(additional_items);
+        let occupied_bytes = item_count.and_then(|count| {
+            let layout = Layout::array::<T>(count).ok()?;
+            Some(layout.size())
+        });
+        let insertion_peak_bytes = item_count.and_then(|required| {
+            let requested_capacity = self.growth_target(required)?;
+            let current_capacity = self.items.capacity();
+            if requested_capacity <= current_capacity {
+                return occupied_bytes;
+            }
+
+            let old_layout = Layout::array::<T>(current_capacity).ok()?;
+            let requested_layout = Layout::array::<T>(requested_capacity).ok()?;
+            let old_bytes = old_layout.size();
+            let requested_bytes = requested_layout.size();
+            old_bytes.checked_add(requested_bytes)
+        });
+
+        OwnedStorageMemory {
+            item_count: item_count.unwrap_or(usize::MAX),
+            insertion_peak_bytes: insertion_peak_bytes.unwrap_or(usize::MAX),
+            spill_peak_bytes: occupied_bytes.unwrap_or(usize::MAX),
+        }
+    }
+
+    fn reserve_for_push(&mut self) {
+        let required = self.items.len().checked_add(1).expect("capacity overflow");
+        let requested_capacity = self.growth_target(required).expect("capacity overflow");
+        if requested_capacity > self.items.capacity() {
+            let additional = requested_capacity - self.items.len();
+            self.items.reserve_exact(additional);
         }
     }
 }
@@ -436,19 +509,41 @@ impl<'items, T> ChunkBuffer for &'items mut OwnedBuffer<T> {
     }
 }
 
-trait FlushPolicy<B, I> {
-    fn should_flush_before_push(&self, buffer: &B, input: &I) -> bool;
-    fn should_flush_after_push(&self, buffer: &B) -> bool;
-}
-
-impl<T> FlushPolicy<OwnedBuffer<T>, T> for FlushStrategy {
-    fn should_flush_before_push(&self, _buffer: &OwnedBuffer<T>, _input: &T) -> bool {
-        false
+impl FlushStrategy {
+    fn fixed_size_peak(memory: &OwnedStorageMemory, write_buffer_bytes: usize) -> usize {
+        let spill_peak_bytes = if memory.item_count == 0 {
+            0
+        } else {
+            memory.spill_peak_bytes.saturating_add(write_buffer_bytes)
+        };
+        memory.insertion_peak_bytes.max(spill_peak_bytes)
     }
 
-    fn should_flush_after_push(&self, buffer: &OwnedBuffer<T>) -> bool {
+    fn should_flush_before_push<T>(
+        &self,
+        buffer: &OwnedBuffer<T>,
+        write_buffer_bytes: usize,
+    ) -> bool {
+        let Self::FixedSize { budget } = self else {
+            return false;
+        };
+        let memory = buffer.storage_memory(1);
+        let projected_peak = Self::fixed_size_peak(&memory, write_buffer_bytes);
+        projected_peak >= *budget
+    }
+
+    fn should_flush_after_push<T>(
+        &self,
+        buffer: &OwnedBuffer<T>,
+        write_buffer_bytes: usize,
+    ) -> bool {
         match self {
             FlushStrategy::Bytes { budget } => buffer.active_bytes >= *budget,
+            FlushStrategy::FixedSize { budget } => {
+                let memory = buffer.storage_memory(0);
+                let current_peak = Self::fixed_size_peak(&memory, write_buffer_bytes);
+                current_peak >= *budget
+            }
             FlushStrategy::Items { max_items } => buffer.items.len() >= *max_items,
         }
     }
@@ -508,6 +603,31 @@ where
     {
         self.commit()?;
         self.accumulator.finish()
+    }
+}
+
+impl<T, SK, Cod, Cmp, CS, M> Session<OwnedBuffer<T>, RunAccumulator<T, SK, Cod, Cmp, CS, M>> {
+    fn push<E>(&mut self, item: T, policy: &FlushStrategy) -> Result<(), E>
+    where
+        RunAccumulator<T, SK, Cod, Cmp, CS, M>: AccumulateItems<T, Error = E>,
+    {
+        let write_buffer_bytes = self.accumulator.merge_config.write_buffer_bytes;
+        if !self.buffer.items.is_empty()
+            && policy.should_flush_before_push(&self.buffer, write_buffer_bytes)
+        {
+            self.commit()?;
+        }
+
+        if matches!(policy, FlushStrategy::FixedSize { .. }) {
+            self.buffer.reserve_for_push();
+        }
+        self.buffer.extend([item]);
+
+        if policy.should_flush_after_push(&self.buffer, write_buffer_bytes) {
+            self.commit()?;
+        }
+
+        Ok(())
     }
 }
 
@@ -736,20 +856,7 @@ where
     ///
     /// Returns an error if flushing to disk fails.
     pub fn push(&mut self, item: T) -> Result<(), MergeError<Cod::Error>> {
-        if self
-            .flush
-            .should_flush_before_push(&self.session.buffer, &item)
-        {
-            self.session.commit()?;
-        }
-
-        self.session.buffer.extend([item]);
-
-        if self.flush.should_flush_after_push(&self.session.buffer) {
-            self.session.commit()?;
-        }
-
-        Ok(())
+        self.session.push(item, &self.flush)
     }
 
     /// Flush remaining items, merge all sorted runs, apply dedup,
@@ -798,20 +905,7 @@ where
     ///
     /// Returns an error if flushing to disk fails.
     pub fn push(&mut self, item: T) -> Result<(), MergeError<Cod::Error>> {
-        if self
-            .flush
-            .should_flush_before_push(&self.session.buffer, &item)
-        {
-            self.session.commit()?;
-        }
-
-        self.session.buffer.extend([item]);
-
-        if self.flush.should_flush_after_push(&self.session.buffer) {
-            self.session.commit()?;
-        }
-
-        Ok(())
+        self.session.push(item, &self.flush)
     }
 
     /// Flush remaining items, merge all sorted runs, apply dedup,

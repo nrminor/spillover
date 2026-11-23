@@ -9,6 +9,7 @@ use std::{
 
 use dryice::SeqRecordLike;
 use spillover::SortedItemsError;
+use spillover::chunk::Sequential;
 use spillover::codec::{
     Codec, CodecCursor, CodecWriter, DecodeRun, DeriveKey, EncodeKeyedRun, EncodeRun, KeyedCodec,
     KeyedCodecCursor, KeyedCodecWriter, TakeOwned,
@@ -825,6 +826,111 @@ fn borrowed_non_clone_order_survives_intermediate_and_terminal_merge() {
         .collect();
 
     assert_eq!(observed, [2, 3, 1]);
+}
+
+#[derive(Clone, Copy)]
+struct AdmissionCodec;
+
+struct AdmissionReader<R>(R);
+
+struct AdmissionWriter<W>(W);
+
+#[derive(Debug, Error)]
+enum AdmissionCodecError {
+    #[error(transparent)]
+    Io(#[from] io::Error),
+    #[error("rejected record one")]
+    RejectedOne,
+    #[error("rejected record zero")]
+    RejectedZero,
+}
+
+impl<R: Read> Iterator for AdmissionReader<R> {
+    type Item = Result<u64, AdmissionCodecError>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let mut encoded = [0_u8; 8];
+        match self.0.read(&mut encoded[..1]) {
+            Ok(0) => return None,
+            Ok(_) => {}
+            Err(error) => return Some(Err(error.into())),
+        }
+        if let Err(error) = self.0.read_exact(&mut encoded[1..]) {
+            return Some(Err(error.into()));
+        }
+
+        let record = u64::from_le_bytes(encoded);
+        Some(Ok(record))
+    }
+}
+
+impl DecodeRun for AdmissionCodec {
+    type Record = u64;
+    type Error = AdmissionCodecError;
+    type Reader<R: Read> = AdmissionReader<R>;
+
+    fn reader<R: Read>(&self, source: R) -> Result<Self::Reader<R>, Self::Error> {
+        Ok(AdmissionReader(source))
+    }
+}
+
+impl EncodeRun<u64> for AdmissionCodec {
+    type Writer<W: Write> = AdmissionWriter<W>;
+
+    fn writer<W: Write>(&self, destination: W) -> Self::Writer<W> {
+        AdmissionWriter(destination)
+    }
+}
+
+impl<W: Write> CodecWriter<u64> for AdmissionWriter<W> {
+    type Error = AdmissionCodecError;
+
+    fn write(&mut self, item: &u64) -> Result<(), Self::Error> {
+        match *item {
+            1 => return Err(AdmissionCodecError::RejectedOne),
+            0 => return Err(AdmissionCodecError::RejectedZero),
+            _ => {}
+        }
+
+        let encoded = item.to_le_bytes();
+        self.0.write_all(&encoded)?;
+        Ok(())
+    }
+
+    fn finish(mut self) -> Result<(), Self::Error> {
+        self.0.flush()?;
+        Ok(())
+    }
+}
+
+#[test]
+fn unkeyed_byte_budget_preflushes_old_window_before_insertion() {
+    let mut merge_config = MergeConfig::default();
+    merge_config.write_buffer_bytes = 1009;
+    let sort_key = Owned(|record: &u64| *record);
+    let mut sorter = spillover::sorter::Builder::new()
+        .key(sort_key)
+        .codec(AdmissionCodec)
+        .chunk_sort(Sequential)
+        .merge_config(merge_config)
+        .fixed_size_budget(1024)
+        .build();
+
+    // Modeled spill bytes: 1009 + 8 = 1017 for the old window, but
+    // 1009 + 16 = 1025 with the incoming record. Growth-only overlap is
+    // below 1024 and does not overlap the spill transport.
+    let old_record = 1_u64;
+    sorter.push(old_record).expect("first push should succeed");
+    let incoming_record = 0_u64;
+    let result = sorter.push(incoming_record);
+
+    assert!(
+        matches!(
+            &result,
+            Err(MergeError::Codec(AdmissionCodecError::RejectedOne))
+        ),
+        "expected old-window preflush to reject one, got {result:?}"
+    );
 }
 
 fn make_record(name: &[u8], seq: &[u8], qual: &[u8]) -> SeqRecord {
