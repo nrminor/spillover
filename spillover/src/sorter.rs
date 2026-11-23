@@ -558,7 +558,7 @@ where
         };
         self.chunk_sort.sort(items, compare_items);
 
-        let run_writer = RunWriter::new_unkeyed(self.codec, self.merge_config.clone());
+        let run_writer = RunWriter::new_unkeyed(self.codec, &self.merge_config);
         let run = run_writer.write_sorted(items)?;
         self.runs.push(run);
 
@@ -597,7 +597,7 @@ where
         };
         self.chunk_sort.sort(items, compare_items);
 
-        let run_writer = RunWriter::new_keyed(self.codec, self.merge_config.clone());
+        let run_writer = RunWriter::new_keyed(self.codec, &self.merge_config);
         let run = run_writer.write_sorted(items)?;
         self.runs.push(run);
 

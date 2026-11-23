@@ -152,9 +152,9 @@ pub struct RunMerger<C: Codec, Cmp> {
 }
 
 /// Writes sorted entries into temporary run files.
-pub(crate) struct RunWriter<C, M> {
+pub(crate) struct RunWriter<'config, C, M> {
     codec: C,
-    config: MergeConfig,
+    config: &'config MergeConfig,
     _mode: std::marker::PhantomData<fn() -> M>,
 }
 
@@ -162,8 +162,8 @@ pub(crate) struct Unkeyed;
 
 pub(crate) struct Keyed;
 
-impl<C> RunWriter<C, Unkeyed> {
-    pub(crate) fn new_unkeyed(codec: C, config: MergeConfig) -> Self {
+impl<'config, C> RunWriter<'config, C, Unkeyed> {
+    pub(crate) fn new_unkeyed(codec: C, config: &'config MergeConfig) -> Self {
         Self {
             codec,
             config,
@@ -172,8 +172,8 @@ impl<C> RunWriter<C, Unkeyed> {
     }
 }
 
-impl<C> RunWriter<C, Keyed> {
-    pub(crate) fn new_keyed(codec: C, config: MergeConfig) -> Self {
+impl<'config, C> RunWriter<'config, C, Keyed> {
+    pub(crate) fn new_keyed(codec: C, config: &'config MergeConfig) -> Self {
         Self {
             codec,
             config,
@@ -182,7 +182,7 @@ impl<C> RunWriter<C, Keyed> {
     }
 }
 
-impl<C, M> RunWriter<C, M> {
+impl<C, M> RunWriter<'_, C, M> {
     fn create_temp_file<CE>(&self) -> MergeResult<tempfile::NamedTempFile, CE> {
         let file = match self.config.temp_dir {
             Some(ref dir) => tempfile::NamedTempFile::new_in(dir)?,
@@ -192,7 +192,7 @@ impl<C, M> RunWriter<C, M> {
     }
 }
 
-impl<C> RunWriter<C, Unkeyed>
+impl<C> RunWriter<'_, C, Unkeyed>
 where
     C: Codec,
 {
@@ -218,7 +218,7 @@ where
     }
 }
 
-impl<C> RunWriter<C, Keyed>
+impl<C> RunWriter<'_, C, Keyed>
 where
     C: KeyedCodec,
 {
