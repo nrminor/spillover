@@ -635,6 +635,47 @@ impl<O, Cod, D, CS> Builder<HasOrder<O>, HasKeyedCodec<Cod>, ItemLimit, (), D, C
 }
 
 impl<O, Cod, D, CS> Builder<HasOrder<O>, HasKeyedCodec<Cod>, ByteLimit, (), D, CS> {
+    /// Build a measured keyed sorter in caller-provided storage.
+    #[doc(hidden)]
+    pub fn build_keyed_measured_in<'arena, B>(
+        self,
+        storage: &'arena mut B,
+    ) -> Sorter<(), O, Cod, (), D, CS, Keyed, MeasuredArena<'arena, B>>
+    where
+        B: Buffer + EstimateBufferMemory,
+        for<'items> &'items mut B: ChunkBuffer,
+        Cod: KeyedCodec + EncodeKeyedRun<KeyedRecord<Cod>>,
+        O: Compare<KeyedRecord<Cod>>,
+        for<'items> Cod: EncodeKeyedRun<<&'items mut B as ChunkBuffer>::Item>,
+        for<'items> O: DeriveKey<<&'items mut B as ChunkBuffer>::Item, StoredKey = Cod::Key>
+            + Compare<<&'items mut B as ChunkBuffer>::Item>,
+        CS: EstimateSortMemory<crate::key::Keyed<usize, Cod::Key>>,
+        for<'items, 'order> CS: ChunkSorter<
+                crate::key::Keyed<usize, Cod::Key>,
+                KeyedEntryCompare<'order, <&'items mut B as ChunkBuffer>::Item, O>,
+            >,
+    {
+        ChunkBuffer::clear(&mut *storage);
+        let holder = ArenaBuffer { storage };
+        let accumulator = OrderedAccumulator {
+            order: self.sort_key.0,
+            codec: self.codec.0,
+            chunk_sort: self.chunk_sort,
+            merge_config: self.config.merge,
+            runs: Vec::new(),
+            pending: Vec::new(),
+            accounting: ByteAccounting::empty(),
+        };
+        Sorter {
+            session: Session::new(holder, accumulator),
+            dedup: self.dedup,
+            flush: FlushStrategy::Bytes {
+                budget: self.flush.bytes,
+            },
+            _marker: std::marker::PhantomData,
+        }
+    }
+
     /// Build a byte-limited sorter using the complete order.
     #[must_use]
     pub fn build<T>(self) -> Sorter<T, O, Cod, (), D, CS, Keyed, ByteLimit>
@@ -805,6 +846,12 @@ mod binding {
         for super::ArenaBuffer<'_, B>
     {
         type Session = Session<Self, OrderedAccumulator<O, C, CS>>;
+    }
+    impl<'a, B, O, C: crate::codec::KeyedCodec, CS> Binding<(), O, C, (), CS, super::Keyed>
+        for super::MeasuredArena<'a, B>
+    {
+        type Session =
+            Session<super::ArenaBuffer<'a, B>, OrderedAccumulator<O, C, CS, ByteAccounting>>;
     }
     impl<T, O, Cod: crate::codec::KeyedCodec, CS> Binding<T, O, Cod, (), CS, super::Keyed>
         for super::ByteLimit
@@ -1267,6 +1314,43 @@ where
     }
 }
 
+impl<B, O, C, D, CS> Sorter<(), O, C, (), D, CS, Keyed, MeasuredArena<'_, B>>
+where
+    B: Buffer + EstimateBufferMemory,
+    for<'items> &'items mut B: ChunkBuffer,
+    C: KeyedCodec + EncodeKeyedRun<KeyedRecord<C>>,
+    O: Compare<KeyedRecord<C>>,
+    for<'items> C: EncodeKeyedRun<<&'items mut B as ChunkBuffer>::Item>,
+    for<'items> O: DeriveKey<<&'items mut B as ChunkBuffer>::Item, StoredKey = C::Key>
+        + Compare<<&'items mut B as ChunkBuffer>::Item>,
+    CS: EstimateSortMemory<crate::key::Keyed<usize, C::Key>>,
+    for<'items, 'order> CS: ChunkSorter<
+            crate::key::Keyed<usize, C::Key>,
+            KeyedEntryCompare<'order, <&'items mut B as ChunkBuffer>::Item, O>,
+        >,
+{
+    #[doc(hidden)]
+    pub fn push<'input, I: ?Sized>(&mut self, input: &'input I) -> Result<(), MergeError<C::Error>>
+    where
+        B: Extend<&'input I> + ProjectBufferMemory<&'input I>,
+        O: EstimateKeyMemory<I>,
+    {
+        let FlushStrategy::Bytes { budget } = self.flush else {
+            unreachable!("measured sorter requires a byte limit");
+        };
+        self.session.push_keyed_measured(input, budget)
+    }
+
+    #[doc(hidden)]
+    pub fn finish(self) -> Result<OrderedOutput<C, O, D>, MergeError<C::Error>>
+    where
+        D: Dedup<KeyedRunMerge<C, O, (), Keyed>>,
+    {
+        let merged = self.session.finish()?;
+        Ok(Sorted::new(self.dedup.dedup(merged)))
+    }
+}
+
 impl<B, A> Session<ArenaBuffer<'_, B>, A>
 where
     B: Buffer,
@@ -1490,6 +1574,10 @@ impl ByteAccounting {
 
     fn include(&mut self, heap: usize, key: &KeyMemory) {
         self.payload_heap = self.payload_heap.and_then(|n| n.checked_add(heap));
+        self.include_key(key);
+    }
+
+    fn include_key(&mut self, key: &KeyMemory) {
         self.missing_keys = self
             .missing_keys
             .and_then(|n| n.checked_add(key.retained_heap_bytes()));
@@ -1746,6 +1834,55 @@ where
         let merged = self.session.finish()?;
 
         Ok(Sorted::new(dedup.dedup(merged)))
+    }
+}
+
+impl<B, O, C, CS> Session<ArenaBuffer<'_, B>, OrderedAccumulator<O, C, CS, ByteAccounting>>
+where
+    B: Buffer + EstimateBufferMemory,
+    for<'items> &'items mut B: ChunkBuffer,
+    C: KeyedCodec + EncodeKeyedRun<KeyedRecord<C>>,
+    O: Compare<KeyedRecord<C>>,
+    for<'items> C: EncodeKeyedRun<<&'items mut B as ChunkBuffer>::Item>,
+    for<'items> O: DeriveKey<<&'items mut B as ChunkBuffer>::Item, StoredKey = C::Key>
+        + Compare<<&'items mut B as ChunkBuffer>::Item>,
+    CS: EstimateSortMemory<crate::key::Keyed<usize, C::Key>>,
+    for<'items, 'order> CS: ChunkSorter<
+            crate::key::Keyed<usize, C::Key>,
+            KeyedEntryCompare<'order, <&'items mut B as ChunkBuffer>::Item, O>,
+        >,
+{
+    fn push_keyed_measured<'input, I: ?Sized>(
+        &mut self,
+        input: &'input I,
+        budget: usize,
+    ) -> Result<(), MergeError<C::Error>>
+    where
+        B: Extend<&'input I> + ProjectBufferMemory<&'input I>,
+        O: EstimateKeyMemory<I>,
+    {
+        let key = self.accumulator.order.estimate_key_memory(input);
+        let mut projected = self.accumulator.accounting.clone();
+        projected.include_key(&key);
+        let report = self.buffer().memory_after(&input);
+        let peak = self
+            .accumulator
+            .keyed_peak(&report, &projected)
+            .unwrap_or(usize::MAX);
+        if !self.buffer().is_empty() && peak >= budget {
+            self.commit()?;
+        }
+        self.buffer.extend([input]);
+        self.accumulator.accounting.include_key(&key);
+        let report = self.buffer().memory();
+        let peak = self
+            .accumulator
+            .keyed_peak(&report, &self.accumulator.accounting)
+            .unwrap_or(usize::MAX);
+        if peak >= budget {
+            self.commit()?;
+        }
+        Ok(())
     }
 }
 

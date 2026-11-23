@@ -11,7 +11,7 @@
 //!
 //! The [`Builder`] is the main entry point for creating a sorter.
 
-use std::{fs::File, io::BufReader, mem::size_of};
+use std::{fs::File, io::BufReader};
 
 use dryice::{
     DryIceWriter, NameCodec, QualityCodec, RawAsciiCodec, RawNameCodec, RawQualityCodec, RecordKey,
@@ -24,8 +24,8 @@ use spillover::{
     compare::{Compare, Natural},
     dedup::Identity,
     key::{KeyCompare, SortKey},
-    merge::{KeyedRunMerge, MergeConfig, MergeError, RunMerge, RunMerger, SortedRun},
-    sorter::{Buffer, VisitSortedItems},
+    merge::{KeyedRunMerge, MergeConfig, MergeError, RunMerge},
+    sorter::VisitSortedItems,
 };
 
 use crate::{
@@ -92,10 +92,6 @@ mod sealed {
     pub trait Sealed {}
 
     pub trait CompatibleChunkSorter<O> {}
-
-    pub trait ArenaSortMemory {
-        fn scratch_bytes(&self, count: usize) -> usize;
-    }
 
     /// Resolves codec type-state to a concrete [`crate::codec::DryIceCodec`].
     /// `NeedsCodec` yields the raw (no-encoding) default;
@@ -164,33 +160,6 @@ pub trait KeyedSortOrder: SortOrder<Strategy = Keyed> + RecordKeyer {}
 impl<O> KeyedSortOrder for O where O: SortOrder<Strategy = Keyed> + RecordKeyer {}
 
 impl<O> sealed::CompatibleChunkSorter<O> for Sequential {}
-
-impl sealed::ArenaSortMemory for Sequential {
-    fn scratch_bytes(&self, _: usize) -> usize {
-        0
-    }
-}
-
-#[cfg(feature = "rayon")]
-impl sealed::ArenaSortMemory for spillover::chunk::Parallel {
-    fn scratch_bytes(&self, _: usize) -> usize {
-        0
-    }
-}
-
-impl<const N: usize> sealed::ArenaSortMemory for RadixThenRefine<N> {
-    fn scratch_bytes(&self, count: usize) -> usize {
-        let estimate =
-            <Self as spillover::chunk::EstimateSortMemory<SeqRecordView<'_>>>::sort_memory(
-                self,
-                count,
-                &(),
-            );
-        estimate
-            .retained_bytes()
-            .saturating_add(estimate.scratch_bytes())
-    }
-}
 
 #[cfg(feature = "rayon")]
 impl<O> sealed::CompatibleChunkSorter<O> for spillover::chunk::Parallel {}
@@ -768,23 +737,6 @@ pub enum FlushConfig {
 /// 1 GiB.
 const DEFAULT_BUDGET: usize = 1 << 30;
 
-/// Conservative per-record reserve for temporary sort scratch used while
-/// flushing an arena-backed spill window.
-///
-/// The built-in radix sorter allocates packed-key scratch during sorting. The
-/// sorter remains generic over `ChunkSorter`, so G4 intentionally avoids adding a
-/// public scratch-accounting API and instead reserves enough per record for the
-/// current built-in arena sorters.
-const SORT_SCRATCH_BYTES_PER_RECORD: usize = 128;
-
-fn record_byte_len<R: SeqRecordParts + ?Sized>(record: &R) -> usize {
-    record
-        .name()
-        .len()
-        .saturating_add(record.sequence().len())
-        .saturating_add(record.quality().len())
-}
-
 // ── Sealed trait impls for default resolution ────────────
 
 impl sealed::ResolveCodec for NeedsCodec {
@@ -916,21 +868,6 @@ pub struct OwnedBackend<
     _types: std::marker::PhantomData<SorterTypeMarker<SK, Cod, Cmp, CS, M>>,
 }
 
-/// Arena-backed spill-window backend for [`Sorter`].
-#[doc(hidden)]
-pub struct ArenaBackend<'a, SK, Cod, KeyCmp, RecCmp, CS, M> {
-    arena: &'a mut SeqRecordArena,
-    spilled_runs: Vec<SortedRun>,
-    sort_key: SK,
-    codec: Cod,
-    key_comparator: KeyCmp,
-    comparator: RecCmp,
-    chunk_sort: CS,
-    flush: FlushConfig,
-    merge_config: MergeConfig,
-    _mode: std::marker::PhantomData<fn() -> M>,
-}
-
 /// Finalized stream of sorted sequence records.
 ///
 /// `SortedRecordStream` owns the sorted output source after a [`Sorter`] has
@@ -993,102 +930,6 @@ where
 
     fn write_record<R: SeqRecordParts + ?Sized>(&mut self, record: &R) -> Result<(), Self::Error> {
         self.write_record(&SeqRecordPartsAdapter(record))
-    }
-}
-
-impl<SK, Cod, KeyCmp, RecCmp, CS: sealed::ArenaSortMemory, M>
-    ArenaBackend<'_, SK, Cod, KeyCmp, RecCmp, CS, M>
-{
-    fn estimated_non_arena_flush_bytes(&self, record_count: usize) -> usize {
-        let views = record_count.saturating_mul(size_of::<SeqRecordView<'static>>());
-        let old_floor = views
-            .saturating_add(record_count.saturating_mul(SORT_SCRATCH_BYTES_PER_RECORD))
-            .saturating_add(self.merge_config.write_buffer_bytes);
-        let workspace = self.chunk_sort.scratch_bytes(record_count);
-        let live = views.saturating_add(workspace.max(self.merge_config.write_buffer_bytes));
-        old_floor.max(live)
-    }
-
-    fn estimated_flush_peak_for(&self, record_bytes: usize, record_count: usize) -> usize {
-        SeqRecordArena::live_byte_len_for(record_bytes, record_count)
-            .saturating_add(self.estimated_non_arena_flush_bytes(record_count))
-    }
-
-    fn estimated_flush_peak(&self) -> usize {
-        self.arena
-            .live_byte_len()
-            .saturating_add(self.estimated_non_arena_flush_bytes(self.arena.len()))
-    }
-
-    fn estimated_flush_peak_after_push(&self, incoming_record_bytes: usize) -> usize {
-        self.estimated_flush_peak_for(
-            self.arena.byte_len().saturating_add(incoming_record_bytes),
-            self.arena.len().saturating_add(1),
-        )
-    }
-
-    fn should_flush_before_push(&self, incoming_record_bytes: usize) -> bool {
-        let record_count = self.arena.len();
-        match self.flush {
-            FlushConfig::MeasuredBudget(budget) => {
-                record_count != 0
-                    && self.estimated_flush_peak_after_push(incoming_record_bytes) >= budget
-            }
-            FlushConfig::MaxItems(max_items) => record_count != 0 && record_count >= max_items,
-        }
-    }
-
-    fn should_flush(&self) -> bool {
-        let record_count = self.arena.len();
-        match self.flush {
-            FlushConfig::MeasuredBudget(budget) => {
-                record_count != 0 && self.estimated_flush_peak() >= budget
-            }
-            FlushConfig::MaxItems(max_items) => record_count != 0 && record_count >= max_items,
-        }
-    }
-
-    fn clear_spill_window(&mut self) {
-        self.arena.clear();
-    }
-}
-
-impl<SK, Cod, KeyCmp, RecCmp, CS>
-    ArenaBackend<'_, SK, Cod, KeyCmp, RecCmp, CS, spillover::sorter::Keyed>
-where
-    SK: SortKey<SeqRecord> + Copy + Send + Sync + 'static,
-    Cod: KeyedCodec + EncodeKeyedRun<SeqRecord> + Copy + 'static,
-    for<'v> Cod: EncodeKeyedRun<SeqRecordView<'v>>,
-    KeyCmp: for<'r> Compare<<SK as SortKey<SeqRecord>>::Key<'r>>
-        + Compare<Cod::Key>
-        + Copy
-        + Send
-        + Sync
-        + 'static,
-    for<'v> RecCmp: Compare<SeqRecordView<'v>>,
-    RecCmp: Copy + Send + Sync + 'static,
-    for<'v> CS: ChunkSorter<SeqRecordView<'v>, RecCmp>,
-    CS: sealed::ArenaSortMemory,
-{
-    fn flush(&mut self) -> Result<(), MergeError<Cod::Error>> {
-        let record_count = self.arena.len();
-        if record_count == 0 {
-            return Ok(());
-        }
-
-        let mut views = self.arena.views();
-        self.chunk_sort.sort(&mut views, &self.comparator);
-
-        let run_merger = RunMerger::new(
-            self.codec,
-            KeyCompare::new(self.sort_key, self.key_comparator),
-            self.merge_config.clone(),
-        );
-        let run = run_merger.spill_sorted_with_keys(views)?;
-        self.spilled_runs.push(run);
-        self.clear_spill_window();
-
-        Ok(())
     }
 }
 
@@ -1232,83 +1073,6 @@ where
         let inner = self.inner.inner.finish()?;
         let dedup = RecordDedupState::new(self.dedup);
         Ok(SortedRecordStream::new(inner, dedup))
-    }
-}
-
-impl<SK, Cod, Cmp, RecCmp, CS>
-    Sorter<
-        SK,
-        Cod,
-        Cmp,
-        CS,
-        spillover::sorter::Keyed,
-        ArenaBackend<'_, SK, Cod, Cmp, RecCmp, CS, spillover::sorter::Keyed>,
-    >
-where
-    SK: SortKey<SeqRecord> + Copy + Send + Sync + 'static,
-    Cod: KeyedCodec + EncodeKeyedRun<SeqRecord> + Copy + 'static,
-    Cod: EncodeKeyedRun<<<Cod as KeyedCodec>::KeyedCursor<BufReader<File>> as CodecCursor>::Record>,
-    for<'v> Cod: EncodeKeyedRun<SeqRecordView<'v>>,
-    Cmp: for<'r> Compare<<SK as SortKey<SeqRecord>>::Key<'r>>
-        + Compare<Cod::Key>
-        + Copy
-        + Send
-        + Sync
-        + 'static,
-    for<'v> RecCmp: Compare<SeqRecordView<'v>>,
-    RecCmp: Copy + Send + Sync + 'static,
-    for<'v> CS: ChunkSorter<SeqRecordView<'v>, RecCmp>,
-    CS: sealed::ArenaSortMemory,
-    KeyCompare<SK, Cmp>:
-        Compare<<<Cod as KeyedCodec>::KeyedCursor<BufReader<File>> as CodecCursor>::Record>,
-{
-    /// Add an unsorted record to the arena-backed sorter.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if flushing buffered records to disk fails.
-    pub fn push<R: SeqRecordParts + ?Sized>(
-        &mut self,
-        record: &R,
-    ) -> Result<(), MergeError<Cod::Error>> {
-        let incoming_record_bytes = record_byte_len(record);
-        if self.inner.should_flush_before_push(incoming_record_bytes) {
-            self.inner.flush()?;
-        }
-
-        self.inner.arena.store(record);
-
-        if self.inner.should_flush() {
-            self.inner.flush()?;
-        }
-
-        Ok(())
-    }
-
-    /// Finish sorting and return the finalized sorted record stream.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if flushing or merging fails.
-    #[allow(clippy::type_complexity)]
-    pub fn finish(
-        mut self,
-    ) -> Result<
-        SortedRecordStream<KeyedRunMerge<Cod, Cmp, KeyCompare<SK, Cmp>>>,
-        MergeError<Cod::Error>,
-    > {
-        self.inner.flush()?;
-
-        let item_cmp = KeyCompare::new(self.inner.sort_key, self.inner.key_comparator);
-        let run_merger =
-            RunMerger::new(self.inner.codec, item_cmp, self.inner.merge_config.clone());
-        let merged = run_merger.merge_keyed(
-            std::mem::take(&mut self.inner.spilled_runs),
-            self.inner.key_comparator,
-        )?;
-
-        let dedup = RecordDedupState::new(self.dedup);
-        Ok(SortedRecordStream::new(merged, dedup))
     }
 }
 
@@ -1727,75 +1491,6 @@ owned_keyed_builder!(HasFlush<spillover::sorter::ByteLimit>, spillover::sorter::
 );
 owned_keyed_builder!(HasFlush<spillover::sorter::ItemLimit>, spillover::sorter::ItemLimit, |flush: HasFlush<spillover::sorter::ItemLimit>| flush.0.max_items(), max_buffer_items;);
 
-macro_rules! legacy_keyed_arena_builder {
-    ($flush:ty) => {
-        impl<'a, O, C, CS> Builder<HasKeyedOrder<O>, C, $flush, CS, ArenaStorage<'a>>
-        where
-            O: KeyedSortOrder,
-            O::SortKey: Send + Sync + 'static,
-            O::KeyComparator: for<'r> Compare<<O::SortKey as SortKey<SeqRecord>>::Key<'r>>
-                + Compare<<O as RecordKeyer>::RecordKey>
-                + Send
-                + Sync
-                + 'static,
-            <O as RecordKeyer>::RecordKey: RecordKey + Clone + 'static,
-            C: sealed::ResolveCodec,
-            CS: sealed::CompatibleChunkSorter<O> + sealed::ArenaSortMemory,
-            for<'v> CS: ChunkSorter<SeqRecordView<'v>, O::Comparator>,
-            for<'v> O::Comparator: Compare<SeqRecordView<'v>>,
-        {
-            /// Build an arena-backed sorter (keyed merge path).
-            ///
-            /// Clears the arena's logical contents while retaining its allocated capacity.
-            #[allow(clippy::type_complexity)]
-            #[must_use]
-            pub fn build(
-                self,
-            ) -> Sorter<
-                O::SortKey,
-                KeyedDryIceCodec<O, C::S, C::Q, C::N>,
-                O::KeyComparator,
-                CS,
-                spillover::sorter::Keyed,
-                ArenaBackend<
-                    'a,
-                    O::SortKey,
-                    KeyedDryIceCodec<O, C::S, C::Q, C::N>,
-                    O::KeyComparator,
-                    O::Comparator,
-                    CS,
-                    spillover::sorter::Keyed,
-                >,
-            > {
-                let order = self.order.0;
-                let codec = self.codec.resolve();
-                let keyed_codec = codec.with_record_keyer(order);
-                let arena = self.storage.arena;
-                arena.clear();
-
-                Sorter {
-                    inner: ArenaBackend {
-                        arena,
-                        spilled_runs: Vec::new(),
-                        sort_key: order.sort_key(),
-                        codec: keyed_codec,
-                        key_comparator: order.key_comparator(),
-                        comparator: order.comparator(),
-                        chunk_sort: self.chunk_sort,
-                        flush: sealed::ResolveFlush::resolve(self.flush),
-                        merge_config: self.merge_config,
-                        _mode: std::marker::PhantomData,
-                    },
-                    dedup: self.dedup,
-                    _types: std::marker::PhantomData,
-                }
-            }
-        }
-    };
-}
-legacy_keyed_arena_builder!(NeedsFlush);
-legacy_keyed_arena_builder!(HasFlush<spillover::sorter::ByteLimit>);
-
 // build() for unkeyed sort orders.
 
 macro_rules! legacy_unkeyed_builder {
@@ -2195,6 +1890,126 @@ where
     }
 }
 
+type MeasuredArenaKeyedCore<'a, O, C, CS> = spillover::sorter::Sorter<
+    (),
+    O,
+    C,
+    (),
+    Identity,
+    CS,
+    spillover::sorter::Keyed,
+    spillover::sorter::MeasuredArena<'a, SeqRecordArena>,
+>;
+type NativeMeasuredArenaKeyed<'a, O, C, CS> =
+    Sorter<O, C, (), CS, spillover::sorter::Keyed, MeasuredArenaKeyedCore<'a, O, C, CS>>;
+
+impl<'a, O, C, CS>
+    Builder<HasKeyedOrder<O>, C, HasFlush<spillover::sorter::ByteLimit>, CS, ArenaStorage<'a>>
+where
+    O: KeyedSortOrder + Compare<NativeRecord<NativeKeyedCodec<O, C>>>,
+    <O as RecordKeyer>::RecordKey: RecordKey + Clone + 'static,
+    C: sealed::ResolveCodec,
+    CS: sealed::CompatibleChunkSorter<O>
+        + spillover::chunk::EstimateSortMemory<
+            spillover::key::Keyed<usize, <O as RecordKeyer>::RecordKey>,
+        >,
+    for<'v> O: spillover::key::DeriveKey<SeqRecordView<'v>, StoredKey = <O as RecordKeyer>::RecordKey>
+        + spillover::key::EstimateKeyMemory<SeqRecordView<'v>>
+        + Compare<SeqRecordView<'v>>,
+    for<'v, 'order> CS: ChunkSorter<
+            spillover::key::Keyed<usize, <O as RecordKeyer>::RecordKey>,
+            spillover::key::KeyedEntryCompare<'order, SeqRecordView<'v>, O>,
+        >,
+{
+    /// Build a measured keyed sorter using the arena.
+    #[must_use]
+    pub fn build(self) -> NativeMeasuredArenaKeyed<'a, O, NativeKeyedCodec<O, C>, CS> {
+        let order = self.order.0;
+        let codec = self.codec.resolve();
+        let keyed_codec = codec.with_record_keyer(order);
+        let budget = self.flush.0.max_bytes();
+        let storage = self.storage.arena;
+        let builder = spillover::sorter::Builder::new()
+            .order(order)
+            .keyed_codec(keyed_codec)
+            .chunk_sort(self.chunk_sort)
+            .merge_config(self.merge_config)
+            .memory_budget(budget);
+        let build_keyed_measured_in: fn(_, &'a mut SeqRecordArena) -> _ =
+            spillover::sorter::Builder::build_keyed_measured_in;
+        let inner = build_keyed_measured_in(builder, storage);
+        Sorter {
+            inner,
+            dedup: self.dedup,
+            _types: std::marker::PhantomData,
+        }
+    }
+}
+
+impl<'a, O, C, CS> Builder<HasKeyedOrder<O>, C, NeedsFlush, CS, ArenaStorage<'a>>
+where
+    O: KeyedSortOrder + Compare<NativeRecord<NativeKeyedCodec<O, C>>>,
+    <O as RecordKeyer>::RecordKey: RecordKey + Clone + 'static,
+    C: sealed::ResolveCodec,
+    CS: sealed::CompatibleChunkSorter<O>
+        + spillover::chunk::EstimateSortMemory<
+            spillover::key::Keyed<usize, <O as RecordKeyer>::RecordKey>,
+        >,
+    for<'v> O: spillover::key::DeriveKey<SeqRecordView<'v>, StoredKey = <O as RecordKeyer>::RecordKey>
+        + spillover::key::EstimateKeyMemory<SeqRecordView<'v>>
+        + Compare<SeqRecordView<'v>>,
+    for<'v, 'order> CS: ChunkSorter<
+            spillover::key::Keyed<usize, <O as RecordKeyer>::RecordKey>,
+            spillover::key::KeyedEntryCompare<'order, SeqRecordView<'v>, O>,
+        >,
+{
+    /// Build a keyed sorter with the default measured budget.
+    #[must_use]
+    pub fn build(self) -> NativeMeasuredArenaKeyed<'a, O, NativeKeyedCodec<O, C>, CS> {
+        self.measured_budget(DEFAULT_BUDGET).build()
+    }
+}
+
+impl<O, C, CS> NativeMeasuredArenaKeyed<'_, O, C, CS>
+where
+    C: KeyedCodec + EncodeKeyedRun<NativeRecord<C>>,
+    for<'v> C: EncodeKeyedRun<SeqRecordView<'v>>,
+    O: Compare<NativeRecord<C>>,
+    for<'v> O: spillover::key::DeriveKey<SeqRecordView<'v>, StoredKey = C::Key>
+        + spillover::key::EstimateKeyMemory<SeqRecordView<'v>>
+        + Compare<SeqRecordView<'v>>,
+    CS: spillover::chunk::EstimateSortMemory<spillover::key::Keyed<usize, C::Key>>,
+    for<'v, 'order> CS: ChunkSorter<
+            spillover::key::Keyed<usize, C::Key>,
+            spillover::key::KeyedEntryCompare<'order, SeqRecordView<'v>, O>,
+        >,
+{
+    /// Insert a borrowed record.
+    ///
+    /// # Errors
+    /// Returns an error if completing a run fails.
+    pub fn push<R: SeqRecordParts + ?Sized>(
+        &mut self,
+        record: &R,
+    ) -> Result<(), MergeError<C::Error>> {
+        let name = record.name();
+        let sequence = record.sequence();
+        let quality = record.quality();
+        let view = SeqRecordView::new(name, sequence, quality);
+        self.inner.push(&view)
+    }
+
+    /// Finish and return the sorted records.
+    ///
+    /// # Errors
+    /// Returns an error if spilling or merging fails.
+    pub fn finish(self) -> Result<NativeOutput<C, O>, MergeError<C::Error>> {
+        let inner = self.inner.finish()?;
+        let dedup = RecordDedupState::new(self.dedup);
+        Ok(SortedRecordStream::new(inner, dedup))
+    }
+}
+
 impl<O, C, CS> NativeArenaKeyed<'_, O, C, CS>
 where
     C: KeyedCodec + EncodeKeyedRun<NativeRecord<C>>,
@@ -2240,18 +2055,6 @@ mod tests {
 
     fn make_record(name: &[u8], seq: &[u8], qual: &[u8]) -> SeqRecord {
         SeqRecord::new(name, seq, qual)
-    }
-
-    fn merge_config_without_write_buffer() -> MergeConfig {
-        let mut config = MergeConfig::default();
-        config.write_buffer_bytes = 0;
-        config
-    }
-
-    fn tiny_record_peak(record_count: usize) -> usize {
-        SeqRecordArena::live_byte_len_for(3 * record_count, record_count)
-            .saturating_add(record_count.saturating_mul(size_of::<SeqRecordView<'static>>()))
-            .saturating_add(record_count.saturating_mul(SORT_SCRATCH_BYTES_PER_RECORD))
     }
 
     // ── Sort key tests ───────────────────────────────────
@@ -2391,87 +2194,6 @@ mod tests {
         let mut arena = SeqRecordArena::new();
 
         let _builder = Builder::new().sort_by_illumina().arena(&mut arena);
-    }
-
-    #[test]
-    fn arena_budget_flushes_before_projected_overflow() {
-        let budget = tiny_record_peak(1) + 1;
-        assert!(
-            tiny_record_peak(2) >= budget,
-            "test budget should fit one tiny record but not two"
-        );
-
-        let mut arena = SeqRecordArena::new();
-        let mut sorter = Builder::new()
-            .sort_by_illumina()
-            .sort_with_sequential()
-            .arena(&mut arena)
-            .measured_budget(budget)
-            .merge_config(merge_config_without_write_buffer())
-            .build();
-
-        sorter
-            .push(&SeqRecordView::new(b"a", b"A", b"!"))
-            .expect("first push should not flush");
-        assert_eq!(sorter.inner.spilled_runs.len(), 0);
-        assert_eq!(sorter.inner.arena.len(), 1);
-
-        sorter
-            .push(&SeqRecordView::new(b"b", b"C", b"!"))
-            .expect("second push should pre-flush the first record");
-
-        assert_eq!(sorter.inner.spilled_runs.len(), 1);
-        assert_eq!(sorter.inner.arena.len(), 1);
-        assert_eq!(sorter.inner.arena.byte_len(), 3);
-    }
-
-    #[test]
-    fn arena_budget_allows_oversized_single_record_then_flushes_it() {
-        let mut arena = SeqRecordArena::new();
-        let mut sorter = Builder::new()
-            .sort_by_illumina()
-            .sort_with_sequential()
-            .arena(&mut arena)
-            .measured_budget(1)
-            .merge_config(merge_config_without_write_buffer())
-            .build();
-
-        sorter
-            .push(&SeqRecordView::new(b"oversized", b"ACGT", b"!!!!"))
-            .expect("oversized single record should be accepted and flushed");
-
-        assert_eq!(sorter.inner.spilled_runs.len(), 1);
-        assert_eq!(sorter.inner.arena.len(), 0);
-        assert!(sorter.inner.arena.is_empty());
-    }
-
-    #[test]
-    fn arena_budget_ignores_retained_capacity_after_clear() {
-        let budget = tiny_record_peak(1) + 1;
-        let mut arena = SeqRecordArena::new();
-        let mut sorter = Builder::new()
-            .sort_by_illumina()
-            .sort_with_sequential()
-            .arena(&mut arena)
-            .measured_budget(budget)
-            .merge_config(merge_config_without_write_buffer())
-            .build();
-
-        sorter
-            .push(&SeqRecordView::new(b"large", &[b'A'; 1024], &[b'!'; 1024]))
-            .expect("large record should flush after push");
-        let retained_capacity = sorter.inner.arena.capacity();
-        assert!(retained_capacity >= 2048);
-        assert_eq!(sorter.inner.spilled_runs.len(), 1);
-        assert_eq!(sorter.inner.arena.len(), 0);
-
-        sorter
-            .push(&SeqRecordView::new(b"s", b"A", b"!"))
-            .expect("small record should not flush because of retained capacity");
-
-        assert_eq!(sorter.inner.spilled_runs.len(), 1);
-        assert_eq!(sorter.inner.arena.len(), 1);
-        assert_eq!(sorter.inner.arena.byte_len(), 3);
     }
 
     // ── Sort order tests ─────────────────────────────────

@@ -240,21 +240,6 @@ impl SeqRecordArena {
         self.bytes.is_empty()
     }
 
-    /// Estimated live bytes owned by the arena for the current spill window.
-    pub(crate) fn live_byte_len(&self) -> usize {
-        Self::live_byte_len_for(self.byte_len(), self.len())
-    }
-
-    /// Estimated live arena bytes for a projected spill window.
-    pub(crate) fn live_byte_len_for(record_bytes: usize, record_count: usize) -> usize {
-        record_bytes.saturating_add(Self::metadata_bytes_for(record_count))
-    }
-
-    /// Estimated live bytes used for private per-record boundary metadata.
-    pub(crate) fn metadata_bytes_for(record_count: usize) -> usize {
-        record_count.saturating_mul(std::mem::size_of::<ArenaRecord>())
-    }
-
     pub(crate) fn store<R: SeqRecordParts + ?Sized>(&mut self, record: &R) {
         let start = self.bytes.len();
         let name = record.name();
