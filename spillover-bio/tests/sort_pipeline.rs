@@ -1202,6 +1202,35 @@ fn arena_unkeyed_sorter_sorts_borrowed_record_views() {
 }
 
 #[test]
+fn arena_keyed_measured_admits_oversized_before_failed_commit() {
+    let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("Cargo.toml");
+    assert!(manifest.is_file());
+    let mut merge_config = MergeConfig::default();
+    merge_config.temp_dir = Some(manifest);
+    merge_config.write_buffer_bytes = 0;
+
+    let mut arena = SeqRecordArena::new();
+    let mut sorter = Builder::new()
+        .sort_by_illumina()
+        .sort_with_sequential()
+        .codec(DryIceCodec::new())
+        .merge_config(merge_config)
+        .arena(&mut arena)
+        .measured_budget(1)
+        .build();
+
+    let record = SeqRecordView::new(b"oversized", b"ACGT", b"!!!!");
+    let result = sorter.push(&record);
+    assert!(
+        matches!(result, Err(MergeError::Io(_))),
+        "push should fail during commit, got {result:?}"
+    );
+
+    drop(sorter);
+    assert_eq!(arena.byte_len(), 17);
+}
+
+#[test]
 fn arena_unkeyed_measured_preflushes_before_payload_replacement() {
     let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("Cargo.toml");
     assert!(manifest.is_file());
