@@ -1773,16 +1773,29 @@ where
         } else {
             occupied
         };
-        let entries = &self.accumulator.pending;
+        let payload = accounting.payload_heap?;
+        let insertion_peak_bytes = insertion_storage.checked_add(payload)?;
+        let spill_peak_bytes = occupied.checked_add(payload)?;
+        let memory = BufferMemory::new(count, insertion_peak_bytes, spill_peak_bytes);
+        self.accumulator.keyed_peak(&memory, accounting)
+    }
+}
+
+impl<O, C: KeyedCodec, CS> OrderedAccumulator<O, C, CS, ByteAccounting>
+where
+    CS: EstimateSortMemory<crate::key::Keyed<usize, C::Key>>,
+{
+    fn keyed_peak(&self, memory: &BufferMemory, accounting: &ByteAccounting) -> Option<usize> {
+        let count = memory.item_count;
+        let entries = &self.pending;
         let existing_entries = Layout::array::<crate::key::Keyed<usize, C::Key>>(entries.len())
             .ok()?
             .size();
         let retained_keys = accounting.retained_keys?;
-        let payload = accounting.payload_heap?;
-        let sort_memory = self.accumulator.chunk_sort.sort_memory(count, &());
+        let sort_memory = self.chunk_sort.sort_memory(count, &());
         let workspace = sort_memory.retained_bytes();
-        let insertion = insertion_storage
-            .checked_add(payload)?
+        let insertion = memory
+            .insertion_peak_bytes
             .checked_add(existing_entries)?
             .checked_add(retained_keys)?
             .checked_add(workspace)?;
@@ -1804,7 +1817,7 @@ where
         } else {
             completed_entries
         };
-        let base = occupied.checked_add(payload)?.checked_add(workspace)?;
+        let base = memory.spill_peak_bytes.checked_add(workspace)?;
         let existing_key_heap = retained_keys;
         let all_key_heap = retained_keys.checked_add(accounting.missing_keys?)?;
         let reserve = base
@@ -1815,10 +1828,22 @@ where
             .checked_add(all_key_heap)?;
         let derive = completed.checked_add(accounting.derivation_scratch)?;
         let sorting = completed.checked_add(sort_memory.scratch_bytes())?;
-        let writing = completed.checked_add(self.accumulator.merge_config.write_buffer_bytes)?;
+        let writing = completed.checked_add(self.merge_config.write_buffer_bytes)?;
         Some(insertion.max(reserve).max(derive).max(sorting).max(writing))
     }
+}
 
+impl<T, O, C, CS> Session<OwnedBuffer<T>, OrderedAccumulator<O, C, CS, ByteAccounting>>
+where
+    T: GetSize,
+    C: KeyedCodec + EncodeKeyedRun<T> + EncodeKeyedRun<KeyedRecord<C>>,
+    O: DeriveKey<T, StoredKey = C::Key>
+        + EstimateKeyMemory<T>
+        + Compare<T>
+        + Compare<KeyedRecord<C>>,
+    CS: EstimateSortMemory<crate::key::Keyed<usize, C::Key>>,
+    for<'a> CS: ChunkSorter<crate::key::Keyed<usize, C::Key>, KeyedEntryCompare<'a, T, O>>,
+{
     fn push_measured(&mut self, item: T, budget: usize) -> Result<(), MergeError<C::Error>> {
         let heap = item.get_heap_size();
         let key = self.accumulator.order.estimate_key_memory(&item);
