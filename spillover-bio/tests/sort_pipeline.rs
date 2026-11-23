@@ -1134,6 +1134,42 @@ fn arena_keyed_sorter_sorts_borrowed_record_views() {
 }
 
 #[test]
+fn arena_keyed_radix_chunk_preserves_record_identity() {
+    let mut arena = SeqRecordArena::new();
+    let mut sorter = Builder::new()
+        .sort_by_illumina()
+        .codec(DryIceCodec::new())
+        .arena(&mut arena)
+        .max_buffer_items(65)
+        .build();
+
+    for quality in (b'!'..=b'1').rev() {
+        for sequence in [b"TTTT", b"GGGG", b"CCCC", b"AAAA"] {
+            let name = [sequence[0], quality];
+            let qualities = [quality; 4];
+            let record = SeqRecordView::new(&name, sequence, &qualities);
+            sorter.push(&record).expect("push should succeed");
+        }
+    }
+
+    let mut output = sorter.finish().expect("finish should succeed");
+    for sequence in [b"AAAA", b"CCCC", b"GGGG", b"TTTT"] {
+        for quality in b'!'..=b'1' {
+            let expected_name = [sequence[0], quality];
+            let expected_quality = [quality; 4];
+            let record = output
+                .next()
+                .expect("record should exist")
+                .expect("record should decode");
+            assert_eq!(record.name(), expected_name);
+            assert_eq!(record.sequence(), sequence);
+            assert_eq!(record.quality(), expected_quality);
+        }
+    }
+    assert!(output.next().is_none(), "output should be exhausted");
+}
+
+#[test]
 fn arena_unkeyed_sorter_sorts_borrowed_record_views() {
     let mut arena = SeqRecordArena::new();
     let mut sorter = Builder::new()
