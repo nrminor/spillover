@@ -1147,6 +1147,24 @@ struct MeasuredInput<T, S> {
     summary: S,
 }
 
+// Contextual sessions maintain active_bytes as measured heap, unlike legacy
+// sessions where it can contain opaque item-size callback totals.
+struct OwnedHeapReport<'a, T> {
+    buffer: &'a OwnedBuffer<T>,
+}
+
+impl<T> EstimateBufferMemory for OwnedHeapReport<'_, T> {
+    fn memory(&self) -> BufferMemory {
+        self.buffer.storage_memory(0, 0)
+    }
+}
+
+impl<T, S> ProjectBufferMemory<MeasuredInput<T, S>> for OwnedHeapReport<'_, T> {
+    fn memory_after(&self, input: &MeasuredInput<T, S>) -> BufferMemory {
+        self.buffer.storage_memory(1, input.heap)
+    }
+}
+
 trait ContextualMemory<T>: MeasureMemory<T> {
     fn current_summary(&self) -> Option<&Self::Summary>;
     fn empty_summary(&self) -> Self::Summary;
@@ -1266,11 +1284,21 @@ where
 }
 
 impl<T, A> Session<OwnedBuffer<T>, A> {
+    fn heap_report(&self) -> OwnedHeapReport<'_, T>
+    where
+        A: ContextualMemory<T>,
+    {
+        debug_assert!(self.buffer.item_size.is_none());
+        OwnedHeapReport {
+            buffer: &self.buffer,
+        }
+    }
+
     fn guard(&self, heap: usize, allowance: (usize, usize)) -> usize
     where
         A: ContextualMemory<T>,
     {
-        let storage = self.buffer.storage_memory(0, 0);
+        let storage = self.heap_report().memory();
         let retained = self.accumulator.retained_workspace(self.buffer.len());
         storage
             .spill_peak_bytes
@@ -1281,20 +1309,14 @@ impl<T, A> Session<OwnedBuffer<T>, A> {
 
     fn contextual_peak(
         &self,
-        additional_items: usize,
-        heap: usize,
+        storage: &BufferMemory,
         summary: &A::Summary,
         summary_heap: usize,
+        insertion_summaries: usize,
     ) -> usize
     where
         A: ContextualMemory<T>,
     {
-        let storage = self.buffer.storage_memory(additional_items, heap);
-        let insertion_summaries = if additional_items == 0 {
-            summary_heap
-        } else {
-            summary_heap.saturating_mul(2)
-        };
         let report = BufferMemory::new(
             storage.item_count,
             storage
@@ -1341,7 +1363,9 @@ impl<T, A> Session<OwnedBuffer<T>, A> {
             summary,
         };
         let mut joined = current + &measured.summary;
-        let peak = self.contextual_peak(1, measured.heap, &joined, allowance.0);
+        let storage = self.heap_report().memory_after(&measured);
+        let insertion_summaries = allowance.0.saturating_mul(2);
+        let peak = self.contextual_peak(&storage, &joined, allowance.0, insertion_summaries);
         if !self.buffer.is_empty() && peak >= budget {
             drop(joined);
             self.commit()?;
@@ -1369,7 +1393,8 @@ impl<T, A> Session<OwnedBuffer<T>, A> {
             .current_summary()
             .expect("inserted summary");
         let allowance = self.accumulator.allowance(current);
-        if self.contextual_peak(0, 0, current, allowance.0) >= budget {
+        let storage = self.heap_report().memory();
+        if self.contextual_peak(&storage, current, allowance.0, allowance.0) >= budget {
             self.commit()?;
         }
         Ok(())
