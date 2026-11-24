@@ -1009,6 +1009,29 @@ fn summary_envelope((heap, scratch): (usize, usize)) -> usize {
         .unwrap_or(usize::MAX)
 }
 
+trait MeasureMemory<Input: ?Sized> {
+    type Summary;
+
+    fn memory_summary(&self, input: &Input) -> Self::Summary;
+}
+
+impl<T, O, C, CS> MeasureMemory<T> for UnkeyedAccumulator<O, C, CS, Option<CS::Summary>>
+where
+    CS: SummarizeSortInput<T>,
+{
+    type Summary = CS::Summary;
+
+    fn memory_summary(&self, input: &T) -> Self::Summary {
+        self.chunk_sort.summarize(input)
+    }
+}
+
+struct MeasuredInput<T, S> {
+    input: T,
+    heap: usize,
+    summary: S,
+}
+
 impl<T, O, C, CS> Session<OwnedBuffer<T>, UnkeyedAccumulator<O, C, CS, Option<CS::Summary>>>
 where
     T: GetSize,
@@ -1018,7 +1041,7 @@ where
     for<'a> &'a CS::Summary: std::ops::Add<&'a CS::Summary, Output = CS::Summary>,
 {
     fn guard(&self, heap: usize, allowance: (usize, usize)) -> usize {
-        let storage = self.buffer.storage_memory(0);
+        let storage = self.buffer.storage_memory(0, 0);
         let retained = self.accumulator.accounting.as_ref().map_or(0, |summary| {
             self.accumulator
                 .chunk_sort
@@ -1027,7 +1050,6 @@ where
         });
         storage
             .spill_peak_bytes
-            .saturating_add(self.buffer.active_bytes)
             .saturating_add(heap)
             .saturating_add(retained)
             .saturating_add(summary_envelope(allowance))
@@ -1040,8 +1062,7 @@ where
         summary: &CS::Summary,
         summary_heap: usize,
     ) -> usize {
-        let storage = self.buffer.storage_memory(additional_items);
-        let payload = self.buffer.active_bytes.saturating_add(heap);
+        let storage = self.buffer.storage_memory(additional_items, heap);
         let insertion_summaries = if additional_items == 0 {
             summary_heap
         } else {
@@ -1051,12 +1072,8 @@ where
             storage.item_count,
             storage
                 .insertion_peak_bytes
-                .saturating_add(payload)
                 .saturating_add(insertion_summaries),
-            storage
-                .spill_peak_bytes
-                .saturating_add(payload)
-                .saturating_add(summary_heap),
+            storage.spill_peak_bytes.saturating_add(summary_heap),
         );
         let sort = self
             .accumulator
@@ -1101,21 +1118,35 @@ where
             .as_ref()
             .or(empty.as_ref())
             .expect("configured summary");
-        let incoming = self.accumulator.chunk_sort.summarize(&item);
-        let mut joined = current + &incoming;
-        let peak = self.contextual_peak(1, heap, &joined, allowance.0);
+        let summary = self.accumulator.memory_summary(&item);
+        let measured = MeasuredInput {
+            input: item,
+            heap,
+            summary,
+        };
+        let mut joined = current + &measured.summary;
+        let peak = self.contextual_peak(1, measured.heap, &joined, allowance.0);
         if !self.buffer.is_empty() && peak >= budget {
             drop(joined);
             self.commit()?;
             let fresh = self.accumulator.chunk_sort.summary();
-            joined = &fresh + &incoming;
+            joined = &fresh + &measured.summary;
             empty = Some(fresh);
         }
-        drop(incoming);
-        self.buffer.reserve_for_push();
-        self.buffer.extend([item]);
-        self.buffer.active_bytes = self.buffer.active_bytes.saturating_add(heap);
-        self.accumulator.accounting = Some(joined);
+        let staged = {
+            let MeasuredInput {
+                input,
+                heap,
+                summary,
+            } = measured;
+            drop(summary);
+            MeasuredInput {
+                input,
+                heap,
+                summary: joined,
+            }
+        };
+        self.insert_measured(staged);
         drop(empty);
         let current = self
             .accumulator
@@ -1127,6 +1158,18 @@ where
             self.commit()?;
         }
         Ok(())
+    }
+
+    fn insert_measured(&mut self, measured: MeasuredInput<T, CS::Summary>) {
+        let MeasuredInput {
+            input,
+            heap,
+            summary,
+        } = measured;
+        self.buffer.reserve_for_push();
+        self.buffer.extend([input]);
+        self.buffer.active_bytes = self.buffer.active_bytes.saturating_add(heap);
+        self.accumulator.accounting = Some(summary);
     }
 }
 
@@ -1250,12 +1293,6 @@ fn growth_target<T>(items: &Vec<T>, required: usize) -> Option<usize> {
     }
 }
 
-struct OwnedStorageMemory {
-    item_count: usize,
-    insertion_peak_bytes: usize,
-    spill_peak_bytes: usize,
-}
-
 impl<T> OwnedBuffer<T> {
     fn new(item_size: MaybeItemSize<T>) -> Self {
         Self {
@@ -1269,7 +1306,7 @@ impl<T> OwnedBuffer<T> {
         growth_target(&self.items, required)
     }
 
-    fn storage_memory(&self, additional_items: usize) -> OwnedStorageMemory {
+    fn storage_memory(&self, additional_items: usize, additional_heap: usize) -> BufferMemory {
         let item_count = self.items.len().checked_add(additional_items);
         let occupied_bytes = item_count.and_then(|count| {
             let layout = Layout::array::<T>(count).ok()?;
@@ -1289,11 +1326,16 @@ impl<T> OwnedBuffer<T> {
             old_bytes.checked_add(requested_bytes)
         });
 
-        OwnedStorageMemory {
-            item_count: item_count.unwrap_or(usize::MAX),
-            insertion_peak_bytes: insertion_peak_bytes.unwrap_or(usize::MAX),
-            spill_peak_bytes: occupied_bytes.unwrap_or(usize::MAX),
-        }
+        let payload = self.active_bytes.saturating_add(additional_heap);
+        let insertion_peak_bytes = insertion_peak_bytes
+            .unwrap_or(usize::MAX)
+            .saturating_add(payload);
+        let spill_peak_bytes = occupied_bytes.unwrap_or(usize::MAX).saturating_add(payload);
+        BufferMemory::new(
+            item_count.unwrap_or(usize::MAX),
+            insertion_peak_bytes,
+            spill_peak_bytes,
+        )
     }
 
     fn reserve_for_push(&mut self) {
@@ -1392,7 +1434,7 @@ impl<'items, T> ChunkBuffer for &'items mut OwnedBuffer<T> {
 }
 
 impl FlushStrategy {
-    fn fixed_size_peak(memory: &OwnedStorageMemory, write_buffer_bytes: usize) -> usize {
+    fn fixed_size_peak(memory: &BufferMemory, write_buffer_bytes: usize) -> usize {
         let spill_peak_bytes = if memory.item_count == 0 {
             0
         } else {
@@ -1409,7 +1451,7 @@ impl FlushStrategy {
         let Self::FixedSize { budget } = self else {
             return false;
         };
-        let memory = buffer.storage_memory(1);
+        let memory = buffer.storage_memory(1, 0);
         let projected_peak = Self::fixed_size_peak(&memory, write_buffer_bytes);
         projected_peak >= *budget
     }
@@ -1422,7 +1464,7 @@ impl FlushStrategy {
         match self {
             FlushStrategy::Bytes { budget } => buffer.active_bytes >= *budget,
             FlushStrategy::FixedSize { budget } => {
-                let memory = buffer.storage_memory(0);
+                let memory = buffer.storage_memory(0, 0);
                 let current_peak = Self::fixed_size_peak(&memory, write_buffer_bytes);
                 current_peak >= *budget
             }
@@ -2355,13 +2397,9 @@ where
     CS: ChunkSorter<T, O> + EstimateSortMemory<T>,
 {
     fn owned_peak(&self, additional_items: usize, additional_heap: usize) -> usize {
-        let storage = self.buffer.storage_memory(additional_items);
-        let heap = self.buffer.active_bytes.saturating_add(additional_heap);
-        let report = BufferMemory::new(
-            storage.item_count,
-            storage.insertion_peak_bytes.saturating_add(heap),
-            storage.spill_peak_bytes.saturating_add(heap),
-        );
+        let report = self
+            .buffer
+            .storage_memory(additional_items, additional_heap);
         let sort = self
             .accumulator
             .chunk_sort
