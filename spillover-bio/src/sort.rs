@@ -811,9 +811,15 @@ pub struct Builder<
     codec: C,
     flush: F,
     dedup: RecordDedup,
-    chunk_sort: CS,
+    core: spillover::sorter::Builder<
+        spillover::sorter::NeedsSortKey,
+        spillover::sorter::NeedsCodec,
+        spillover::sorter::NeedsFlushStrategy,
+        spillover::compare::Natural,
+        Identity,
+        CS,
+    >,
     storage: S,
-    merge_config: MergeConfig,
 }
 
 /// Active genomics sorter.
@@ -988,9 +994,8 @@ impl Builder {
             codec: NeedsCodec,
             flush: NeedsFlush,
             dedup: RecordDedup::None,
-            chunk_sort: Sequential,
+            core: spillover::sorter::Builder::new(),
             storage: OwnedStorage,
-            merge_config: MergeConfig::default(),
         }
     }
 }
@@ -1145,9 +1150,8 @@ impl<O, C, F, CS> Builder<O, C, F, CS, OwnedStorage> {
             codec: self.codec,
             flush: self.flush,
             dedup: self.dedup,
-            chunk_sort: self.chunk_sort,
+            core: self.core,
             storage: ArenaStorage { arena },
-            merge_config: self.merge_config,
         }
     }
 }
@@ -1161,9 +1165,8 @@ impl<C, F, CS, S> Builder<NeedsOrder, C, F, CS, S> {
             codec: self.codec,
             flush: self.flush,
             dedup: self.dedup,
-            chunk_sort: self.chunk_sort,
+            core: self.core,
             storage: self.storage,
-            merge_config: self.merge_config,
         }
     }
 
@@ -1178,9 +1181,8 @@ impl<C, F, CS, S> Builder<NeedsOrder, C, F, CS, S> {
             codec: self.codec,
             flush: self.flush,
             dedup: self.dedup,
-            chunk_sort: self.chunk_sort,
+            core: self.core,
             storage: self.storage,
-            merge_config: self.merge_config,
         }
     }
 
@@ -1256,9 +1258,8 @@ impl<O, F, CS, St> Builder<O, NeedsCodec, F, CS, St> {
             codec: HasCodec(codec),
             flush: self.flush,
             dedup: self.dedup,
-            chunk_sort: self.chunk_sort,
+            core: self.core,
             storage: self.storage,
-            merge_config: self.merge_config,
         }
     }
 }
@@ -1275,9 +1276,8 @@ impl<O, C, CS, S> Builder<O, C, NeedsFlush, CS, S> {
             codec: self.codec,
             flush: HasFlush(spillover::sorter::ByteLimit::new(budget)),
             dedup: self.dedup,
-            chunk_sort: self.chunk_sort,
+            core: self.core,
             storage: self.storage,
-            merge_config: self.merge_config,
         }
     }
 
@@ -1292,9 +1292,8 @@ impl<O, C, CS, S> Builder<O, C, NeedsFlush, CS, S> {
             codec: self.codec,
             flush: HasFlush(spillover::sorter::ItemLimit::new(max_items)),
             dedup: self.dedup,
-            chunk_sort: self.chunk_sort,
+            core: self.core,
             storage: self.storage,
-            merge_config: self.merge_config,
         }
     }
 }
@@ -1317,16 +1316,15 @@ impl<O, C, F, CS, S> Builder<O, C, F, CS, S> {
             codec: self.codec,
             flush: self.flush,
             dedup: self.dedup,
-            chunk_sort,
+            core: self.core.chunk_sort(chunk_sort),
             storage: self.storage,
-            merge_config: self.merge_config,
         }
     }
 
     /// Override the merge configuration.
     #[must_use]
     pub fn merge_config(mut self, config: MergeConfig) -> Self {
-        self.merge_config = config;
+        self.core = self.core.merge_config(config);
         self
     }
 
@@ -1338,9 +1336,8 @@ impl<O, C, F, CS, S> Builder<O, C, F, CS, S> {
             codec: self.codec,
             flush: self.flush,
             dedup: RecordDedup::Name,
-            chunk_sort: self.chunk_sort,
+            core: self.core,
             storage: self.storage,
-            merge_config: self.merge_config,
         }
     }
 
@@ -1352,9 +1349,8 @@ impl<O, C, F, CS, S> Builder<O, C, F, CS, S> {
             codec: self.codec,
             flush: self.flush,
             dedup: RecordDedup::Sequence,
-            chunk_sort: self.chunk_sort,
+            core: self.core,
             storage: self.storage,
-            merge_config: self.merge_config,
         }
     }
 
@@ -1367,9 +1363,8 @@ impl<O, C, F, CS, S> Builder<O, C, F, CS, S> {
             codec: self.codec,
             flush: self.flush,
             dedup: RecordDedup::SequenceAndQuality,
-            chunk_sort: self.chunk_sort,
+            core: self.core,
             storage: self.storage,
-            merge_config: self.merge_config,
         }
     }
 
@@ -1435,11 +1430,7 @@ macro_rules! owned_keyed_builder {
                 let codec = self.codec.resolve();
                 let keyed_codec = codec.with_record_keyer(order);
                 let limit = $extract(self.flush);
-                let builder = spillover::sorter::Builder::new()
-                    .order(order)
-                    .keyed_codec(keyed_codec)
-                    .chunk_sort(self.chunk_sort)
-                    .merge_config(self.merge_config);
+                let builder = self.core.order(order).keyed_codec(keyed_codec);
                 let inner = builder.$setter(limit).build();
                 Sorter {
                     inner: OwnedBackend { inner, _types: std::marker::PhantomData },
@@ -1501,11 +1492,10 @@ where
         let order = self.order.0;
         let codec = self.codec.resolve();
         let max_items = self.flush.0.max_items();
-        let inner = spillover::sorter::Builder::new()
+        let inner = self
+            .core
             .order(order)
             .codec(codec)
-            .chunk_sort(self.chunk_sort)
-            .merge_config(self.merge_config)
             .max_buffer_items(max_items)
             .build();
         Sorter {
@@ -1552,11 +1542,10 @@ where
     pub fn build(self) -> NativeUnkeyedBuilt<O, C, CS, spillover::sorter::ByteLimit> {
         let order = self.order.0;
         let codec = self.codec.resolve();
-        let inner = spillover::sorter::Builder::new()
+        let inner = self
+            .core
             .order(order)
             .codec(codec)
-            .chunk_sort(self.chunk_sort)
-            .merge_config(self.merge_config)
             .memory_budget(self.flush.0)
             .build();
         Sorter {
@@ -1659,11 +1648,10 @@ where
         let codec = self.codec.resolve();
         let max_items = self.flush.0.max_items();
         let storage = self.storage.arena;
-        let builder = spillover::sorter::Builder::new()
+        let builder = self
+            .core
             .order(order)
             .codec(codec)
-            .chunk_sort(self.chunk_sort)
-            .merge_config(self.merge_config)
             .max_buffer_items(max_items);
         let build_in: fn(_, &'a mut SeqRecordArena) -> _ = spillover::sorter::Builder::build_in;
         let inner = build_in(builder, storage);
@@ -1745,12 +1733,7 @@ where
         let codec = self.codec.resolve();
         let budget = self.flush.0.max_bytes();
         let storage = self.storage.arena;
-        let builder = spillover::sorter::Builder::new()
-            .order(order)
-            .codec(codec)
-            .chunk_sort(self.chunk_sort)
-            .merge_config(self.merge_config)
-            .memory_budget(budget);
+        let builder = self.core.order(order).codec(codec).memory_budget(budget);
         let build_measured_in: fn(_, &'a mut SeqRecordArena) -> _ =
             spillover::sorter::Builder::build_measured_in;
         let inner = build_measured_in(builder, storage);
@@ -1844,11 +1827,10 @@ where
         let keyed_codec = codec.with_record_keyer(order);
         let max_items = self.flush.0.max_items();
         let storage = self.storage.arena;
-        let builder = spillover::sorter::Builder::new()
+        let builder = self
+            .core
             .order(order)
             .keyed_codec(keyed_codec)
-            .chunk_sort(self.chunk_sort)
-            .merge_config(self.merge_config)
             .max_buffer_items(max_items);
         let build_keyed_in: fn(_, &'a mut SeqRecordArena) -> _ =
             spillover::sorter::Builder::build_keyed_in;
@@ -1900,11 +1882,10 @@ where
         let keyed_codec = codec.with_record_keyer(order);
         let budget = self.flush.0.max_bytes();
         let storage = self.storage.arena;
-        let builder = spillover::sorter::Builder::new()
+        let builder = self
+            .core
             .order(order)
             .keyed_codec(keyed_codec)
-            .chunk_sort(self.chunk_sort)
-            .merge_config(self.merge_config)
             .memory_budget(budget);
         let build_keyed_measured_in: fn(_, &'a mut SeqRecordArena) -> _ =
             spillover::sorter::Builder::build_keyed_measured_in;
