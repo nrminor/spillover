@@ -1147,6 +1147,37 @@ struct MeasuredInput<T, S> {
     summary: S,
 }
 
+enum Evidence<'a, S> {
+    Current(&'a S),
+    Projected(S),
+}
+
+struct MemoryQuery<'a, T, A: MeasureMemory<T>> {
+    accumulator: &'a A,
+    evidence: Evidence<'a, A::Summary>,
+    storage: BufferMemory,
+    summary_heap: usize,
+}
+
+impl<T, A: ContextualMemory<T>> MemoryQuery<'_, T, A> {
+    fn peak_bytes(&self) -> usize {
+        let (summary, insertion_summaries) = match &self.evidence {
+            Evidence::Current(summary) => (*summary, self.summary_heap),
+            Evidence::Projected(summary) => (summary, self.summary_heap.saturating_mul(2)),
+        };
+        let report = BufferMemory::new(
+            self.storage.item_count,
+            self.storage
+                .insertion_peak_bytes
+                .saturating_add(insertion_summaries),
+            self.storage
+                .spill_peak_bytes
+                .saturating_add(self.summary_heap),
+        );
+        self.accumulator.evaluate_peak(&report, summary)
+    }
+}
+
 // Contextual sessions maintain active_bytes as measured heap, unlike legacy
 // sessions where it can contain opaque item-size callback totals.
 struct OwnedHeapReport<'a, T> {
@@ -1307,24 +1338,47 @@ impl<T, A> Session<OwnedBuffer<T>, A> {
             .saturating_add(summary_envelope(allowance))
     }
 
-    fn contextual_peak(
-        &self,
-        storage: &BufferMemory,
-        summary: &A::Summary,
-        summary_heap: usize,
-        insertion_summaries: usize,
-    ) -> usize
+    fn memory_for<'a>(
+        &'a self,
+        measured: &MeasuredInput<T, A::Summary>,
+        empty: Option<&A::Summary>,
+        allowance: (usize, usize),
+    ) -> MemoryQuery<'a, T, A>
+    where
+        A: ContextualMemory<T>,
+        for<'b> &'b A::Summary: std::ops::Add<&'b A::Summary, Output = A::Summary>,
+    {
+        let current = self
+            .accumulator
+            .current_summary()
+            .or(empty)
+            .expect("configured summary");
+        let joined = current + &measured.summary;
+        let storage = self.heap_report().memory_after(measured);
+        MemoryQuery {
+            accumulator: &self.accumulator,
+            evidence: Evidence::Projected(joined),
+            storage,
+            summary_heap: allowance.0,
+        }
+    }
+
+    fn memory(&self) -> MemoryQuery<'_, T, A>
     where
         A: ContextualMemory<T>,
     {
-        let report = BufferMemory::new(
-            storage.item_count,
-            storage
-                .insertion_peak_bytes
-                .saturating_add(insertion_summaries),
-            storage.spill_peak_bytes.saturating_add(summary_heap),
-        );
-        self.accumulator.evaluate_peak(&report, summary)
+        let current = self
+            .accumulator
+            .current_summary()
+            .expect("inserted summary");
+        let allowance = self.accumulator.allowance(current);
+        let storage = self.heap_report().memory();
+        MemoryQuery {
+            accumulator: &self.accumulator,
+            evidence: Evidence::Current(current),
+            storage,
+            summary_heap: allowance.0,
+        }
     }
 
     fn push_contextual(&mut self, item: T, budget: usize) -> Result<(), A::Error>
@@ -1351,28 +1405,27 @@ impl<T, A> Session<OwnedBuffer<T>, A> {
             allowance = self.accumulator.allowance_for(&fresh, &item);
             empty = Some(fresh);
         }
-        let current = self
-            .accumulator
-            .current_summary()
-            .or(empty.as_ref())
-            .expect("configured summary");
         let summary = self.accumulator.memory_summary(&item);
         let measured = MeasuredInput {
             input: item,
             heap,
             summary,
         };
-        let mut joined = current + &measured.summary;
-        let storage = self.heap_report().memory_after(&measured);
-        let insertion_summaries = allowance.0.saturating_mul(2);
-        let peak = self.contextual_peak(&storage, &joined, allowance.0, insertion_summaries);
-        if !self.buffer.is_empty() && peak >= budget {
-            drop(joined);
+        let query = self.memory_for(&measured, empty.as_ref(), allowance);
+        let peak = query.peak_bytes();
+        let joined = if !self.buffer.is_empty() && peak >= budget {
+            drop(query);
             self.commit()?;
             let fresh = self.accumulator.empty_summary();
-            joined = &fresh + &measured.summary;
+            let joined = &fresh + &measured.summary;
             empty = Some(fresh);
-        }
+            joined
+        } else {
+            let Evidence::Projected(joined) = query.evidence else {
+                unreachable!()
+            };
+            joined
+        };
         let staged = {
             let MeasuredInput {
                 input,
@@ -1388,13 +1441,8 @@ impl<T, A> Session<OwnedBuffer<T>, A> {
         };
         self.insert_measured(staged);
         drop(empty);
-        let current = self
-            .accumulator
-            .current_summary()
-            .expect("inserted summary");
-        let allowance = self.accumulator.allowance(current);
-        let storage = self.heap_report().memory();
-        if self.contextual_peak(&storage, current, allowance.0, allowance.0) >= budget {
+        let query = self.memory();
+        if query.peak_bytes() >= budget {
             self.commit()?;
         }
         Ok(())
