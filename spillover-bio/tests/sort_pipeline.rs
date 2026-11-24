@@ -1692,6 +1692,33 @@ fn owned_keyed_spills_follow_complete_sequence_order() {
 }
 
 #[test]
+fn owned_keyed_default_radix_spills_follow_complete_sequence_order_below_fallback() {
+    let mut sorter = Builder::new()
+        .sort_by_illumina()
+        .codec(DryIceCodec::new())
+        .max_buffer_items(2)
+        .build();
+
+    let records = [
+        SeqRecord::new(b"c", b"C", b"I"),
+        SeqRecord::new(b"n", b"N", b"I"),
+        SeqRecord::new(b"a", b"A", b"I"),
+    ];
+    for record in records {
+        sorter.push(record).expect("push should succeed");
+    }
+
+    let mut output = sorter.finish().expect("finish should succeed");
+    for (name, sequence, quality) in [(b"a", b"A", b"I"), (b"n", b"N", b"I"), (b"c", b"C", b"I")] {
+        let record = output.next().expect("record should exist").expect("decode");
+        assert_eq!(record.name(), name);
+        assert_eq!(record.sequence(), sequence);
+        assert_eq!(record.quality(), quality);
+    }
+    assert!(output.next().is_none());
+}
+
+#[test]
 fn quality_tiebreaker_orders_identical_sequences() {
     let mut sorter = Builder::new()
         .sort_by_illumina()
