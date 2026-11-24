@@ -523,6 +523,31 @@ impl<O, Cod, D, CS> Builder<HasOrder<O>, HasCodec<Cod>, ItemLimit, (), D, CS> {
 }
 
 impl<O, Cod, D, CS> Builder<HasOrder<O>, HasCodec<Cod>, ByteLimit, (), D, CS> {
+    /// Build an owned sorter under a measured byte budget.
+    #[must_use]
+    pub fn build<T>(self) -> Sorter<T, O, Cod, (), D, CS, Unkeyed, ByteLimit>
+    where
+        T: GetSize,
+        Cod: Codec + EncodeRun<T> + EncodeRun<OrdinaryRecord<Cod>>,
+        O: Compare<T> + Compare<OrdinaryRecord<Cod>>,
+        CS: ChunkSorter<T, O> + EstimateSortMemory<T>,
+    {
+        let accumulator = UnkeyedAccumulator {
+            order: self.sort_key.0,
+            codec: self.codec.0,
+            chunk_sort: self.chunk_sort,
+            merge_config: self.config.merge,
+            runs: Vec::new(),
+        };
+        Sorter {
+            session: Session::new(OwnedBuffer::new(None), accumulator),
+            dedup: self.dedup,
+            flush: FlushStrategy::Bytes {
+                budget: self.flush.bytes,
+            },
+            _marker: std::marker::PhantomData,
+        }
+    }
     /// Build a measured unkeyed sorter and clear the selected storage.
     #[doc(hidden)]
     #[must_use]
@@ -834,6 +859,9 @@ mod binding {
         type Session = Session<OwnedBuffer<T>, OrderedAccumulator<O, Cod, CS>>;
     }
     impl<T, O, Cod, CS> Binding<T, O, Cod, (), CS, super::Unkeyed> for super::ItemLimit {
+        type Session = Session<OwnedBuffer<T>, UnkeyedAccumulator<O, Cod, CS>>;
+    }
+    impl<T, O, Cod, CS> Binding<T, O, Cod, (), CS, super::Unkeyed> for super::ByteLimit {
         type Session = Session<OwnedBuffer<T>, UnkeyedAccumulator<O, Cod, CS>>;
     }
     impl<B, O, C, CS> Binding<(), O, C, (), CS, super::Unkeyed> for super::ArenaBuffer<'_, B> {
@@ -1214,6 +1242,18 @@ where
         .accumulator
         .chunk_sort
         .sort_memory(report.item_count, &());
+    unkeyed_peak(
+        report,
+        &sort,
+        session.accumulator.merge_config.write_buffer_bytes,
+    )
+}
+
+fn unkeyed_peak(
+    report: &BufferMemory,
+    sort: &crate::chunk::SortMemory,
+    write_buffer_bytes: usize,
+) -> usize {
     let retained = sort.retained_bytes();
     let insertion = report.insertion_peak_bytes.saturating_add(retained);
     if report.item_count == 0 {
@@ -1221,7 +1261,7 @@ where
     }
     let spill = report.spill_peak_bytes.saturating_add(retained);
     let sorting = spill.saturating_add(sort.scratch_bytes());
-    let writing = spill.saturating_add(session.accumulator.merge_config.write_buffer_bytes);
+    let writing = spill.saturating_add(write_buffer_bytes);
     insertion.max(sorting).max(writing)
 }
 
@@ -2031,6 +2071,79 @@ where
         let dedup = self.dedup;
         let merged = self.session.finish()?;
         Ok(Sorted::new(dedup.dedup(merged)))
+    }
+}
+
+impl<T, O, C, CS> Session<OwnedBuffer<T>, UnkeyedAccumulator<O, C, CS>>
+where
+    T: GetSize,
+    C: Codec + EncodeRun<T> + EncodeRun<OrdinaryRecord<C>>,
+    O: Compare<T> + Compare<OrdinaryRecord<C>>,
+    CS: ChunkSorter<T, O> + EstimateSortMemory<T>,
+{
+    fn owned_peak(&self, additional_items: usize, additional_heap: usize) -> usize {
+        let storage = self.buffer.storage_memory(additional_items);
+        let heap = self.buffer.active_bytes.saturating_add(additional_heap);
+        let report = BufferMemory::new(
+            storage.item_count,
+            storage.insertion_peak_bytes.saturating_add(heap),
+            storage.spill_peak_bytes.saturating_add(heap),
+        );
+        let sort = self
+            .accumulator
+            .chunk_sort
+            .sort_memory(report.item_count, &());
+        unkeyed_peak(
+            &report,
+            &sort,
+            self.accumulator.merge_config.write_buffer_bytes,
+        )
+    }
+
+    fn push_measured(&mut self, item: T, budget: usize) -> Result<(), MergeError<C::Error>> {
+        let heap = item.get_heap_size();
+        let peak = self.owned_peak(1, heap);
+        if !self.buffer.is_empty() && peak >= budget {
+            self.commit()?;
+        }
+        self.buffer.reserve_for_push();
+        self.buffer.extend([item]);
+        self.buffer.active_bytes = self.buffer.active_bytes.saturating_add(heap);
+        if self.owned_peak(0, 0) >= budget {
+            self.commit()?;
+        }
+        Ok(())
+    }
+}
+
+impl<T, O, C, D, CS> Sorter<T, O, C, (), D, CS, Unkeyed, ByteLimit>
+where
+    T: GetSize,
+    C: Codec + EncodeRun<T> + EncodeRun<OrdinaryRecord<C>>,
+    O: Compare<T> + Compare<OrdinaryRecord<C>>,
+    CS: ChunkSorter<T, O> + EstimateSortMemory<T>,
+{
+    /// Add an item under the modeled byte budget.
+    ///
+    /// # Errors
+    /// Returns an error if spilling fails.
+    pub fn push(&mut self, item: T) -> Result<(), MergeError<C::Error>> {
+        let FlushStrategy::Bytes { budget } = self.flush else {
+            unreachable!("measured sorter requires a byte limit");
+        };
+        self.session.push_measured(item, budget)
+    }
+
+    /// Finish the remaining run and return the merged output.
+    ///
+    /// # Errors
+    /// Returns an error if spilling or merging fails.
+    pub fn finish(self) -> Result<UnkeyedOutput<C, O, D>, MergeError<C::Error>>
+    where
+        D: Dedup<RunMerge<C, O>>,
+    {
+        let merged = self.session.finish()?;
+        Ok(Sorted::new(self.dedup.dedup(merged)))
     }
 }
 

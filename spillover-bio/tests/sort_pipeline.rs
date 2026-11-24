@@ -979,6 +979,43 @@ fn make_record(name: &[u8], seq: &[u8], qual: &[u8]) -> SeqRecord {
     SeqRecord::new(name, seq, qual)
 }
 
+#[test]
+fn owned_unkeyed_budget_includes_spill_writer() {
+    let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("Cargo.toml");
+    assert!(manifest.is_file());
+    let writer_bytes = 1009_usize;
+    let record_size = std::mem::size_of::<SeqRecord>();
+    assert!(record_size > 0);
+    let two_records = record_size.checked_mul(2).expect("record sizes should fit");
+    assert!(two_records < writer_bytes + 1);
+    let budget = writer_bytes
+        .checked_add(512)
+        .and_then(|bytes| bytes.checked_add(record_size))
+        .and_then(|bytes| bytes.checked_add(1))
+        .expect("budget should fit");
+    let mut merge_config = MergeConfig::default();
+    merge_config.temp_dir = Some(manifest);
+    merge_config.write_buffer_bytes = writer_bytes;
+    let mut sorter = Builder::new()
+        .sort_by_unkeyed(ILLUMINA_ORDER.unkeyed())
+        .codec(DryIceCodec::new())
+        .chunk_sort(Sequential)
+        .merge_config(merge_config)
+        .measured_budget(budget)
+        .build();
+
+    let sequence = [b'A'; 127];
+    let quality = [b'!'; 127];
+    let first = SeqRecord::new(b"r1", sequence.as_slice(), quality.as_slice());
+    let second = SeqRecord::new(b"r2", sequence.as_slice(), quality.as_slice());
+    sorter.push(first).expect("first push should succeed");
+    let result = sorter.push(second);
+    assert!(
+        matches!(result, Err(MergeError::Io(_))),
+        "second push should attempt a spill, got {result:?}"
+    );
+}
+
 #[derive(Default)]
 struct VecSink {
     records: Vec<SeqRecord>,

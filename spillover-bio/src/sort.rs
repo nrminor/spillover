@@ -103,13 +103,6 @@ mod sealed {
 
         fn resolve(self) -> crate::codec::DryIceCodec<Self::S, Self::Q, Self::N>;
     }
-
-    /// Resolves flush type-state to a concrete [`super::FlushConfig`].
-    /// `NeedsFlush` yields a 1 GiB measured budget;
-    /// `HasFlush` passes through the user's choice.
-    pub trait ResolveFlush {
-        fn resolve(self) -> super::FlushConfig;
-    }
 }
 
 /// Defines a complete sort order: what to sort by, how to
@@ -725,8 +718,7 @@ pub struct ArenaStorage<'a> {
     arena: &'a mut SeqRecordArena,
 }
 
-// pub visibility required because `sealed::ResolveFlush`
-// returns it. The sealed module prevents external impls.
+// Retained for public compatibility.
 #[doc(hidden)]
 pub enum FlushConfig {
     MeasuredBudget(usize),
@@ -761,24 +753,6 @@ where
 
     fn resolve(self) -> DryIceCodec<S, Q, N> {
         self.0
-    }
-}
-
-impl sealed::ResolveFlush for NeedsFlush {
-    fn resolve(self) -> FlushConfig {
-        FlushConfig::MeasuredBudget(DEFAULT_BUDGET)
-    }
-}
-
-impl sealed::ResolveFlush for HasFlush<spillover::sorter::ByteLimit> {
-    fn resolve(self) -> FlushConfig {
-        FlushConfig::MeasuredBudget(self.0.max_bytes())
-    }
-}
-
-impl sealed::ResolveFlush for HasFlush<spillover::sorter::ItemLimit> {
-    fn resolve(self) -> FlushConfig {
-        FlushConfig::MaxItems(self.0.max_items())
     }
 }
 
@@ -1423,10 +1397,6 @@ impl<O, C, F, CS, S> Builder<O, C, F, CS, S> {
 }
 
 // build() for keyed sort orders.
-//
-// The `ResolveCodec` and `ResolveFlush` traits handle defaults:
-// `NeedsCodec` → raw DryIceCodec, `NeedsFlush` → 1 GiB budget.
-// This single impl covers all four combinations of has/needs.
 
 type NativeKeyedCodec<O, C> = KeyedDryIceCodec<
     O,
@@ -1493,95 +1463,19 @@ owned_keyed_builder!(HasFlush<spillover::sorter::ItemLimit>, spillover::sorter::
 
 // build() for unkeyed sort orders.
 
-macro_rules! legacy_unkeyed_builder {
-    ($flush:ty) => {
-        impl<O, C, CS> Builder<HasUnkeyedOrder<O>, C, $flush, CS, OwnedStorage>
-        where
-            O: SortOrder<Strategy = Unkeyed>,
-            O::SortKey: Send + Sync + 'static,
-            O::KeyComparator: for<'a> Compare<<O::SortKey as SortKey<SeqRecord>>::Key<'a>>
-                + Send
-                + Sync
-                + 'static,
-            C: sealed::ResolveCodec,
-            CS: ChunkSorter<SeqRecord, KeyCompare<O::SortKey, O::KeyComparator>>
-                + sealed::CompatibleChunkSorter<O>,
-        {
-            /// Build the sorter (unkeyed merge path, no stored record keys).
-            ///
-            /// If `.codec()` was not called, defaults to raw (uncompressed)
-            /// dryice encoding. If `.measured_budget()` / `.max_buffer_items()`
-            /// was not called, defaults to a 1 GiB measured memory budget.
-            #[allow(clippy::type_complexity)]
-            #[must_use]
-            pub fn build(
-                self,
-            ) -> Sorter<
-                O::SortKey,
-                DryIceCodec<C::S, C::Q, C::N>,
-                O::KeyComparator,
-                CS,
-                spillover::sorter::Unkeyed,
-            > {
-                let order = self.order.0;
-                let _storage = self.storage;
-                let codec = self.codec.resolve();
-                let flush = sealed::ResolveFlush::resolve(self.flush);
-
-                let builder = spillover::sorter::Builder::new()
-                    .key(order.sort_key())
-                    .compare(order.key_comparator())
-                    .codec(codec)
-                    .dedup(Identity)
-                    .chunk_sort(self.chunk_sort)
-                    .merge_config(self.merge_config);
-
-                let inner = match flush {
-                    FlushConfig::MeasuredBudget(budget) => {
-                        builder.measured_budget::<SeqRecord>(budget).build()
-                    }
-                    FlushConfig::MaxItems(max_items) => {
-                        builder.max_buffer_items::<SeqRecord>(max_items).build()
-                    }
-                };
-
-                Sorter {
-                    inner: OwnedBackend {
-                        inner,
-                        _types: std::marker::PhantomData,
-                    },
-                    dedup: self.dedup,
-                    _types: std::marker::PhantomData,
-                }
-            }
-        }
-    };
-}
-
-legacy_unkeyed_builder!(NeedsFlush);
-legacy_unkeyed_builder!(HasFlush<spillover::sorter::ByteLimit>);
-
 type NativeOrdinaryRecord<C> = <<C as Codec>::Cursor<BufReader<File>> as CodecCursor>::Record;
-type NativeUnkeyedCore<O, C, CS> = spillover::sorter::Sorter<
-    SeqRecord,
-    O,
-    C,
-    (),
-    Identity,
-    CS,
-    spillover::sorter::Unkeyed,
-    spillover::sorter::ItemLimit,
->;
-type NativeUnkeyedSorter<O, C, CS> = Sorter<
+type NativeUnkeyedCore<O, C, CS, L> =
+    spillover::sorter::Sorter<SeqRecord, O, C, (), Identity, CS, spillover::sorter::Unkeyed, L>;
+type NativeUnkeyedSorter<O, C, CS, L> = Sorter<
     O,
     C,
     (),
     CS,
     spillover::sorter::Unkeyed,
-    OwnedBackend<O, C, (), CS, spillover::sorter::Unkeyed, NativeUnkeyedCore<O, C, CS>>,
+    OwnedBackend<O, C, (), CS, spillover::sorter::Unkeyed, NativeUnkeyedCore<O, C, CS, L>>,
 >;
 type NativeUnkeyedOutput<C, O> = SortedRecordStream<spillover::Sorted<RunMerge<C, O>>>;
-type NativeUnkeyedBuilt<O, C, CS> = NativeUnkeyedSorter<
+type NativeUnkeyedBuilt<O, C, CS, L> = NativeUnkeyedSorter<
     O,
     DryIceCodec<
         <C as sealed::ResolveCodec>::S,
@@ -1589,6 +1483,7 @@ type NativeUnkeyedBuilt<O, C, CS> = NativeUnkeyedSorter<
         <C as sealed::ResolveCodec>::N,
     >,
     CS,
+    L,
 >;
 
 impl<O, C, CS>
@@ -1602,7 +1497,7 @@ where
 {
     /// Build an item-limited sorter using the complete unkeyed order.
     #[must_use]
-    pub fn build(self) -> NativeUnkeyedBuilt<O, C, CS> {
+    pub fn build(self) -> NativeUnkeyedBuilt<O, C, CS, spillover::sorter::ItemLimit> {
         let order = self.order.0;
         let codec = self.codec.resolve();
         let max_items = self.flush.0.max_items();
@@ -1624,7 +1519,83 @@ where
     }
 }
 
-impl<O, C, CS> NativeUnkeyedSorter<O, C, CS>
+impl<O, C, CS> Builder<HasUnkeyedOrder<O>, C, NeedsFlush, CS, OwnedStorage>
+where
+    C: sealed::ResolveCodec,
+    O: SortOrder<Strategy = Unkeyed>
+        + Compare<SeqRecord>
+        + Compare<NativeOrdinaryRecord<DryIceCodec<C::S, C::Q, C::N>>>,
+    CS: ChunkSorter<SeqRecord, O>
+        + spillover::chunk::EstimateSortMemory<SeqRecord>
+        + sealed::CompatibleChunkSorter<O>,
+{
+    /// Build with the default 1 GiB measured budget.
+    #[must_use]
+    pub fn build(self) -> NativeUnkeyedBuilt<O, C, CS, spillover::sorter::ByteLimit> {
+        self.measured_budget(DEFAULT_BUDGET).build()
+    }
+}
+
+impl<O, C, CS>
+    Builder<HasUnkeyedOrder<O>, C, HasFlush<spillover::sorter::ByteLimit>, CS, OwnedStorage>
+where
+    C: sealed::ResolveCodec,
+    O: SortOrder<Strategy = Unkeyed>
+        + Compare<SeqRecord>
+        + Compare<NativeOrdinaryRecord<DryIceCodec<C::S, C::Q, C::N>>>,
+    CS: ChunkSorter<SeqRecord, O>
+        + spillover::chunk::EstimateSortMemory<SeqRecord>
+        + sealed::CompatibleChunkSorter<O>,
+{
+    /// Build an owned unkeyed sorter under a measured byte budget.
+    #[must_use]
+    pub fn build(self) -> NativeUnkeyedBuilt<O, C, CS, spillover::sorter::ByteLimit> {
+        let order = self.order.0;
+        let codec = self.codec.resolve();
+        let inner = spillover::sorter::Builder::new()
+            .order(order)
+            .codec(codec)
+            .chunk_sort(self.chunk_sort)
+            .merge_config(self.merge_config)
+            .memory_budget(self.flush.0)
+            .build();
+        Sorter {
+            inner: OwnedBackend {
+                inner,
+                _types: std::marker::PhantomData,
+            },
+            dedup: self.dedup,
+            _types: std::marker::PhantomData,
+        }
+    }
+}
+
+impl<O, C, CS> NativeUnkeyedSorter<O, C, CS, spillover::sorter::ByteLimit>
+where
+    C: Codec + EncodeRun<SeqRecord> + EncodeRun<NativeOrdinaryRecord<C>>,
+    O: Compare<SeqRecord> + Compare<NativeOrdinaryRecord<C>>,
+    CS: ChunkSorter<SeqRecord, O> + spillover::chunk::EstimateSortMemory<SeqRecord>,
+{
+    /// Add a record under the measured byte budget.
+    ///
+    /// # Errors
+    /// Returns an error if spilling fails.
+    pub fn push(&mut self, record: impl Into<SeqRecord>) -> Result<(), MergeError<C::Error>> {
+        self.inner.inner.push(record.into())
+    }
+
+    /// Finish sorting and return the finalized stream.
+    ///
+    /// # Errors
+    /// Returns an error if spilling or merging fails.
+    pub fn finish(self) -> Result<NativeUnkeyedOutput<C, O>, MergeError<C::Error>> {
+        let inner = self.inner.inner.finish()?;
+        let dedup = RecordDedupState::new(self.dedup);
+        Ok(SortedRecordStream::new(inner, dedup))
+    }
+}
+
+impl<O, C, CS> NativeUnkeyedSorter<O, C, CS, spillover::sorter::ItemLimit>
 where
     C: Codec + EncodeRun<SeqRecord> + EncodeRun<NativeOrdinaryRecord<C>>,
     O: Compare<SeqRecord> + Compare<NativeOrdinaryRecord<C>>,
