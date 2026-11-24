@@ -69,6 +69,16 @@ pub trait Compare<K: ?Sized> {
     fn min<'a>(&self, a: &'a K, b: &'a K) -> &'a K {
         if self.le(a, b) { a } else { b }
     }
+
+    /// Check whether adjacent items are in nondecreasing order under this comparator.
+    ///
+    /// Empty and single-item slices are sorted.
+    fn is_sorted(&self, items: &[K]) -> bool
+    where
+        K: Sized,
+    {
+        items.windows(2).all(|pair| self.le(&pair[0], &pair[1]))
+    }
 }
 
 /// Natural ordering via [`Ord`]. Any key type that implements `Ord`
