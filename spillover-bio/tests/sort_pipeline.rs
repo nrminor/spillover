@@ -1075,6 +1075,206 @@ fn from_inputs_budget_includes_allocating_summary_envelope() {
     );
 }
 
+struct WitnessSummary(Box<[u8; 32]>);
+
+impl Add<&WitnessSummary> for &WitnessSummary {
+    type Output = WitnessSummary;
+
+    fn add(self, other: &WitnessSummary) -> WitnessSummary {
+        let mut combined = Box::new([0; 32]);
+        combined[0] = self.0[0].saturating_add(other.0[0]).min(63);
+        WitnessSummary(combined)
+    }
+}
+
+struct WitnessOrder;
+
+impl Compare<u64> for WitnessOrder {
+    fn compare(&self, left: &u64, right: &u64) -> Ordering {
+        left.cmp(right)
+    }
+}
+
+impl spillover::key::KeyedOrder for WitnessOrder {
+    type StoredKey = Vec<u8>;
+
+    fn compare_keys(&self, left: &Vec<u8>, right: &Vec<u8>) -> Ordering {
+        left.cmp(right)
+    }
+}
+
+impl spillover::key::DeriveKey<u64> for WitnessOrder {
+    fn derive_key(&self, item: &u64) -> Vec<u8> {
+        let mut key = vec![0; 256];
+        key[0] = u8::try_from((*item).min(63)).expect("capped weight fits");
+        key
+    }
+}
+
+impl spillover::key::EstimateKeyMemory<u64> for WitnessOrder {
+    fn estimate_key_memory(&self, _: &u64) -> spillover::key::KeyMemory {
+        spillover::key::KeyMemory::retained_heap(256)
+    }
+}
+
+struct WitnessSort;
+
+impl<C: Compare<spillover::key::Keyed<usize, Vec<u8>>> + ?Sized>
+    ChunkSorter<spillover::key::Keyed<usize, Vec<u8>>, C> for WitnessSort
+{
+    fn sort(&self, items: &mut [spillover::key::Keyed<usize, Vec<u8>>], cmp: &C) {
+        let weight = items.iter().fold(0_u8, |total, entry| {
+            total.saturating_add(entry.stored_key()[0]).min(63)
+        });
+        let scratch = if weight >= 63 {
+            vec![0_u8; 600]
+        } else {
+            Vec::new()
+        };
+        std::hint::black_box(&scratch);
+        Sequential.sort(items, cmp);
+        std::hint::black_box(scratch);
+    }
+}
+
+impl SortMemorySummary for WitnessSort {
+    type Summary = WitnessSummary;
+
+    fn summary(&self) -> WitnessSummary {
+        WitnessSummary(Box::new([0; 32]))
+    }
+
+    fn summary_allowance(&self, _: Option<&WitnessSummary>) -> (usize, usize) {
+        (32, 0)
+    }
+}
+
+impl SummarizeSortInput<u64> for WitnessSort {
+    fn summarize(&self, input: &u64) -> WitnessSummary {
+        let mut summary = Box::new([0; 32]);
+        summary[0] = u8::try_from((*input).min(63)).expect("capped weight fits");
+        WitnessSummary(summary)
+    }
+
+    fn summary_allowance_for(&self, _: &WitnessSummary, _: &u64) -> (usize, usize) {
+        (32, 0)
+    }
+}
+
+impl EstimateSortMemory<spillover::key::Keyed<usize, Vec<u8>>, WitnessSummary> for WitnessSort {
+    fn sort_memory(&self, _: usize, summary: &WitnessSummary) -> SortMemory {
+        let bytes = if summary.0[0] >= 63 { 600 } else { 0 };
+        SortMemory::temporary(bytes)
+    }
+}
+
+#[derive(Debug, Error)]
+enum WitnessError {
+    #[error("old rejected")]
+    OldRejected,
+    #[error("new rejected")]
+    NewRejected,
+    #[error("unexpected input {0}")]
+    UnexpectedInput(u64),
+    #[error("unexpected codec operation")]
+    UnexpectedOperation,
+}
+
+#[derive(Clone, Copy)]
+struct WitnessCodec;
+struct WitnessCursor<R>(std::marker::PhantomData<R>);
+struct WitnessWriter<W>(std::marker::PhantomData<W>);
+
+impl Codec for WitnessCodec {
+    type Error = WitnessError;
+    type Cursor<R: Read> = WitnessCursor<R>;
+
+    fn cursor<R: Read>(&self, _: R) -> Result<Self::Cursor<R>, Self::Error> {
+        Err(WitnessError::UnexpectedOperation)
+    }
+}
+
+impl KeyedCodec for WitnessCodec {
+    type Key = Vec<u8>;
+    type KeyedCursor<R: Read> = WitnessCursor<R>;
+
+    fn keyed_cursor<R: Read>(&self, _: R) -> Result<Self::KeyedCursor<R>, Self::Error> {
+        Err(WitnessError::UnexpectedOperation)
+    }
+}
+
+impl<R: Read> CodecCursor for WitnessCursor<R> {
+    type Record = u64;
+    type Error = WitnessError;
+
+    fn advance(&mut self) -> Result<bool, Self::Error> {
+        Err(WitnessError::UnexpectedOperation)
+    }
+
+    fn with_current<Output>(
+        &mut self,
+        _: impl FnOnce(&u64) -> Output,
+    ) -> Result<Output, Self::Error> {
+        Err(WitnessError::UnexpectedOperation)
+    }
+}
+
+impl<R: Read> KeyedCodecCursor<Vec<u8>> for WitnessCursor<R> {
+    fn current_key(&self) -> Result<Vec<u8>, Self::Error> {
+        Err(WitnessError::UnexpectedOperation)
+    }
+}
+
+impl EncodeKeyedRun<u64> for WitnessCodec {
+    type KeyedWriter<W: Write> = WitnessWriter<W>;
+
+    fn keyed_writer<W: Write>(&self, _: W) -> Self::KeyedWriter<W> {
+        WitnessWriter(std::marker::PhantomData)
+    }
+}
+
+impl<W: Write> KeyedCodecWriter<u64, Vec<u8>> for WitnessWriter<W> {
+    type Error = WitnessError;
+
+    fn write_keyed(
+        &mut self,
+        entry: spillover::key::Keyed<&u64, &Vec<u8>>,
+    ) -> Result<(), Self::Error> {
+        match **entry.item() {
+            32 => Err(WitnessError::OldRejected),
+            31 => Err(WitnessError::NewRejected),
+            value => Err(WitnessError::UnexpectedInput(value)),
+        }
+    }
+
+    fn finish(self) -> Result<(), Self::Error> {
+        Err(WitnessError::UnexpectedOperation)
+    }
+}
+
+#[test]
+fn keyed_from_inputs_preflushes_old_window_with_heap_and_scratch() {
+    // The two key heaps and sort scratch alone require 1112 bytes.
+    // On 64-bit layouts the singleton needs 329 bytes; omitting key heap
+    // or sort scratch from the pair leaves 712 or 625 bytes, respectively.
+    let mut merge_config = MergeConfig::default();
+    merge_config.write_buffer_bytes = 1;
+    let mut sorter = spillover::sorter::Builder::new()
+        .order(WitnessOrder)
+        .keyed_codec(WitnessCodec)
+        .chunk_sort(WitnessSort)
+        .merge_config(merge_config)
+        .memory_budget(ByteLimit::new(1100).from_inputs())
+        .build();
+
+    sorter.push(32_u64).expect("first input fits");
+    let result = sorter.push(31_u64);
+    assert!(
+        matches!(result, Err(MergeError::Codec(WitnessError::OldRejected))),
+        "expected old-window rejection, got {result:?}"
+    );
+}
+
 fn make_record(name: &[u8], seq: &[u8], qual: &[u8]) -> SeqRecord {
     SeqRecord::new(name, seq, qual)
 }

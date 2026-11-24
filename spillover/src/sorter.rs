@@ -839,6 +839,42 @@ impl<O, Cod, D, CS> Builder<HasOrder<O>, HasKeyedCodec<Cod>, ByteLimit, (), D, C
     }
 }
 
+impl<O, Cod, D, CS> Builder<HasOrder<O>, HasKeyedCodec<Cod>, ByteLimit<FromInputs>, (), D, CS> {
+    /// Build a byte-limited keyed sorter using input summaries.
+    #[must_use]
+    pub fn build<T>(self) -> Sorter<T, O, Cod, (), D, CS, Keyed, ByteLimit<FromInputs>>
+    where
+        T: GetSize,
+        Cod: KeyedCodec + EncodeKeyedRun<T> + EncodeKeyedRun<KeyedRecord<Cod>>,
+        O: DeriveKey<T, StoredKey = Cod::Key>
+            + EstimateKeyMemory<T>
+            + Compare<T>
+            + Compare<KeyedRecord<Cod>>,
+        CS: SummarizeSortInput<T>
+            + EstimateSortMemory<crate::key::Keyed<usize, Cod::Key>, CS::Summary>,
+        for<'a> CS: ChunkSorter<crate::key::Keyed<usize, Cod::Key>, KeyedEntryCompare<'a, T, O>>,
+        for<'a> &'a CS::Summary: std::ops::Add<&'a CS::Summary, Output = CS::Summary>,
+    {
+        let accumulator = OrderedAccumulator {
+            order: self.sort_key.0,
+            codec: self.codec.0,
+            chunk_sort: self.chunk_sort,
+            merge_config: self.config.merge,
+            runs: Vec::new(),
+            pending: Vec::new(),
+            accounting: None,
+        };
+        Sorter {
+            session: Session::new(OwnedBuffer::new(None), accumulator),
+            dedup: self.dedup,
+            flush: FlushStrategy::Bytes {
+                budget: self.flush.bytes,
+            },
+            _marker: std::marker::PhantomData,
+        }
+    }
+}
+
 type OrdinaryRecord<C> = <<C as Codec>::Cursor<BufReader<File>> as CodecCursor>::Record;
 type KeyedRecord<C> = <<C as KeyedCodec>::KeyedCursor<BufReader<File>> as CodecCursor>::Record;
 
@@ -951,6 +987,13 @@ mod binding {
         pub(super) derivation_scratch: usize,
     }
 
+    pub struct ChunkMemorySummary<S> {
+        pub(super) key: Option<super::KeyMemory>,
+        pub(super) prepared_heap: Option<usize>,
+        pub(super) missing_scratch: usize,
+        pub(super) algorithm: S,
+    }
+
     pub trait Binding<T, SK, Cod, Cmp, CS, M> {
         type Session;
     }
@@ -997,11 +1040,61 @@ mod binding {
     {
         type Session = Session<OwnedBuffer<T>, OrderedAccumulator<O, Cod, CS, ByteAccounting>>;
     }
+    impl<T, O, Cod: crate::codec::KeyedCodec, CS: super::SortMemorySummary>
+        Binding<T, O, Cod, (), CS, super::Keyed> for super::ByteLimit<super::FromInputs>
+    {
+        type Session = Session<
+            OwnedBuffer<T>,
+            OrderedAccumulator<O, Cod, CS, Option<ChunkMemorySummary<CS::Summary>>>,
+        >;
+    }
 }
 
 use binding::{
-    ByteAccounting, OrderedAccumulator, OwnedBuffer, RunAccumulator, Session, UnkeyedAccumulator,
+    ByteAccounting, ChunkMemorySummary, OrderedAccumulator, OwnedBuffer, RunAccumulator, Session,
+    UnkeyedAccumulator,
 };
+
+impl<S> std::ops::Add for &ChunkMemorySummary<S>
+where
+    for<'a> &'a S: std::ops::Add<&'a S, Output = S>,
+{
+    type Output = ChunkMemorySummary<S>;
+
+    fn add(self, incoming: Self) -> Self::Output {
+        let key = self.key.as_ref().and_then(|left| {
+            let right = incoming.key.as_ref()?;
+            let heap = left
+                .retained_heap_bytes()
+                .checked_add(right.retained_heap_bytes())?;
+            let scratch = left
+                .derivation_scratch_bytes()
+                .max(right.derivation_scratch_bytes());
+            Some(KeyMemory::retained_heap(heap).with_derivation_scratch(scratch))
+        });
+        ChunkMemorySummary {
+            key,
+            prepared_heap: self
+                .prepared_heap
+                .and_then(|n| n.checked_add(incoming.prepared_heap?)),
+            missing_scratch: self.missing_scratch.max(incoming.missing_scratch),
+            algorithm: &self.algorithm + &incoming.algorithm,
+        }
+    }
+}
+
+impl<S> Accounting for Option<ChunkMemorySummary<S>> {
+    fn prepared(&mut self) {
+        if let Some(summary) = self {
+            summary.prepared_heap = summary.key.as_ref().map(KeyMemory::retained_heap_bytes);
+            summary.missing_scratch = 0;
+        }
+    }
+
+    fn retire(&mut self) {
+        *self = None;
+    }
+}
 
 fn summary_envelope((heap, scratch): (usize, usize)) -> usize {
     heap.checked_mul(3)
@@ -1026,28 +1119,159 @@ where
     }
 }
 
+impl<T, O, C, CS> MeasureMemory<T>
+    for OrderedAccumulator<O, C, CS, Option<ChunkMemorySummary<CS::Summary>>>
+where
+    C: KeyedCodec,
+    O: EstimateKeyMemory<T>,
+    CS: SummarizeSortInput<T>,
+{
+    type Summary = ChunkMemorySummary<CS::Summary>;
+
+    fn memory_summary(&self, input: &T) -> Self::Summary {
+        let key = self.order.estimate_key_memory(input);
+        let missing_scratch = key.derivation_scratch_bytes();
+        let algorithm = self.chunk_sort.summarize(input);
+        ChunkMemorySummary {
+            key: Some(key),
+            prepared_heap: Some(0),
+            missing_scratch,
+            algorithm,
+        }
+    }
+}
+
 struct MeasuredInput<T, S> {
     input: T,
     heap: usize,
     summary: S,
 }
 
-impl<T, O, C, CS> Session<OwnedBuffer<T>, UnkeyedAccumulator<O, C, CS, Option<CS::Summary>>>
+trait ContextualMemory<T>: MeasureMemory<T> {
+    fn current_summary(&self) -> Option<&Self::Summary>;
+    fn empty_summary(&self) -> Self::Summary;
+    fn allowance_for(&self, current: &Self::Summary, input: &T) -> (usize, usize);
+    fn allowance(&self, current: &Self::Summary) -> (usize, usize);
+    fn retained_workspace(&self, count: usize) -> usize;
+    fn evaluate_peak(&self, memory: &BufferMemory, summary: &Self::Summary) -> usize;
+    fn install_summary(&mut self, summary: Self::Summary);
+}
+
+impl<T, O, C, CS> ContextualMemory<T> for UnkeyedAccumulator<O, C, CS, Option<CS::Summary>>
 where
-    T: GetSize,
-    C: Codec + EncodeRun<T> + EncodeRun<OrdinaryRecord<C>>,
-    O: Compare<T> + Compare<OrdinaryRecord<C>>,
-    CS: ChunkSorter<T, O> + SummarizeSortInput<T> + EstimateSortMemory<T, CS::Summary>,
-    for<'a> &'a CS::Summary: std::ops::Add<&'a CS::Summary, Output = CS::Summary>,
+    CS: SummarizeSortInput<T> + EstimateSortMemory<T, CS::Summary>,
 {
-    fn guard(&self, heap: usize, allowance: (usize, usize)) -> usize {
-        let storage = self.buffer.storage_memory(0, 0);
-        let retained = self.accumulator.accounting.as_ref().map_or(0, |summary| {
-            self.accumulator
-                .chunk_sort
-                .sort_memory(self.buffer.len(), summary)
+    fn current_summary(&self) -> Option<&Self::Summary> {
+        self.accounting.as_ref()
+    }
+
+    fn empty_summary(&self) -> Self::Summary {
+        self.chunk_sort.summary()
+    }
+
+    fn allowance_for(&self, current: &Self::Summary, input: &T) -> (usize, usize) {
+        self.chunk_sort.summary_allowance_for(current, input)
+    }
+
+    fn allowance(&self, current: &Self::Summary) -> (usize, usize) {
+        self.chunk_sort.summary_allowance(Some(current))
+    }
+
+    fn retained_workspace(&self, count: usize) -> usize {
+        self.accounting.as_ref().map_or(0, |summary| {
+            self.chunk_sort.sort_memory(count, summary).retained_bytes()
+        })
+    }
+
+    fn evaluate_peak(&self, memory: &BufferMemory, summary: &Self::Summary) -> usize {
+        let sort = self.chunk_sort.sort_memory(memory.item_count, summary);
+        unkeyed_peak(memory, &sort, self.merge_config.write_buffer_bytes)
+    }
+
+    fn install_summary(&mut self, summary: Self::Summary) {
+        self.accounting = Some(summary);
+    }
+}
+
+impl<T, O, C, CS> ContextualMemory<T>
+    for OrderedAccumulator<O, C, CS, Option<ChunkMemorySummary<CS::Summary>>>
+where
+    C: KeyedCodec,
+    O: EstimateKeyMemory<T>,
+    CS: SummarizeSortInput<T> + EstimateSortMemory<crate::key::Keyed<usize, C::Key>, CS::Summary>,
+{
+    fn current_summary(&self) -> Option<&Self::Summary> {
+        self.accounting.as_ref()
+    }
+
+    fn empty_summary(&self) -> Self::Summary {
+        ChunkMemorySummary {
+            key: Some(KeyMemory::NONE),
+            prepared_heap: Some(0),
+            missing_scratch: 0,
+            algorithm: self.chunk_sort.summary(),
+        }
+    }
+
+    fn allowance_for(&self, current: &Self::Summary, input: &T) -> (usize, usize) {
+        self.chunk_sort
+            .summary_allowance_for(&current.algorithm, input)
+    }
+
+    fn allowance(&self, current: &Self::Summary) -> (usize, usize) {
+        self.chunk_sort.summary_allowance(Some(&current.algorithm))
+    }
+
+    fn retained_workspace(&self, count: usize) -> usize {
+        let entries = Layout::array::<crate::key::Keyed<usize, C::Key>>(self.pending.len())
+            .map_or(usize::MAX, |layout| layout.size());
+        let Some(summary) = self.accounting.as_ref() else {
+            return usize::MAX;
+        };
+        let keys = summary.prepared_heap.unwrap_or(usize::MAX);
+        let workspace = {
+            self.chunk_sort
+                .sort_memory(count, &summary.algorithm)
                 .retained_bytes()
-        });
+        };
+        entries.saturating_add(keys).saturating_add(workspace)
+    }
+
+    fn evaluate_peak(&self, memory: &BufferMemory, summary: &Self::Summary) -> usize {
+        let prepared = summary.prepared_heap;
+        let missing = summary
+            .key
+            .as_ref()
+            .and_then(|key| key.retained_heap_bytes().checked_sub(prepared?));
+        if self.pending.len() > memory.item_count
+            || (self.accounting.is_none() && !self.pending.is_empty())
+        {
+            return usize::MAX;
+        }
+        let keys = KeyPhaseMemory {
+            retained: prepared,
+            missing,
+            scratch: summary.missing_scratch,
+        };
+        let sort = self
+            .chunk_sort
+            .sort_memory(memory.item_count, &summary.algorithm);
+        self.keyed_peak_with_sort(memory, &keys, || sort)
+            .unwrap_or(usize::MAX)
+    }
+
+    fn install_summary(&mut self, summary: Self::Summary) {
+        self.accounting = Some(summary);
+    }
+}
+
+impl<T, A> Session<OwnedBuffer<T>, A> {
+    fn guard(&self, heap: usize, allowance: (usize, usize)) -> usize
+    where
+        A: ContextualMemory<T>,
+    {
+        let storage = self.buffer.storage_memory(0, 0);
+        let retained = self.accumulator.retained_workspace(self.buffer.len());
         storage
             .spill_peak_bytes
             .saturating_add(heap)
@@ -1059,9 +1283,12 @@ where
         &self,
         additional_items: usize,
         heap: usize,
-        summary: &CS::Summary,
+        summary: &A::Summary,
         summary_heap: usize,
-    ) -> usize {
+    ) -> usize
+    where
+        A: ContextualMemory<T>,
+    {
         let storage = self.buffer.storage_memory(additional_items, heap);
         let insertion_summaries = if additional_items == 0 {
             summary_heap
@@ -1075,47 +1302,36 @@ where
                 .saturating_add(insertion_summaries),
             storage.spill_peak_bytes.saturating_add(summary_heap),
         );
-        let sort = self
-            .accumulator
-            .chunk_sort
-            .sort_memory(report.item_count, summary);
-        unkeyed_peak(
-            &report,
-            &sort,
-            self.accumulator.merge_config.write_buffer_bytes,
-        )
+        self.accumulator.evaluate_peak(&report, summary)
     }
 
-    fn push_contextual(&mut self, item: T, budget: usize) -> Result<(), MergeError<C::Error>> {
+    fn push_contextual(&mut self, item: T, budget: usize) -> Result<(), A::Error>
+    where
+        T: GetSize,
+        A: ContextualMemory<T> + AccumulateItems<T>,
+        for<'a> &'a A::Summary: std::ops::Add<&'a A::Summary, Output = A::Summary>,
+    {
         let heap = item.get_heap_size();
         let mut empty = None;
-        if self.accumulator.accounting.is_none() {
+        if self.accumulator.current_summary().is_none() {
             debug_assert!(self.buffer.is_empty());
-            empty = Some(self.accumulator.chunk_sort.summary());
+            empty = Some(self.accumulator.empty_summary());
         }
         let current = self
             .accumulator
-            .accounting
-            .as_ref()
+            .current_summary()
             .or(empty.as_ref())
             .expect("configured summary");
-        let mut allowance = self
-            .accumulator
-            .chunk_sort
-            .summary_allowance_for(current, &item);
+        let mut allowance = self.accumulator.allowance_for(current, &item);
         if !self.buffer.is_empty() && self.guard(heap, allowance) >= budget {
             self.commit()?;
-            let fresh = self.accumulator.chunk_sort.summary();
-            allowance = self
-                .accumulator
-                .chunk_sort
-                .summary_allowance_for(&fresh, &item);
+            let fresh = self.accumulator.empty_summary();
+            allowance = self.accumulator.allowance_for(&fresh, &item);
             empty = Some(fresh);
         }
         let current = self
             .accumulator
-            .accounting
-            .as_ref()
+            .current_summary()
             .or(empty.as_ref())
             .expect("configured summary");
         let summary = self.accumulator.memory_summary(&item);
@@ -1129,7 +1345,7 @@ where
         if !self.buffer.is_empty() && peak >= budget {
             drop(joined);
             self.commit()?;
-            let fresh = self.accumulator.chunk_sort.summary();
+            let fresh = self.accumulator.empty_summary();
             joined = &fresh + &measured.summary;
             empty = Some(fresh);
         }
@@ -1150,17 +1366,19 @@ where
         drop(empty);
         let current = self
             .accumulator
-            .accounting
-            .as_ref()
+            .current_summary()
             .expect("inserted summary");
-        let allowance = self.accumulator.chunk_sort.summary_allowance(Some(current));
+        let allowance = self.accumulator.allowance(current);
         if self.contextual_peak(0, 0, current, allowance.0) >= budget {
             self.commit()?;
         }
         Ok(())
     }
 
-    fn insert_measured(&mut self, measured: MeasuredInput<T, CS::Summary>) {
+    fn insert_measured(&mut self, measured: MeasuredInput<T, A::Summary>)
+    where
+        A: ContextualMemory<T>,
+    {
         let MeasuredInput {
             input,
             heap,
@@ -1169,7 +1387,7 @@ where
         self.buffer.reserve_for_push();
         self.buffer.extend([input]);
         self.buffer.active_bytes = self.buffer.active_bytes.saturating_add(heap);
-        self.accumulator.accounting = Some(summary);
+        self.accumulator.install_summary(summary);
     }
 }
 
@@ -2273,18 +2491,42 @@ where
     }
 }
 
+struct KeyPhaseMemory {
+    retained: Option<usize>,
+    missing: Option<usize>,
+    scratch: usize,
+}
+
 impl<O, C: KeyedCodec, CS> OrderedAccumulator<O, C, CS, ByteAccounting>
 where
     CS: EstimateSortMemory<crate::key::Keyed<usize, C::Key>>,
 {
     fn keyed_peak(&self, memory: &BufferMemory, accounting: &ByteAccounting) -> Option<usize> {
+        let keys = KeyPhaseMemory {
+            retained: accounting.retained_keys,
+            missing: accounting.missing_keys,
+            scratch: accounting.derivation_scratch,
+        };
+        self.keyed_peak_with_sort(memory, &keys, || {
+            self.chunk_sort.sort_memory(memory.item_count, &())
+        })
+    }
+}
+
+impl<O, C: KeyedCodec, CS, A> OrderedAccumulator<O, C, CS, A> {
+    fn keyed_peak_with_sort(
+        &self,
+        memory: &BufferMemory,
+        keys: &KeyPhaseMemory,
+        sort_memory: impl FnOnce() -> crate::chunk::SortMemory,
+    ) -> Option<usize> {
         let count = memory.item_count;
         let entries = &self.pending;
         let existing_entries = Layout::array::<crate::key::Keyed<usize, C::Key>>(entries.len())
             .ok()?
             .size();
-        let retained_keys = accounting.retained_keys?;
-        let sort_memory = self.chunk_sort.sort_memory(count, &());
+        let retained_keys = keys.retained?;
+        let sort_memory = sort_memory();
         let workspace = sort_memory.retained_bytes();
         let insertion = memory
             .insertion_peak_bytes
@@ -2311,14 +2553,14 @@ where
         };
         let base = memory.spill_peak_bytes.checked_add(workspace)?;
         let existing_key_heap = retained_keys;
-        let all_key_heap = retained_keys.checked_add(accounting.missing_keys?)?;
+        let all_key_heap = retained_keys.checked_add(keys.missing?)?;
         let reserve = base
             .checked_add(entry_preparation)?
             .checked_add(existing_key_heap)?;
         let completed = base
             .checked_add(completed_entries)?
             .checked_add(all_key_heap)?;
-        let derive = completed.checked_add(accounting.derivation_scratch)?;
+        let derive = completed.checked_add(keys.scratch)?;
         let sorting = completed.checked_add(sort_memory.scratch_bytes())?;
         let writing = completed.checked_add(self.merge_config.write_buffer_bytes)?;
         Some(insertion.max(reserve).max(derive).max(sorting).max(writing))
@@ -2523,6 +2765,42 @@ where
         let dedup = self.dedup;
         let merged = self.session.finish()?;
         Ok(Sorted::new(dedup.dedup(merged)))
+    }
+}
+
+impl<T, O, C, D, CS> Sorter<T, O, C, (), D, CS, Keyed, ByteLimit<FromInputs>>
+where
+    T: GetSize,
+    C: KeyedCodec + EncodeKeyedRun<T> + EncodeKeyedRun<KeyedRecord<C>>,
+    O: DeriveKey<T, StoredKey = C::Key>
+        + EstimateKeyMemory<T>
+        + Compare<T>
+        + Compare<KeyedRecord<C>>,
+    CS: SummarizeSortInput<T> + EstimateSortMemory<crate::key::Keyed<usize, C::Key>, CS::Summary>,
+    for<'a> CS: ChunkSorter<crate::key::Keyed<usize, C::Key>, KeyedEntryCompare<'a, T, O>>,
+    for<'a> &'a CS::Summary: std::ops::Add<&'a CS::Summary, Output = CS::Summary>,
+{
+    /// Add an owned input.
+    ///
+    /// # Errors
+    /// Returns an error if completing a run fails.
+    pub fn push(&mut self, item: T) -> Result<(), MergeError<C::Error>> {
+        let FlushStrategy::Bytes { budget } = self.flush else {
+            unreachable!()
+        };
+        self.session.push_contextual(item, budget)
+    }
+
+    /// Finish the sorted output.
+    ///
+    /// # Errors
+    /// Returns an error if spilling or initializing the merge fails.
+    pub fn finish(self) -> Result<OrderedOutput<C, O, D>, MergeError<C::Error>>
+    where
+        D: Dedup<KeyedRunMerge<C, O, (), Keyed>>,
+    {
+        let merged = self.session.finish()?;
+        Ok(Sorted::new(self.dedup.dedup(merged)))
     }
 }
 
