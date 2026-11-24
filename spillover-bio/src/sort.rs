@@ -1069,7 +1069,11 @@ impl<SK, Cod, Cmp, CS>
     >
 where
     SK: SortKey<SeqRecord> + Copy + Send + Sync + 'static,
-    Cod: KeyedCodec + EncodeKeyedRun<SeqRecord> + Copy + 'static,
+    Cod: KeyedCodec
+        + EncodeKeyedRun<SeqRecord>
+        + spillover::codec::DeriveKey<SeqRecord>
+        + Copy
+        + 'static,
     Cod: EncodeKeyedRun<<<Cod as KeyedCodec>::KeyedCursor<BufReader<File>> as CodecCursor>::Record>,
     Cmp: for<'a> Compare<SK::Key<'a>> + Compare<Cod::Key> + Copy + Send + Sync + 'static,
     KeyCompare<SK, Cmp>:
@@ -1367,7 +1371,7 @@ impl<SK, C, L, CS, S, M> Builder<CoreBuilder<SK, L, CS>, C, S, M> {
 // build() for keyed sort orders.
 
 type NativeKeyedCodec<O, C> = KeyedDryIceCodec<
-    O,
+    <O as RecordKeyer>::RecordKey,
     <C as sealed::ResolveCodec>::S,
     <C as sealed::ResolveCodec>::Q,
     <C as sealed::ResolveCodec>::N,
@@ -1399,9 +1403,8 @@ macro_rules! owned_keyed_builder {
             /// Build the configured owned keyed sorter.
             #[must_use]
             pub fn build(self) -> NativeSorter<O, NativeKeyedCodec<O, C>, CS, $limit> {
-                let record_keyer = *self.core.configured_order();
                 let codec = self.codec.resolve();
-                let keyed_codec = codec.with_record_keyer(record_keyer);
+                let keyed_codec: NativeKeyedCodec<O, C> = codec.with_record_key();
                 let inner = self.core.keyed_codec(keyed_codec).build();
                 Sorter {
                     inner: OwnedBackend { inner, _types: std::marker::PhantomData },
@@ -1788,9 +1791,8 @@ where
     /// Build an item-limited keyed sorter over the selected arena.
     #[must_use]
     pub fn build(self) -> NativeArenaKeyed<'a, O, NativeKeyedCodec<O, C>, CS> {
-        let record_keyer = *self.core.configured_order();
         let codec = self.codec.resolve();
-        let keyed_codec = codec.with_record_keyer(record_keyer);
+        let keyed_codec: NativeKeyedCodec<O, C> = codec.with_record_key();
         let storage = self.storage.arena;
         let builder = self.core.keyed_codec(keyed_codec);
         let build_keyed_in: fn(_, &'a mut SeqRecordArena) -> _ =
@@ -1837,9 +1839,8 @@ where
     /// Build a measured keyed sorter using the arena.
     #[must_use]
     pub fn build(self) -> NativeMeasuredArenaKeyed<'a, O, NativeKeyedCodec<O, C>, CS> {
-        let record_keyer = *self.core.configured_order();
         let codec = self.codec.resolve();
-        let keyed_codec = codec.with_record_keyer(record_keyer);
+        let keyed_codec: NativeKeyedCodec<O, C> = codec.with_record_key();
         let storage = self.storage.arena;
         let builder = self.core.keyed_codec(keyed_codec);
         let build_keyed_measured_in: fn(_, &'a mut SeqRecordArena) -> _ =

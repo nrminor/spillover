@@ -262,6 +262,30 @@ struct ScoredRecord {
 #[derive(Debug, PartialEq, Eq, PartialOrd, Ord)]
 struct StoredScore(u8);
 
+struct ScoreOrder;
+
+impl Compare<ScoredRecord> for ScoreOrder {
+    fn compare(&self, left: &ScoredRecord, right: &ScoredRecord) -> Ordering {
+        left.score
+            .cmp(&right.score)
+            .then_with(|| left.identity.cmp(&right.identity))
+    }
+}
+
+impl spillover::key::KeyedOrder for ScoreOrder {
+    type StoredKey = StoredScore;
+
+    fn compare_keys(&self, left: &StoredScore, right: &StoredScore) -> Ordering {
+        left.cmp(right)
+    }
+}
+
+impl spillover::key::DeriveKey<ScoredRecord> for ScoreOrder {
+    fn derive_key(&self, item: &ScoredRecord) -> StoredScore {
+        StoredScore(item.score)
+    }
+}
+
 #[derive(Clone, Copy)]
 struct ScoreCodec;
 
@@ -347,12 +371,6 @@ impl<R: Read> KeyedCodecCursor<StoredScore> for ScoreCursor<R> {
     }
 }
 
-impl DeriveKey<ScoredRecord> for ScoreCodec {
-    fn derive_key(&self, item: &ScoredRecord) -> StoredScore {
-        StoredScore(item.score)
-    }
-}
-
 impl EncodeKeyedRun<ScoredRecord> for ScoreCodec {
     type KeyedWriter<W: Write> = ScoreWriter<W>;
 
@@ -364,7 +382,12 @@ impl EncodeKeyedRun<ScoredRecord> for ScoreCodec {
 impl<W: Write> KeyedCodecWriter<ScoredRecord, StoredScore> for ScoreWriter<W> {
     type Error = ScoreCodecError;
 
-    fn write_keyed(&mut self, item: &ScoredRecord, key: &StoredScore) -> Result<(), Self::Error> {
+    fn write_keyed(
+        &mut self,
+        entry: spillover::key::Keyed<&ScoredRecord, &StoredScore>,
+    ) -> Result<(), Self::Error> {
+        let item = *entry.item();
+        let key = *entry.stored_key();
         let expected = match item.identity {
             b'a' => 9,
             b'b' => 8,
@@ -401,9 +424,8 @@ fn keyed_merge_preserves_original_keys_across_multiple_spill_generations() {
     let mut merge_config = MergeConfig::default();
     let max_fan_in = NonZeroUsize::new(2).expect("two is nonzero");
     merge_config.max_fan_in = max_fan_in;
-    let sort_key = Owned(|record: &ScoredRecord| record.score);
     let mut sorter = spillover::sorter::Builder::new()
-        .key(sort_key)
+        .order(ScoreOrder)
         .keyed_codec(ScoreCodec)
         .merge_config(merge_config)
         .max_buffer_items(1)
@@ -699,7 +721,9 @@ impl EncodeKeyedRun<Number> for DistinctProjectionCodec {
 impl<W: Write> KeyedCodecWriter<Number, u8> for KeyedNumberWriter<W> {
     type Error = io::Error;
 
-    fn write_keyed(&mut self, item: &Number, key: &u8) -> io::Result<()> {
+    fn write_keyed(&mut self, entry: spillover::key::Keyed<&Number, &u8>) -> io::Result<()> {
+        let item = *entry.item();
+        let key = *entry.stored_key();
         let encoded = [item.0, *key];
         self.0.write_all(&encoded)
     }

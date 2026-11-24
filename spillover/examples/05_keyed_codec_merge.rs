@@ -19,7 +19,9 @@ struct Writer<W: Write> {
 impl<W: Write> KeyedCodecWriter<u64, u8> for Writer<W> {
     type Error = std::io::Error;
 
-    fn write_keyed(&mut self, item: &u64, key: &u8) -> Result<(), Self::Error> {
+    fn write_keyed(&mut self, entry: spillover::key::Keyed<&u64, &u8>) -> Result<(), Self::Error> {
+        let item = *entry.item();
+        let key = *entry.stored_key();
         self.inner.write_all(&[*key])?;
         self.inner.write_all(&item.to_le_bytes())
     }

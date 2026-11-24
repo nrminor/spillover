@@ -228,14 +228,14 @@ where
         project_record: impl Fn(&Yield) -> &Record,
     ) -> MergeResult<SortedRun, C::Error>
     where
-        C: EncodeKeyedRun<Record>,
+        C: EncodeKeyedRun<Record> + crate::codec::DeriveKey<Record>,
     {
         self.write_with(|writer: &mut C::KeyedWriter<&mut RunWriterStream>| {
             for item in items {
                 let record = project_record(&item);
                 let key = self.codec.derive_key(record);
                 writer
-                    .write_keyed(record, &key)
+                    .write_keyed(crate::key::Keyed::trusted(record, &key))
                     .map_err(MergeError::Codec)?;
             }
             Ok(())
@@ -244,15 +244,15 @@ where
 
     pub(crate) fn write_supplied<'item, Record: ?Sized + 'item>(
         &self,
-        items: impl IntoIterator<Item = (&'item Record, &'item C::Key)>,
+        items: impl IntoIterator<Item = crate::key::Keyed<&'item Record, &'item C::Key>>,
     ) -> MergeResult<SortedRun, C::Error>
     where
         C: EncodeKeyedRun<Record>,
         C::Key: 'item,
     {
         self.write_with(|writer: &mut C::KeyedWriter<&mut RunWriterStream>| {
-            for (record, key) in items {
-                writer.write_keyed(record, key).map_err(MergeError::Codec)?;
+            for record in items {
+                writer.write_keyed(record).map_err(MergeError::Codec)?;
             }
             Ok(())
         })
@@ -383,7 +383,7 @@ impl<C: KeyedCodec, Cmp> RunMerger<C, Cmp> {
         items: impl IntoIterator<Item = I>,
     ) -> MergeResult<SortedRun, C::Error>
     where
-        C: EncodeKeyedRun<I>,
+        C: EncodeKeyedRun<I> + crate::codec::DeriveKey<I>,
     {
         let run_writer = RunWriter::new_keyed(self.codec, &self.config);
         run_writer.write_sorted(items, |item| item)
@@ -657,7 +657,10 @@ where
         loop {
             let delivered = execution
                 .next_with(|state, winner| {
-                    state.with_record(winner, |record| writer.write_keyed(record, &winner.key))
+                    state.with_record(winner, |record| {
+                        let entry = crate::key::Keyed::trusted(record, &winner.key);
+                        writer.write_keyed(entry)
+                    })
                 })
                 .map_err(intermediate_error)?;
             if delivered.is_none() {
@@ -1193,7 +1196,9 @@ mod tests {
     impl<W: Write> KeyedCodecWriter<u64, u8> for U64OnlyKeyedWriter<W> {
         type Error = std::io::Error;
 
-        fn write_keyed(&mut self, item: &u64, key: &u8) -> Result<(), Self::Error> {
+        fn write_keyed(&mut self, entry: crate::key::Keyed<&u64, &u8>) -> Result<(), Self::Error> {
+            let item = *entry.item();
+            let key = *entry.stored_key();
             self.inner.write_all(&[*key])?;
             self.inner.write_all(&item.to_le_bytes())
         }
@@ -1206,7 +1211,12 @@ mod tests {
     impl<W: Write> KeyedCodecWriter<U64View, u8> for U64OnlyKeyedWriter<W> {
         type Error = std::io::Error;
 
-        fn write_keyed(&mut self, item: &U64View, key: &u8) -> Result<(), Self::Error> {
+        fn write_keyed(
+            &mut self,
+            entry: crate::key::Keyed<&U64View, &u8>,
+        ) -> Result<(), Self::Error> {
+            let item = *entry.item();
+            let key = *entry.stored_key();
             self.inner.write_all(&[*key])?;
             self.inner.write_all(&item.0.to_le_bytes())
         }

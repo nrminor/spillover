@@ -232,7 +232,7 @@ pub trait KeyedCodecWriter<I: ?Sized, K> {
     /// # Errors
     ///
     /// Returns an error if encoding or writing fails.
-    fn write_keyed(&mut self, item: &I, key: &K) -> Result<(), Self::Error>;
+    fn write_keyed(&mut self, record: crate::key::Keyed<&I, &K>) -> Result<(), Self::Error>;
 
     /// Flush any buffered data and finalize.
     ///
@@ -304,11 +304,12 @@ pub trait KeyedCodec: Codec {
     fn keyed_cursor<R: Read>(&self, source: R) -> Result<Self::KeyedCursor<R>, Self::Error>;
 }
 
-/// Capability for deriving a keyed codec's stored key from a write-side item.
+/// Legacy capability for deriving a keyed codec's stored key from a write-side item.
 ///
 /// This is separate from [`KeyedCodec`] because the item written into a run need
 /// not be the same representation that the codec materializes when reading the
 /// run back. Allocation-conscious writers may implement it for borrowed records.
+/// Complete-order sorting derives keys through [`crate::key::DeriveKey`] instead.
 pub trait DeriveKey<I: ?Sized>: KeyedCodec {
     /// Derive the stored key for `item`.
     fn derive_key(&self, item: &I) -> Self::Key;
@@ -316,10 +317,8 @@ pub trait DeriveKey<I: ?Sized>: KeyedCodec {
 
 /// Capability for encoding write-side items into a keyed sorted run.
 ///
-/// This capability includes key derivation because writing a keyed run requires
-/// both serializing the item and storing the compact record key used during
-/// keyed merge.
-pub trait EncodeKeyedRun<I: ?Sized>: KeyedCodec + DeriveKey<I> {
+/// The writer receives an item paired with its already-derived stored key.
+pub trait EncodeKeyedRun<I: ?Sized>: KeyedCodec {
     /// A stateful writer that encodes `I` values with stored keys.
     type KeyedWriter<W: Write>: KeyedCodecWriter<I, Self::Key, Error = Self::Error>;
 

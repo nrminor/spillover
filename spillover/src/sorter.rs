@@ -234,15 +234,6 @@ impl<SK, Cod, D, CS> Builder<SK, Cod, NeedsLimit, (), D, CS> {
     }
 }
 
-impl<O, Cod, L, D, CS> Builder<HasOrder<O>, Cod, L, (), D, CS> {
-    /// Borrow the configured complete order.
-    #[doc(hidden)]
-    #[must_use]
-    pub fn configured_order(&self) -> &O {
-        &self.sort_key.0
-    }
-}
-
 impl<SK, Cod, Flush, Cmp, D, CS> Builder<SK, Cod, Flush, Cmp, D, CS> {
     /// Set the sort key extractor.
     #[must_use]
@@ -1625,6 +1616,7 @@ where
     SK: SortKey<T> + Copy + Send + Sync + 'static,
     Cod: KeyedCodec
         + EncodeKeyedRun<T>
+        + crate::codec::DeriveKey<T>
         + EncodeKeyedRun<<<Cod as KeyedCodec>::KeyedCursor<BufReader<File>> as CodecCursor>::Record>
         + Copy
         + 'static,
@@ -1900,6 +1892,7 @@ where
     SK: SortKey<T> + Copy + Send + Sync + 'static,
     Cod: KeyedCodec
         + EncodeKeyedRun<T>
+        + crate::codec::DeriveKey<T>
         + EncodeKeyedRun<<<Cod as KeyedCodec>::KeyedCursor<BufReader<File>> as CodecCursor>::Record>
         + Copy
         + 'static,
@@ -2390,7 +2383,9 @@ mod tests {
     impl<W: Write> KeyedCodecWriter<u64, u8> for U64OnlyKeyedWriter<W> {
         type Error = std::io::Error;
 
-        fn write_keyed(&mut self, item: &u64, key: &u8) -> Result<(), Self::Error> {
+        fn write_keyed(&mut self, entry: crate::key::Keyed<&u64, &u8>) -> Result<(), Self::Error> {
+            let item = *entry.item();
+            let key = *entry.stored_key();
             self.inner.write_all(&[*key])?;
             self.inner.write_all(&item.to_le_bytes())
         }

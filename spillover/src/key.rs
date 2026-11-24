@@ -24,7 +24,9 @@
 
 use std::cmp::Ordering;
 
-/// An item associated with the stored key derived from it.
+/// An item associated with its original stored key.
+///
+/// The key may have been preserved through encoding and decoding the item.
 pub struct Keyed<I, K> {
     item: I,
     stored_key: K,
@@ -47,7 +49,7 @@ impl<I, K> Keyed<I, K> {
         &self.item
     }
 
-    /// The key derived from the associated item.
+    /// The original stored key for the associated item.
     #[must_use]
     pub fn stored_key(&self) -> &K {
         &self.stored_key
@@ -59,6 +61,22 @@ impl<'item, I: ?Sized, K> Keyed<&'item I, K> {
     #[must_use]
     pub fn derive<O: DeriveKey<I, StoredKey = K> + ?Sized>(item: &'item I, order: &O) -> Self {
         Self::new(item, order)
+    }
+
+    /// Borrow the associated item and stored key together.
+    #[must_use]
+    pub fn borrowed(&self) -> Keyed<&I, &K> {
+        Keyed {
+            item: self.item,
+            stored_key: &self.stored_key,
+        }
+    }
+}
+
+impl<'item, I: ?Sized, K> Keyed<&'item I, &'item K> {
+    /// Pair a record with its key at a trusted source or merge boundary.
+    pub(crate) fn trusted(item: &'item I, stored_key: &'item K) -> Self {
+        Self { item, stored_key }
     }
 }
 
@@ -111,10 +129,10 @@ impl<'a, I, O: KeyedOrder> KeyedEntryCompare<'a, I, O> {
     pub(crate) fn ordered_records<'records>(
         &'records self,
         entries: &'records [Keyed<usize, O::StoredKey>],
-    ) -> impl Iterator<Item = (&'records I, &'records O::StoredKey)> + 'records {
+    ) -> impl Iterator<Item = Keyed<&'records I, &'records O::StoredKey>> + 'records {
         entries.iter().map(|entry| {
             let item = &self.items[*entry.item()];
-            (item, entry.stored_key())
+            Keyed::trusted(item, entry.stored_key())
         })
     }
 }
