@@ -58,6 +58,9 @@ pub struct HasSortKey<SK>(SK);
 
 /// Marker: a complete order has been selected.
 pub struct HasOrder<O>(O);
+/// Marker for a complete order that has not yet been selected.
+#[doc(hidden)]
+pub struct NeedsOrder;
 /// Marker: the complete-order path needs a limit.
 pub struct NeedsLimit;
 /// Maximum number of buffered items on the complete-order path.
@@ -162,6 +165,81 @@ impl Builder<NeedsSortKey, NeedsCodec, NeedsFlushStrategy> {
 impl Default for Builder<NeedsSortKey, NeedsCodec, NeedsFlushStrategy> {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+impl Builder<NeedsOrder, NeedsCodec, NeedsLimit, ()> {
+    /// Start constructing a complete-order builder.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn for_order() -> Self {
+        Builder {
+            sort_key: NeedsOrder,
+            codec: NeedsCodec,
+            flush: NeedsLimit,
+            compare: (),
+            dedup: Identity,
+            chunk_sort: Sequential,
+            config: SorterConfig::default(),
+        }
+    }
+}
+
+impl<Cod, L, D, CS> Builder<NeedsOrder, Cod, L, (), D, CS> {
+    /// Select the complete order, retaining the configured limit.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn select_order<O>(self, order: O) -> Builder<HasOrder<O>, Cod, L, (), D, CS> {
+        Builder {
+            sort_key: HasOrder(order),
+            codec: self.codec,
+            flush: self.flush,
+            compare: (),
+            dedup: self.dedup,
+            chunk_sort: self.chunk_sort,
+            config: self.config,
+        }
+    }
+}
+
+impl<SK, Cod, D, CS> Builder<SK, Cod, NeedsLimit, (), D, CS> {
+    /// Set the typed item limit without changing the order state.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn item_limit(self, limit: ItemLimit) -> Builder<SK, Cod, ItemLimit, (), D, CS> {
+        Builder {
+            sort_key: self.sort_key,
+            codec: self.codec,
+            flush: limit,
+            compare: (),
+            dedup: self.dedup,
+            chunk_sort: self.chunk_sort,
+            config: self.config,
+        }
+    }
+
+    /// Set the typed byte limit without changing the order state.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn byte_limit(self, limit: ByteLimit) -> Builder<SK, Cod, ByteLimit, (), D, CS> {
+        Builder {
+            sort_key: self.sort_key,
+            codec: self.codec,
+            flush: limit,
+            compare: (),
+            dedup: self.dedup,
+            chunk_sort: self.chunk_sort,
+            config: self.config,
+        }
+    }
+}
+
+impl<O, Cod, L, D, CS> Builder<HasOrder<O>, Cod, L, (), D, CS> {
+    /// Borrow the configured complete order.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn configured_order(&self) -> &O {
+        &self.sort_key.0
     }
 }
 
@@ -284,15 +362,8 @@ impl<O, Cod, D, CS> Builder<HasOrder<O>, Cod, NeedsLimit, (), D, CS> {
         self,
         max_items: usize,
     ) -> Builder<HasOrder<O>, Cod, ItemLimit, (), D, CS> {
-        Builder {
-            sort_key: self.sort_key,
-            codec: self.codec,
-            flush: ItemLimit { max_items },
-            compare: (),
-            dedup: self.dedup,
-            chunk_sort: self.chunk_sort,
-            config: self.config,
-        }
+        let limit = ItemLimit::new(max_items);
+        self.item_limit(limit)
     }
     /// Set the modeled byte budget for the complete-order path.
     #[must_use]
@@ -300,15 +371,8 @@ impl<O, Cod, D, CS> Builder<HasOrder<O>, Cod, NeedsLimit, (), D, CS> {
         self,
         budget: impl Into<ByteLimit>,
     ) -> Builder<HasOrder<O>, Cod, ByteLimit, (), D, CS> {
-        Builder {
-            sort_key: self.sort_key,
-            codec: self.codec,
-            flush: budget.into(),
-            compare: (),
-            dedup: self.dedup,
-            chunk_sort: self.chunk_sort,
-            config: self.config,
-        }
+        let limit = budget.into();
+        self.byte_limit(limit)
     }
 }
 
