@@ -20,7 +20,7 @@ use get_size2::GetSize;
 
 use crate::{
     SortedItemsError,
-    chunk::{ChunkSorter, EstimateSortMemory, Sequential},
+    chunk::{ChunkSorter, EstimateSortMemory, Sequential, SortMemorySummary, SummarizeSortInput},
     codec::{Codec, CodecCursor, EncodeKeyedRun, EncodeRun, KeyedCodec},
     compare::{Compare, Natural},
     dedup::{Dedup, Identity},
@@ -85,6 +85,9 @@ impl ItemLimit {
 /// Count-based algorithm workspace estimation.
 pub struct CountBased;
 
+/// Select input-summary-based workspace estimation.
+pub struct FromInputs;
+
 /// A byte budget for the modeled active window and initial spill.
 pub struct ByteLimit<M = CountBased> {
     bytes: usize,
@@ -97,6 +100,15 @@ impl ByteLimit {
     pub fn new(bytes: usize) -> Self {
         Self {
             bytes,
+            mode: std::marker::PhantomData,
+        }
+    }
+
+    /// Select input-summary estimation without changing the byte limit.
+    #[must_use]
+    pub fn from_inputs(self) -> ByteLimit<FromInputs> {
+        ByteLimit {
+            bytes: self.bytes,
             mode: std::marker::PhantomData,
         }
     }
@@ -221,7 +233,7 @@ impl<SK, Cod, D, CS> Builder<SK, Cod, NeedsLimit, (), D, CS> {
     /// Set the typed byte limit without changing the order state.
     #[doc(hidden)]
     #[must_use]
-    pub fn byte_limit(self, limit: ByteLimit) -> Builder<SK, Cod, ByteLimit, (), D, CS> {
+    pub fn byte_limit<M>(self, limit: ByteLimit<M>) -> Builder<SK, Cod, ByteLimit<M>, (), D, CS> {
         Builder {
             sort_key: self.sort_key,
             codec: self.codec,
@@ -358,11 +370,11 @@ impl<O, Cod, D, CS> Builder<HasOrder<O>, Cod, NeedsLimit, (), D, CS> {
     }
     /// Set the modeled byte budget for the complete-order path.
     #[must_use]
-    pub fn memory_budget(
+    pub fn memory_budget<M>(
         self,
-        budget: impl Into<ByteLimit>,
-    ) -> Builder<HasOrder<O>, Cod, ByteLimit, (), D, CS> {
-        let limit = budget.into();
+        budget: impl Into<ByteLimit<M>>,
+    ) -> Builder<HasOrder<O>, Cod, ByteLimit<M>, (), D, CS> {
+        let limit: ByteLimit<M> = budget.into();
         self.byte_limit(limit)
     }
 }
@@ -531,6 +543,7 @@ impl<O, Cod, D, CS> Builder<HasOrder<O>, HasCodec<Cod>, ItemLimit, (), D, CS> {
             chunk_sort: self.chunk_sort,
             merge_config: self.config.merge,
             runs: Vec::new(),
+            accounting: (),
         };
         Sorter {
             session: Session::new(OwnedBuffer::new(None), accumulator),
@@ -565,6 +578,7 @@ impl<O, Cod, D, CS> Builder<HasOrder<O>, HasCodec<Cod>, ItemLimit, (), D, CS> {
             chunk_sort: self.chunk_sort,
             merge_config: self.config.merge,
             runs: Vec::new(),
+            accounting: (),
         };
         Sorter {
             session: Session::new(holder, accumulator),
@@ -593,6 +607,7 @@ impl<O, Cod, D, CS> Builder<HasOrder<O>, HasCodec<Cod>, ByteLimit, (), D, CS> {
             chunk_sort: self.chunk_sort,
             merge_config: self.config.merge,
             runs: Vec::new(),
+            accounting: (),
         };
         Sorter {
             session: Session::new(OwnedBuffer::new(None), accumulator),
@@ -628,9 +643,44 @@ impl<O, Cod, D, CS> Builder<HasOrder<O>, HasCodec<Cod>, ByteLimit, (), D, CS> {
             chunk_sort: self.chunk_sort,
             merge_config: self.config.merge,
             runs: Vec::new(),
+            accounting: (),
         };
         Sorter {
             session: Session::new(holder, accumulator),
+            dedup: self.dedup,
+            flush: FlushStrategy::Bytes {
+                budget: self.flush.bytes,
+            },
+            _marker: std::marker::PhantomData,
+        }
+    }
+}
+
+impl<O, Cod, D, CS> Builder<HasOrder<O>, HasCodec<Cod>, ByteLimit<FromInputs>, (), D, CS> {
+    /// Build a sorter using input summaries.
+    pub fn build<T>(self) -> Sorter<T, O, Cod, (), D, CS, Unkeyed, ByteLimit<FromInputs>>
+    where
+        T: GetSize,
+        Cod: Codec + EncodeRun<T> + EncodeRun<OrdinaryRecord<Cod>>,
+        O: Compare<T> + Compare<OrdinaryRecord<Cod>>,
+        CS: ChunkSorter<T, O>
+            + SummarizeSortInput<T>
+            + EstimateSortMemory<T, <CS as SortMemorySummary>::Summary>,
+        for<'a> &'a <CS as SortMemorySummary>::Summary: std::ops::Add<
+                &'a <CS as SortMemorySummary>::Summary,
+                Output = <CS as SortMemorySummary>::Summary,
+            >,
+    {
+        let accumulator = UnkeyedAccumulator {
+            order: self.sort_key.0,
+            codec: self.codec.0,
+            chunk_sort: self.chunk_sort,
+            merge_config: self.config.merge,
+            runs: Vec::new(),
+            accounting: None,
+        };
+        Sorter {
+            session: Session::new(OwnedBuffer::new(None), accumulator),
             dedup: self.dedup,
             flush: FlushStrategy::Bytes {
                 budget: self.flush.bytes,
@@ -884,12 +934,13 @@ mod binding {
         pub(super) accounting: A,
     }
 
-    pub struct UnkeyedAccumulator<O, C, CS> {
+    pub struct UnkeyedAccumulator<O, C, CS, A = ()> {
         pub(super) order: O,
         pub(super) codec: C,
         pub(super) chunk_sort: CS,
         pub(super) merge_config: MergeConfig,
         pub(super) runs: Vec<SortedRun>,
+        pub(super) accounting: A,
     }
 
     #[derive(Clone)]
@@ -919,6 +970,11 @@ mod binding {
     impl<T, O, Cod, CS> Binding<T, O, Cod, (), CS, super::Unkeyed> for super::ByteLimit {
         type Session = Session<OwnedBuffer<T>, UnkeyedAccumulator<O, Cod, CS>>;
     }
+    impl<T, O, Cod, CS: super::SortMemorySummary> Binding<T, O, Cod, (), CS, super::Unkeyed>
+        for super::ByteLimit<super::FromInputs>
+    {
+        type Session = Session<OwnedBuffer<T>, UnkeyedAccumulator<O, Cod, CS, Option<CS::Summary>>>;
+    }
     impl<B, O, C, CS> Binding<(), O, C, (), CS, super::Unkeyed> for super::ArenaBuffer<'_, B> {
         type Session = Session<Self, UnkeyedAccumulator<O, C, CS>>;
     }
@@ -946,6 +1002,165 @@ mod binding {
 use binding::{
     ByteAccounting, OrderedAccumulator, OwnedBuffer, RunAccumulator, Session, UnkeyedAccumulator,
 };
+
+fn summary_envelope((heap, scratch): (usize, usize)) -> usize {
+    heap.checked_mul(3)
+        .and_then(|n| n.checked_add(scratch))
+        .unwrap_or(usize::MAX)
+}
+
+impl<T, O, C, CS> Session<OwnedBuffer<T>, UnkeyedAccumulator<O, C, CS, Option<CS::Summary>>>
+where
+    T: GetSize,
+    C: Codec + EncodeRun<T> + EncodeRun<OrdinaryRecord<C>>,
+    O: Compare<T> + Compare<OrdinaryRecord<C>>,
+    CS: ChunkSorter<T, O> + SummarizeSortInput<T> + EstimateSortMemory<T, CS::Summary>,
+    for<'a> &'a CS::Summary: std::ops::Add<&'a CS::Summary, Output = CS::Summary>,
+{
+    fn guard(&self, heap: usize, allowance: (usize, usize)) -> usize {
+        let storage = self.buffer.storage_memory(0);
+        let retained = self.accumulator.accounting.as_ref().map_or(0, |summary| {
+            self.accumulator
+                .chunk_sort
+                .sort_memory(self.buffer.len(), summary)
+                .retained_bytes()
+        });
+        storage
+            .spill_peak_bytes
+            .saturating_add(self.buffer.active_bytes)
+            .saturating_add(heap)
+            .saturating_add(retained)
+            .saturating_add(summary_envelope(allowance))
+    }
+
+    fn contextual_peak(
+        &self,
+        additional_items: usize,
+        heap: usize,
+        summary: &CS::Summary,
+        summary_heap: usize,
+    ) -> usize {
+        let storage = self.buffer.storage_memory(additional_items);
+        let payload = self.buffer.active_bytes.saturating_add(heap);
+        let insertion_summaries = if additional_items == 0 {
+            summary_heap
+        } else {
+            summary_heap.saturating_mul(2)
+        };
+        let report = BufferMemory::new(
+            storage.item_count,
+            storage
+                .insertion_peak_bytes
+                .saturating_add(payload)
+                .saturating_add(insertion_summaries),
+            storage
+                .spill_peak_bytes
+                .saturating_add(payload)
+                .saturating_add(summary_heap),
+        );
+        let sort = self
+            .accumulator
+            .chunk_sort
+            .sort_memory(report.item_count, summary);
+        unkeyed_peak(
+            &report,
+            &sort,
+            self.accumulator.merge_config.write_buffer_bytes,
+        )
+    }
+
+    fn push_contextual(&mut self, item: T, budget: usize) -> Result<(), MergeError<C::Error>> {
+        let heap = item.get_heap_size();
+        let mut empty = None;
+        if self.accumulator.accounting.is_none() {
+            debug_assert!(self.buffer.is_empty());
+            empty = Some(self.accumulator.chunk_sort.summary());
+        }
+        let current = self
+            .accumulator
+            .accounting
+            .as_ref()
+            .or(empty.as_ref())
+            .expect("configured summary");
+        let mut allowance = self
+            .accumulator
+            .chunk_sort
+            .summary_allowance_for(current, &item);
+        if !self.buffer.is_empty() && self.guard(heap, allowance) >= budget {
+            self.commit()?;
+            let fresh = self.accumulator.chunk_sort.summary();
+            allowance = self
+                .accumulator
+                .chunk_sort
+                .summary_allowance_for(&fresh, &item);
+            empty = Some(fresh);
+        }
+        let current = self
+            .accumulator
+            .accounting
+            .as_ref()
+            .or(empty.as_ref())
+            .expect("configured summary");
+        let incoming = self.accumulator.chunk_sort.summarize(&item);
+        let mut joined = current + &incoming;
+        let peak = self.contextual_peak(1, heap, &joined, allowance.0);
+        if !self.buffer.is_empty() && peak >= budget {
+            drop(joined);
+            self.commit()?;
+            let fresh = self.accumulator.chunk_sort.summary();
+            joined = &fresh + &incoming;
+            empty = Some(fresh);
+        }
+        drop(incoming);
+        self.buffer.reserve_for_push();
+        self.buffer.extend([item]);
+        self.buffer.active_bytes = self.buffer.active_bytes.saturating_add(heap);
+        self.accumulator.accounting = Some(joined);
+        drop(empty);
+        let current = self
+            .accumulator
+            .accounting
+            .as_ref()
+            .expect("inserted summary");
+        let allowance = self.accumulator.chunk_sort.summary_allowance(Some(current));
+        if self.contextual_peak(0, 0, current, allowance.0) >= budget {
+            self.commit()?;
+        }
+        Ok(())
+    }
+}
+
+impl<T, O, C, D, CS> Sorter<T, O, C, (), D, CS, Unkeyed, ByteLimit<FromInputs>>
+where
+    T: GetSize,
+    C: Codec + EncodeRun<T> + EncodeRun<OrdinaryRecord<C>>,
+    O: Compare<T> + Compare<OrdinaryRecord<C>>,
+    CS: ChunkSorter<T, O> + SummarizeSortInput<T> + EstimateSortMemory<T, CS::Summary>,
+    for<'a> &'a CS::Summary: std::ops::Add<&'a CS::Summary, Output = CS::Summary>,
+{
+    /// Add an owned input.
+    ///
+    /// # Errors
+    /// Returns an error if completing a run fails.
+    pub fn push(&mut self, item: T) -> Result<(), MergeError<C::Error>> {
+        let FlushStrategy::Bytes { budget } = self.flush else {
+            unreachable!()
+        };
+        self.session.push_contextual(item, budget)
+    }
+
+    /// Finish the sorted output.
+    ///
+    /// # Errors
+    /// Returns an error if spilling or initializing the merge fails.
+    pub fn finish(self) -> Result<UnkeyedOutput<C, O, D>, MergeError<C::Error>>
+    where
+        D: Dedup<RunMerge<C, O>>,
+    {
+        let merged = self.session.finish()?;
+        Ok(Sorted::new(self.dedup.dedup(merged)))
+    }
+}
 
 type ItemSize<T> = Box<dyn Fn(&T) -> usize + Send + Sync>;
 type MaybeItemSize<T> = Option<ItemSize<T>>;
@@ -1552,7 +1767,7 @@ impl<SK, Cod, Cmp, CS, M> RunAccumulator<SK, Cod, Cmp, CS, M> {
     }
 }
 
-impl<T, O, C, CS> AccumulateItems<T> for UnkeyedAccumulator<O, C, CS>
+impl<T, O, C, CS, A: Default> AccumulateItems<T> for UnkeyedAccumulator<O, C, CS, A>
 where
     C: Codec + EncodeRun<T> + EncodeRun<OrdinaryRecord<C>>,
     O: Compare<T> + Compare<OrdinaryRecord<C>>,
@@ -1566,6 +1781,7 @@ where
         let writer = RunWriter::new_unkeyed(self.codec, &self.merge_config);
         let run = writer.write_sorted(items)?;
         self.runs.push(run);
+        self.accounting = A::default();
         Ok(())
     }
 

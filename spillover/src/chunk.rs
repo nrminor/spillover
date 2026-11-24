@@ -95,9 +95,44 @@ impl SortMemory {
 }
 
 /// Conservatively estimate modeled workspace for the actual sorted element.
+///
+/// Reports must bound retained workspace that can overlap an applicable
+/// projection, as well as scratch used by the corresponding sort. Estimates
+/// need not be monotone across different windows or summaries. These are
+/// modeled allocation bounds, not measurements of process RSS.
 pub trait EstimateSortMemory<T, Summary = ()> {
     /// Report retained and call-scoped workspace for this sort.
     fn sort_memory(&self, items: usize, summary: &Summary) -> SortMemory;
+}
+
+/// Supply the configured empty summary and bounds on summary construction.
+///
+/// In the returned `(H, W)`, `H` bounds the retained heap of each applicable
+/// summary, including the configured empty summary and any supplied existing
+/// summary; `W` bounds additional temporary construction scratch. The forecast
+/// itself must not allocate, unless its allocations are included in the bounds.
+pub trait SortMemorySummary {
+    /// Summary consumed by the selected algorithm.
+    type Summary;
+
+    /// Construct the configured empty summary.
+    fn summary(&self) -> Self::Summary;
+    /// Bound each applicable summary and additional construction scratch.
+    fn summary_allowance(&self, existing: Option<&Self::Summary>) -> (usize, usize);
+}
+
+/// Summarize an input and forecast summary construction before consuming it.
+pub trait SummarizeSortInput<T: ?Sized>: SortMemorySummary {
+    /// Produce the summary for an input.
+    fn summarize(&self, input: &T) -> Self::Summary;
+    /// Return `(H, W)` for this input and current summary.
+    ///
+    /// `H` bounds the retained heap of each current, incoming, combined, and
+    /// configured-empty summary. `W` bounds additional construction scratch,
+    /// including reset and recombination with an empty summary after a spill.
+    /// Forecasting must not allocate, unless its allocations are included in
+    /// these bounds. Forecasts need not be monotone.
+    fn summary_allowance_for(&self, current: &Self::Summary, input: &T) -> (usize, usize);
 }
 
 /// Single-threaded sort via [`slice::sort_unstable_by`]. Always

@@ -6,20 +6,23 @@ use std::{
     convert::Infallible,
     io::{self, Read, Write},
     num::NonZeroUsize,
+    ops::Add,
 };
 
 use dryice::SeqRecordLike;
 use spillover::SortedItemsError;
-use spillover::chunk::{ChunkSorter, Sequential};
+use spillover::chunk::{
+    ChunkSorter, EstimateSortMemory, Sequential, SortMemory, SortMemorySummary, SummarizeSortInput,
+};
 use spillover::codec::{
     Codec, CodecCursor, CodecWriter, DecodeRun, DeriveKey, EncodeKeyedRun, EncodeRun, KeyedCodec,
     KeyedCodecCursor, KeyedCodecWriter, TakeOwned,
 };
-use spillover::compare::Compare;
+use spillover::compare::{Compare, Natural};
 use spillover::dedup::Dedup;
 use spillover::key::{Owned, SortKey};
 use spillover::merge::{MergeConfig, MergeError, RunMerger};
-use spillover::sorter::VisitSortedItems;
+use spillover::sorter::{ByteLimit, VisitSortedItems};
 use spillover_bio::{
     codec::DryIceCodec,
     error::SortedRecordStreamError,
@@ -996,6 +999,79 @@ fn unkeyed_byte_budget_preflushes_old_window_before_insertion() {
             Err(MergeError::Codec(AdmissionCodecError::RejectedOne))
         ),
         "expected old-window preflush to reject one, got {result:?}"
+    );
+}
+
+#[test]
+fn from_inputs_budget_includes_allocating_summary_envelope() {
+    struct Summary(Box<[u8; 128]>);
+
+    impl Add<&Summary> for &Summary {
+        type Output = Summary;
+
+        fn add(self, other: &Summary) -> Summary {
+            let mut combined = Box::new([0; 128]);
+            combined[0] = self.0[0].saturating_add(other.0[0]);
+            Summary(combined)
+        }
+    }
+
+    struct Algorithm;
+
+    impl ChunkSorter<u64, Natural> for Algorithm {
+        fn sort(&self, items: &mut [u64], order: &Natural) {
+            Sequential.sort(items, order);
+        }
+    }
+
+    impl SortMemorySummary for Algorithm {
+        type Summary = Summary;
+
+        fn summary(&self) -> Summary {
+            Summary(Box::new([0; 128]))
+        }
+
+        fn summary_allowance(&self, _: Option<&Summary>) -> (usize, usize) {
+            (128, 0)
+        }
+    }
+
+    impl SummarizeSortInput<u64> for Algorithm {
+        fn summarize(&self, _: &u64) -> Summary {
+            Summary(Box::new([0; 128]))
+        }
+
+        fn summary_allowance_for(&self, _: &Summary, _: &u64) -> (usize, usize) {
+            (128, 0)
+        }
+    }
+
+    impl EstimateSortMemory<u64, Summary> for Algorithm {
+        fn sort_memory(&self, _: usize, _: &Summary) -> SortMemory {
+            SortMemory::NONE
+        }
+    }
+
+    // One slot plus 3H is 392 > 388. The joined replacement and two
+    // overlapping summaries are 24 + 256 = 280, below the budget.
+    let mut merge_config = MergeConfig::default();
+    merge_config.write_buffer_bytes = 1;
+    let mut sorter = spillover::sorter::Builder::new()
+        .order(Natural)
+        .codec(AdmissionCodec)
+        .chunk_sort(Algorithm)
+        .merge_config(merge_config)
+        .memory_budget(ByteLimit::new(388).from_inputs())
+        .build();
+
+    sorter.push(1_u64).expect("first input fits");
+    let result = sorter.push(0_u64);
+    assert!(
+        matches!(
+            &result,
+            Err(MergeError::Codec(AdmissionCodecError::RejectedOne))
+        ),
+        "expected the old record to be rejected, got {result:?}"
     );
 }
 
