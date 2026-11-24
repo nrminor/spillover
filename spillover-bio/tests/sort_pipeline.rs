@@ -1348,6 +1348,31 @@ fn arena_keyed_default_radix_spills_follow_complete_sequence_order_above_fallbac
 }
 
 #[test]
+fn arena_unkeyed_sort_preserves_all_empty_record() {
+    let mut arena = SeqRecordArena::new();
+    let mut sorter = Builder::new()
+        .sort_by_unkeyed(ILLUMINA_ORDER.unkeyed())
+        .codec(DryIceCodec::new())
+        .arena(&mut arena)
+        .max_buffer_items(1)
+        .build();
+
+    let record = SeqRecordView::new(b"", b"", b"");
+    sorter.push(&record).expect("push should succeed");
+
+    let results: Vec<SeqRecord> = sorter
+        .finish()
+        .expect("finish should succeed")
+        .map(|record| record.expect("each record should decode"))
+        .collect();
+
+    assert_eq!(results.len(), 1);
+    assert_eq!(results[0].name(), b"");
+    assert_eq!(results[0].sequence(), b"");
+    assert_eq!(results[0].quality(), b"");
+}
+
+#[test]
 fn arena_unkeyed_sorter_sorts_borrowed_record_views() {
     let mut arena = SeqRecordArena::new();
     let mut sorter = Builder::new()
