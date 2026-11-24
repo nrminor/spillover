@@ -1,5 +1,8 @@
-use std::cmp::Ordering;
-use std::io::{BufRead, BufReader, BufWriter, Write};
+use std::{
+    cmp::Ordering,
+    io::{self, BufRead, BufReader, BufWriter, Lines, Read, Write},
+    iter::Map,
+};
 
 use spillover::{
     codec::{CodecWriter, DecodeRun, EncodeRun},
@@ -27,36 +30,24 @@ impl<W: Write> CodecWriter<String> for LineWriter<W> {
     }
 }
 
-struct LineReader<R: std::io::Read> {
-    inner: BufReader<R>,
-}
-
-impl<R: std::io::Read> Iterator for LineReader<R> {
-    type Item = std::io::Result<String>;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        let mut line = String::new();
-        match self.inner.read_line(&mut line) {
-            Ok(0) => None,
-            Ok(_) => {
-                let content_length = line.trim_end().len();
-                line.truncate(content_length);
-                Some(Ok(line))
-            }
-            Err(error) => Some(Err(error)),
-        }
-    }
+fn trim_record(record: io::Result<String>) -> io::Result<String> {
+    let mut record = record?;
+    let retained_length = record.trim_end().len();
+    record.truncate(retained_length);
+    Ok(record)
 }
 
 impl DecodeRun for LineCodec {
     type Record = String;
     type Error = std::io::Error;
-    type Reader<R: std::io::Read> = LineReader<R>;
+    type Reader<R: Read> = Map<Lines<BufReader<R>>, fn(io::Result<String>) -> io::Result<String>>;
 
-    fn reader<R: std::io::Read>(&self, source: R) -> Result<Self::Reader<R>, Self::Error> {
-        Ok(LineReader {
-            inner: BufReader::new(source),
-        })
+    fn reader<R: Read>(&self, source: R) -> Result<Self::Reader<R>, Self::Error> {
+        let trim: fn(io::Result<String>) -> io::Result<String> = trim_record;
+        let buffered = BufReader::new(source);
+        let lines = buffered.lines();
+        let records = lines.map(trim);
+        Ok(records)
     }
 }
 
