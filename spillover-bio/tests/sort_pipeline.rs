@@ -1300,11 +1300,14 @@ impl OrderCodecPolicy for DownstreamNameOrder {
 
 #[test]
 fn downstream_non_copy_order_and_chunk_sorter_work_with_owned_and_arena_storage() {
+    // Count-only builds must not require memory accounting from ComparisonSort,
+    // even when replacing an explicitly configured measured limit.
     let mut sorter = Builder::new()
         .sort_by_unkeyed(DownstreamNameOrder {
             descending: Box::new(true),
         })
         .chunk_sort(ComparisonSort)
+        .measured_budget(1)
         .max_buffer_items(2)
         .build();
     for name in [b"b", b"a", b"c", b"d", b"e"] {
@@ -1327,6 +1330,7 @@ fn downstream_non_copy_order_and_chunk_sorter_work_with_owned_and_arena_storage(
         })
         .chunk_sort(ComparisonSort)
         .arena(&mut arena)
+        .measured_budget(1)
         .max_buffer_items(2)
         .build();
     for name in [b"b", b"a", b"c", b"d", b"e"] {
@@ -1350,6 +1354,7 @@ fn downstream_chunk_sorter_obeys_keyed_full_record_tiebreaks_across_spills() {
     let mut sorter = Builder::new()
         .sort_by_illumina()
         .chunk_sort(ComparisonSort)
+        .measured_budget(1)
         .max_buffer_items(2)
         .build();
     for record in [
@@ -1410,6 +1415,47 @@ fn owned_unkeyed_budget_includes_spill_writer() {
     assert!(
         matches!(result, Err(MergeError::Io(_))),
         "second push should attempt a spill, got {result:?}"
+    );
+}
+
+#[test]
+fn last_limit_call_controls_spill_mode_and_value() {
+    let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("Cargo.toml");
+    assert!(manifest.is_file());
+    let mut merge_config = MergeConfig::default();
+    merge_config.temp_dir = Some(manifest);
+    merge_config.write_buffer_bytes = 0;
+
+    let mut arena = SeqRecordArena::new();
+    let mut sorter = Builder::new()
+        .sort_by_illumina()
+        .arena(&mut arena)
+        .merge_config(merge_config.clone())
+        .max_buffer_items(1)
+        .measured_budget(1)
+        .max_buffer_items(2)
+        .build();
+    let record = SeqRecordView::new(b"r", b"A", b"!");
+    sorter.push(&record).expect("final count limit admits one");
+    let result = sorter.push(&record);
+    assert!(
+        matches!(result, Err(MergeError::Io(_))),
+        "final count limit must spill at two records, got {result:?}"
+    );
+    drop(sorter);
+
+    let mut sorter = Builder::new()
+        .sort_by_illumina()
+        .arena(&mut arena)
+        .merge_config(merge_config)
+        .measured_budget(usize::MAX)
+        .max_buffer_items(100)
+        .measured_budget(1)
+        .build();
+    let result = sorter.push(&record);
+    assert!(
+        matches!(result, Err(MergeError::Io(_))),
+        "final byte limit must spill the oversized singleton, got {result:?}"
     );
 }
 
@@ -1546,6 +1592,8 @@ fn arena_keyed_sorter_sorts_borrowed_record_views() {
         .sort_by_illumina()
         .codec(DryIceCodec::new())
         .arena(&mut arena)
+        .chunk_sort(ComparisonSort)
+        .measured_budget(1)
         .max_buffer_items(2)
         .build();
 
@@ -2885,6 +2933,7 @@ fn dedup_with_spilling_removes_cross_chunk_duplicates() {
         .sort_by_illumina()
         .codec(DryIceCodec::new())
         .dedup_by_sequence()
+        .measured_budget(1)
         .max_buffer_items(3)
         .build();
 

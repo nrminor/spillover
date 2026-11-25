@@ -24,8 +24,8 @@ use spillover::{
     key::{DeriveKey, KeyedOrder, SortKey},
     merge::MergeConfig,
     sorter::{
-        ByteLimit, HasOrder, ItemLimit, Keyed as CoreKeyed, NeedsLimit,
-        NeedsOrder as CoreNeedsOrder, Unkeyed as CoreUnkeyed, VisitSortedItems,
+        ByteLimit, HasOrder, ItemLimit, Keyed as CoreKeyed, NeedsOrder as CoreNeedsOrder,
+        Unkeyed as CoreUnkeyed, VisitSortedItems,
     },
 };
 
@@ -692,7 +692,7 @@ pub struct Builder<Core = InitialCore, C = NeedsCodec, S = OwnedStorage, M = ()>
 type CoreBuilder<SK, L, CS> =
     spillover::sorter::Builder<SK, spillover::sorter::NeedsCodec, L, (), RecordDedup, CS>;
 type OrderedCore<O, L, CS> = CoreBuilder<HasOrder<O>, L, CS>;
-type InitialCore = CoreBuilder<CoreNeedsOrder, NeedsLimit, Sequential>;
+type InitialCore = CoreBuilder<CoreNeedsOrder, ByteLimit, Sequential>;
 
 /// Finalized stream of sorted sequence records.
 ///
@@ -823,11 +823,17 @@ where
 }
 
 impl Builder {
-    /// Start building a new sorter.
+    /// Start building a sorter with a default 1 GiB measured byte budget.
+    ///
+    /// Later limit settings replace this default; the last setting wins.
     #[must_use]
     pub fn new() -> Self {
+        let limit = ByteLimit::new(DEFAULT_BUDGET);
+        let core = spillover::sorter::Builder::for_order()
+            .byte_limit(limit)
+            .dedup(RecordDedup::None);
         Builder {
-            core: spillover::sorter::Builder::for_order().dedup(RecordDedup::None),
+            core,
             codec: NeedsCodec,
             storage: OwnedStorage,
             mode: PhantomData,
@@ -961,9 +967,32 @@ impl<Core, St, M> Builder<Core, NeedsCodec, St, M> {
 
 // Flush strategy selection.
 
-impl<SK, C, CS, S, M> Builder<CoreBuilder<SK, NeedsLimit, CS>, C, S, M> {
+impl<SK, C, L, CS, S, M> Builder<CoreBuilder<SK, L, CS>, C, S, M> {
     /// Set a byte budget for modeled active-window and initial-spill memory.
-    /// Requires [`SeqRecord`] to implement `GetSize`.
+    ///
+    /// Replaces any previous item or byte limit. The final configuration must
+    /// provide the applicable storage, key, and algorithm memory estimates.
+    ///
+    /// An algorithm without memory estimation cannot use a final byte budget:
+    ///
+    /// ```compile_fail
+    /// use spillover::{chunk::ChunkSorter, compare::Compare};
+    /// use spillover_bio::sort::Builder;
+    ///
+    /// struct CountOnly;
+    /// impl<T, O: Compare<T>> ChunkSorter<T, O> for CountOnly {
+    ///     fn sort(&self, records: &mut [T], order: &O) {
+    ///         records.sort_unstable_by(|left, right| order.compare(left, right));
+    ///     }
+    /// }
+    ///
+    /// let _sorter = Builder::new()
+    ///     .sort_by_name()
+    ///     .chunk_sort(CountOnly)
+    ///     .max_buffer_items(1)
+    ///     .measured_budget(1024)
+    ///     .build();
+    /// ```
     #[must_use]
     pub fn measured_budget(
         self,
@@ -974,6 +1003,9 @@ impl<SK, C, CS, S, M> Builder<CoreBuilder<SK, NeedsLimit, CS>, C, S, M> {
     }
 
     /// Flush when the buffer reaches `max_items` records.
+    ///
+    /// Replaces any previous item or byte limit, including the default byte
+    /// budget. An item-limited sorter does not require memory estimates.
     #[must_use]
     pub fn max_buffer_items(
         self,
@@ -1107,28 +1139,6 @@ owned_keyed_builder!(ByteLimit;
 );
 owned_keyed_builder!(ItemLimit;);
 
-impl<O, C, CS> Builder<OrderedCore<O, NeedsLimit, CS>, C, OwnedStorage, CoreKeyed>
-where
-    O: OrderCodecPolicy
-        + DeriveKey<SeqRecord>
-        + spillover::key::EstimateKeyMemory<SeqRecord>
-        + Compare<SeqRecord>
-        + Compare<NativeRecord<NativeKeyedCodec<O, C>>>,
-    O::StoredKey: RecordKey + Clone + 'static,
-    C: sealed::ResolveCodec<O::Policy>,
-    CS: spillover::chunk::EstimateSortMemory<spillover::key::Keyed<usize, O::StoredKey>>,
-    for<'a> CS: ChunkSorter<
-            spillover::key::Keyed<usize, O::StoredKey>,
-            spillover::key::KeyedEntryCompare<'a, SeqRecord, O>,
-        >,
-{
-    /// Build with the default 1 GiB measured budget.
-    #[must_use]
-    pub fn build(self) -> NativeSorter<O, NativeKeyedCodec<O, C>, CS, ByteLimit> {
-        self.measured_budget(DEFAULT_BUDGET).build()
-    }
-}
-
 // build() for unkeyed sort orders.
 
 type ResolvedCodec<O, C> = DryIceCodec<
@@ -1152,19 +1162,6 @@ where
     pub fn build(self) -> NativeUnkeyedBuilt<O, C, CS, spillover::sorter::ItemLimit> {
         let codec = self.codec.resolve();
         self.core.codec(codec).build()
-    }
-}
-
-impl<O, C, CS> Builder<OrderedCore<O, NeedsLimit, CS>, C, OwnedStorage, CoreUnkeyed>
-where
-    C: sealed::ResolveCodec<O::Policy>,
-    O: OrderCodecPolicy + Compare<SeqRecord> + Compare<NativeOrdinaryRecord<ResolvedCodec<O, C>>>,
-    CS: ChunkSorter<SeqRecord, O> + spillover::chunk::EstimateSortMemory<SeqRecord>,
-{
-    /// Build with the default 1 GiB measured budget.
-    #[must_use]
-    pub fn build(self) -> NativeUnkeyedBuilt<O, C, CS, spillover::sorter::ByteLimit> {
-        self.measured_budget(DEFAULT_BUDGET).build()
     }
 }
 
@@ -1245,21 +1242,6 @@ where
     }
 }
 
-impl<'a, O, C, CS> Builder<OrderedCore<O, NeedsLimit, CS>, C, ArenaStorage<'a>, CoreUnkeyed>
-where
-    C: sealed::ResolveCodec<O::Policy>,
-    O: OrderCodecPolicy + Compare<NativeOrdinaryRecord<ResolvedCodec<O, C>>>,
-    for<'v> O: Compare<SeqRecordView<'v>>,
-    for<'v> CS:
-        ChunkSorter<SeqRecordView<'v>, O> + spillover::chunk::EstimateSortMemory<SeqRecordView<'v>>,
-{
-    /// Build a measured sorter over the selected arena.
-    #[must_use]
-    pub fn build(self) -> NativeMeasuredArenaBuilt<'a, O, C, CS> {
-        self.measured_budget(DEFAULT_BUDGET).build()
-    }
-}
-
 type NativeArenaKeyed<'a, O, C, CS> = spillover::sorter::Sorter<
     (),
     O,
@@ -1330,27 +1312,6 @@ where
         let build_keyed_measured_in: fn(_, &'a mut SeqRecordArena) -> _ =
             spillover::sorter::Builder::build_keyed_measured_in;
         build_keyed_measured_in(builder, storage)
-    }
-}
-
-impl<'a, O, C, CS> Builder<OrderedCore<O, NeedsLimit, CS>, C, ArenaStorage<'a>, CoreKeyed>
-where
-    O: OrderCodecPolicy + KeyedOrder + Compare<NativeRecord<NativeKeyedCodec<O, C>>>,
-    O::StoredKey: RecordKey + Clone + 'static,
-    C: sealed::ResolveCodec<O::Policy>,
-    CS: spillover::chunk::EstimateSortMemory<spillover::key::Keyed<usize, O::StoredKey>>,
-    for<'v> O: DeriveKey<SeqRecordView<'v>>
-        + spillover::key::EstimateKeyMemory<SeqRecordView<'v>>
-        + Compare<SeqRecordView<'v>>,
-    for<'v, 'order> CS: ChunkSorter<
-            spillover::key::Keyed<usize, O::StoredKey>,
-            spillover::key::KeyedEntryCompare<'order, SeqRecordView<'v>, O>,
-        >,
-{
-    /// Build a keyed sorter with the default measured budget.
-    #[must_use]
-    pub fn build(self) -> NativeMeasuredArenaKeyed<'a, O, NativeKeyedCodec<O, C>, CS> {
-        self.measured_budget(DEFAULT_BUDGET).build()
     }
 }
 
@@ -1524,7 +1485,7 @@ mod tests {
 
         assert_builder_type::<
             Builder<
-                OrderedCore<UnkeyedSequenceOrder, NeedsLimit, Sequential>,
+                OrderedCore<UnkeyedSequenceOrder, ByteLimit, Sequential>,
                 NeedsCodec,
                 OwnedStorage,
                 CoreUnkeyed,
@@ -1542,7 +1503,7 @@ mod tests {
 
         assert_builder_type::<
             Builder<
-                OrderedCore<UnkeyedSequenceOrder, NeedsLimit, Sequential>,
+                OrderedCore<UnkeyedSequenceOrder, ByteLimit, Sequential>,
                 NeedsCodec,
                 OwnedStorage,
                 CoreUnkeyed,
@@ -1558,7 +1519,7 @@ mod tests {
 
         assert_builder_type::<
             Builder<
-                OrderedCore<Reverse<SequenceOrder<38>>, NeedsLimit, Sequential>,
+                OrderedCore<Reverse<SequenceOrder<38>>, ByteLimit, Sequential>,
                 NeedsCodec,
                 OwnedStorage,
                 CoreKeyed,

@@ -214,8 +214,11 @@ impl<Cod, L, D, CS> Builder<NeedsOrder, Cod, L, (), D, CS> {
     }
 }
 
-impl<SK, Cod, D, CS> Builder<SK, Cod, NeedsLimit, (), D, CS> {
+impl<SK, Cod, L, D, CS> Builder<SK, Cod, L, (), D, CS> {
     /// Set the typed item limit without changing the order state.
+    ///
+    /// Replaces any previously selected item or byte limit. The final limit
+    /// determines which capabilities construction requires.
     #[doc(hidden)]
     #[must_use]
     pub fn item_limit(self, limit: ItemLimit) -> Builder<SK, Cod, ItemLimit, (), D, CS> {
@@ -231,6 +234,9 @@ impl<SK, Cod, D, CS> Builder<SK, Cod, NeedsLimit, (), D, CS> {
     }
 
     /// Set the typed byte limit without changing the order state.
+    ///
+    /// Replaces any previously selected item or byte limit. The final limit
+    /// determines which capabilities construction requires.
     #[doc(hidden)]
     #[must_use]
     pub fn byte_limit<M>(self, limit: ByteLimit<M>) -> Builder<SK, Cod, ByteLimit<M>, (), D, CS> {
@@ -3382,6 +3388,45 @@ mod tests {
         assert_eq!(sorter.session.accumulator.runs.len(), 1);
         assert!(sorter.session.buffer.items.is_empty());
         assert_eq!(sorter.session.buffer.active_bytes, 0);
+    }
+
+    #[test]
+    fn typed_item_limit_replaces_byte_limit_and_previous_item_limit() {
+        let mut sorter = Builder::new()
+            .order(Natural)
+            .codec(U64Codec)
+            .memory_budget(ByteLimit::new(1 << 20))
+            .item_limit(ItemLimit::new(9))
+            .item_limit(ItemLimit::new(2))
+            .build();
+
+        sorter.push(2_u64).expect("first push");
+        assert!(sorter.session.accumulator.runs.is_empty());
+        sorter.push(1).expect("threshold push");
+        assert_eq!(sorter.session.accumulator.runs.len(), 1);
+        assert!(sorter.session.buffer.items.is_empty());
+
+        let records: Result<Vec<u64>, _> = sorter.finish().expect("finish").collect();
+        assert_eq!(records.expect("decode"), [1, 2]);
+    }
+
+    #[test]
+    fn typed_byte_limit_replaces_item_limit_and_previous_byte_limit() {
+        let mut sorter = Builder::new()
+            .order(Natural)
+            .codec(U64Codec)
+            .max_buffer_items(1)
+            .byte_limit(ByteLimit::new(0))
+            .byte_limit(ByteLimit::new(1 << 20))
+            .build();
+
+        sorter.push(2_u64).expect("first push");
+        sorter.push(1).expect("second push");
+        assert!(sorter.session.accumulator.runs.is_empty());
+        assert_eq!(sorter.session.buffer.items, [2, 1]);
+
+        let records: Result<Vec<u64>, _> = sorter.finish().expect("finish").collect();
+        assert_eq!(records.expect("decode"), [1, 2]);
     }
 
     #[test]
