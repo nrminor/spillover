@@ -32,7 +32,7 @@ use spillover::{
 };
 
 use crate::{
-    codec::{DryIceCodec, KeyedDryIceCodec},
+    codec::{DryIceCodec, KeyedDryIceCodec, SeqRecordPartsAdapter},
     error::SortedRecordStreamError,
     key::PackedSequenceKey,
     radix::RadixThenRefine,
@@ -888,22 +888,6 @@ pub trait SeqRecordSink {
     /// Returns an error if the destination rejects the record or fails while
     /// writing it.
     fn write_record<R: SeqRecordParts + ?Sized>(&mut self, record: &R) -> Result<(), Self::Error>;
-}
-
-struct SeqRecordPartsAdapter<'a, R: ?Sized>(&'a R);
-
-impl<R: SeqRecordParts + ?Sized> dryice::SeqRecordLike for SeqRecordPartsAdapter<'_, R> {
-    fn name(&self) -> &[u8] {
-        self.0.name()
-    }
-
-    fn sequence(&self) -> &[u8] {
-        self.0.sequence()
-    }
-
-    fn quality(&self) -> &[u8] {
-        self.0.quality()
-    }
 }
 
 impl<W, S, Q, N> SeqRecordSink for DryIceWriter<W, S, Q, N, dryice::NoRecordKey>

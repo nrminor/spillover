@@ -225,7 +225,7 @@ impl<K, S, Q, N> KeyedDryIceCodec<K, S, Q, N> {
 
 // ── Writer adapters ──────────────────────────────────────────
 
-struct SeqRecordPartsAdapter<'a, R: ?Sized>(&'a R);
+pub(crate) struct SeqRecordPartsAdapter<'a, R: ?Sized>(pub(crate) &'a R);
 
 impl<R: SeqRecordParts + ?Sized> SeqRecordLike for SeqRecordPartsAdapter<'_, R> {
     fn name(&self) -> &[u8] {
