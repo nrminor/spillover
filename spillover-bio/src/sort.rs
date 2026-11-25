@@ -92,14 +92,19 @@ impl<R: SeqRecordParts> SortKey<R> for LengthKey {
 // ── Sort order traits (sealed) ────────────────────────────
 
 mod sealed {
-    pub trait Sealed {}
+    pub struct ExistingCodecChoices;
+    pub struct ExactSequenceThenQuality;
+
+    pub trait Sealed {
+        type CodecPolicy;
+    }
 
     pub trait CompatibleChunkSorter<O> {}
 
     /// Resolves codec type-state to a concrete [`crate::codec::DryIceCodec`].
     /// `NeedsCodec` yields the raw (no-encoding) default;
-    /// `HasCodec` passes through the user's choice.
-    pub trait ResolveCodec {
+    /// `HasCodec` passes through a choice accepted by the order's policy.
+    pub trait ResolveCodec<P> {
         type S: dryice::SequenceCodec + Copy + 'static;
         type Q: dryice::QualityCodec + Copy + 'static;
         type N: dryice::NameCodec + Copy + 'static;
@@ -178,7 +183,9 @@ pub struct Keyed;
 #[derive(Debug, Clone, Copy)]
 pub struct SequenceOrder<const N: usize>;
 
-impl<const N: usize> sealed::Sealed for SequenceOrder<N> {}
+impl<const N: usize> sealed::Sealed for SequenceOrder<N> {
+    type CodecPolicy = sealed::ExistingCodecChoices;
+}
 
 impl<const N: usize> SortOrder for SequenceOrder<N> {
     type SortKey = SequenceQualityKey;
@@ -230,7 +237,9 @@ impl<const N: usize> SequenceOrder<N> {
 #[derive(Debug, Clone, Copy)]
 pub struct NameOrder;
 
-impl sealed::Sealed for NameOrder {}
+impl sealed::Sealed for NameOrder {
+    type CodecPolicy = sealed::ExistingCodecChoices;
+}
 
 impl SortOrder for NameOrder {
     type SortKey = NameKey;
@@ -288,7 +297,9 @@ impl NameOrder {
 #[derive(Debug, Clone, Copy)]
 pub struct LengthOrder;
 
-impl sealed::Sealed for LengthOrder {}
+impl sealed::Sealed for LengthOrder {
+    type CodecPolicy = sealed::ExistingCodecChoices;
+}
 
 impl SortOrder for LengthOrder {
     type SortKey = LengthKey;
@@ -395,7 +406,9 @@ impl<R: SeqRecordParts + ?Sized> spillover::key::EstimateKeyMemory<R> for Length
 #[derive(Debug, Clone, Copy)]
 pub struct UnkeyedSequenceOrder;
 
-impl sealed::Sealed for UnkeyedSequenceOrder {}
+impl sealed::Sealed for UnkeyedSequenceOrder {
+    type CodecPolicy = sealed::ExactSequenceThenQuality;
+}
 
 impl SortOrder for UnkeyedSequenceOrder {
     type SortKey = SequenceQualityKey;
@@ -428,7 +441,9 @@ impl<R: SeqRecordParts + ?Sized> Compare<R> for UnkeyedSequenceOrder {
 #[derive(Debug, Clone, Copy)]
 pub struct UnkeyedNameOrder;
 
-impl sealed::Sealed for UnkeyedNameOrder {}
+impl sealed::Sealed for UnkeyedNameOrder {
+    type CodecPolicy = sealed::ExistingCodecChoices;
+}
 
 impl SortOrder for UnkeyedNameOrder {
     type SortKey = NameKey;
@@ -459,7 +474,9 @@ impl<R: SeqRecordParts + ?Sized> Compare<R> for UnkeyedNameOrder {
 #[derive(Debug, Clone, Copy)]
 pub struct UnkeyedLengthOrder;
 
-impl sealed::Sealed for UnkeyedLengthOrder {}
+impl sealed::Sealed for UnkeyedLengthOrder {
+    type CodecPolicy = sealed::ExistingCodecChoices;
+}
 
 impl SortOrder for UnkeyedLengthOrder {
     type SortKey = LengthKey;
@@ -498,7 +515,9 @@ impl<R: SeqRecordParts + ?Sized> Compare<R> for UnkeyedLengthOrder {
 #[derive(Debug, Clone, Copy)]
 pub struct Reverse<O>(pub O);
 
-impl<O: sealed::Sealed> sealed::Sealed for Reverse<O> {}
+impl<O: sealed::Sealed> sealed::Sealed for Reverse<O> {
+    type CodecPolicy = O::CodecPolicy;
+}
 
 impl<O: SortOrder + Send + Sync + 'static> SortOrder for Reverse<O> {
     type SortKey = O::SortKey;
@@ -744,7 +763,7 @@ const DEFAULT_BUDGET: usize = 1 << 30;
 
 // ── Sealed trait impls for default resolution ────────────
 
-impl sealed::ResolveCodec for NeedsCodec {
+impl<P> sealed::ResolveCodec<P> for NeedsCodec {
     type S = RawAsciiCodec;
     type Q = RawQualityCodec;
     type N = RawNameCodec;
@@ -754,7 +773,7 @@ impl sealed::ResolveCodec for NeedsCodec {
     }
 }
 
-impl<S, Q, N> sealed::ResolveCodec for HasCodec<S, Q, N>
+impl<S, Q, N> sealed::ResolveCodec<sealed::ExistingCodecChoices> for HasCodec<S, Q, N>
 where
     S: SequenceCodec + Copy + 'static,
     Q: QualityCodec + Copy + 'static,
@@ -765,6 +784,20 @@ where
     type N = N;
 
     fn resolve(self) -> DryIceCodec<S, Q, N> {
+        self.0
+    }
+}
+
+impl<N> sealed::ResolveCodec<sealed::ExactSequenceThenQuality>
+    for HasCodec<RawAsciiCodec, RawQualityCodec, N>
+where
+    N: NameCodec + Copy + 'static,
+{
+    type S = RawAsciiCodec;
+    type Q = RawQualityCodec;
+    type N = N;
+
+    fn resolve(self) -> DryIceCodec<Self::S, Self::Q, Self::N> {
         self.0
     }
 }
@@ -1192,12 +1225,20 @@ impl<C, L, CS, S> Builder<CoreBuilder<CoreNeedsOrder, L, CS>, C, S> {
     }
 
     /// Sort by exact raw sequence bytes, then raw quality bytes.
+    /// This order requires raw sequence and quality codecs; the name codec may vary.
     ///
     /// This uses the unkeyed sequence order rather than the accelerated
     /// packed-key order used by [`Self::sort_by_illumina`]. It also selects the
     /// sequential comparator-based chunk sorter, even if a chunk sorter was
     /// configured earlier on the builder, because packed-key radix sorting is not
     /// compatible with exact raw sequence ordering.
+    ///
+    /// ```compile_fail
+    /// use spillover_bio::{codec::DryIceCodec, sort::Builder};
+    ///
+    /// let codec = DryIceCodec::new().two_bit_lossy_n();
+    /// let _sorter = Builder::new().sort_by_sequence_exact().codec(codec).build();
+    /// ```
     #[must_use]
     pub fn sort_by_sequence_exact(
         self,
@@ -1372,9 +1413,9 @@ impl<SK, C, L, CS, S, M> Builder<CoreBuilder<SK, L, CS>, C, S, M> {
 
 type NativeKeyedCodec<O, C> = KeyedDryIceCodec<
     <O as RecordKeyer>::RecordKey,
-    <C as sealed::ResolveCodec>::S,
-    <C as sealed::ResolveCodec>::Q,
-    <C as sealed::ResolveCodec>::N,
+    <C as sealed::ResolveCodec<<O as sealed::Sealed>::CodecPolicy>>::S,
+    <C as sealed::ResolveCodec<<O as sealed::Sealed>::CodecPolicy>>::Q,
+    <C as sealed::ResolveCodec<<O as sealed::Sealed>::CodecPolicy>>::N,
 >;
 type NativeRecord<C> = <<C as KeyedCodec>::KeyedCursor<BufReader<File>> as CodecCursor>::Record;
 type NativeCore<O, C, CS, L> =
@@ -1395,7 +1436,7 @@ macro_rules! owned_keyed_builder {
             O: KeyedSortOrder + spillover::key::DeriveKey<SeqRecord, StoredKey = <O as RecordKeyer>::RecordKey>
                 + Compare<SeqRecord> + Compare<NativeRecord<NativeKeyedCodec<O, C>>>,
             <O as RecordKeyer>::RecordKey: RecordKey + Clone + 'static,
-            C: sealed::ResolveCodec,
+            C: sealed::ResolveCodec<<O as sealed::Sealed>::CodecPolicy>,
             CS: sealed::CompatibleChunkSorter<O>,
             for<'a> CS: ChunkSorter<spillover::key::Keyed<usize, <O as RecordKeyer>::RecordKey>, spillover::key::KeyedEntryCompare<'a, SeqRecord, O>>,
             $($extra)*
@@ -1430,7 +1471,7 @@ where
         + Compare<SeqRecord>
         + Compare<NativeRecord<NativeKeyedCodec<O, C>>>,
     <O as RecordKeyer>::RecordKey: RecordKey + Clone + 'static,
-    C: sealed::ResolveCodec,
+    C: sealed::ResolveCodec<<O as sealed::Sealed>::CodecPolicy>,
     CS: sealed::CompatibleChunkSorter<O>
         + spillover::chunk::EstimateSortMemory<
             spillover::key::Keyed<usize, <O as RecordKeyer>::RecordKey>,
@@ -1449,6 +1490,11 @@ where
 
 // build() for unkeyed sort orders.
 
+type ResolvedCodec<O, C> = DryIceCodec<
+    <C as sealed::ResolveCodec<<O as sealed::Sealed>::CodecPolicy>>::S,
+    <C as sealed::ResolveCodec<<O as sealed::Sealed>::CodecPolicy>>::Q,
+    <C as sealed::ResolveCodec<<O as sealed::Sealed>::CodecPolicy>>::N,
+>;
 type NativeOrdinaryRecord<C> = <<C as Codec>::Cursor<BufReader<File>> as CodecCursor>::Record;
 type NativeUnkeyedCore<O, C, CS, L> =
     spillover::sorter::Sorter<SeqRecord, O, C, (), Identity, CS, spillover::sorter::Unkeyed, L>;
@@ -1461,23 +1507,14 @@ type NativeUnkeyedSorter<O, C, CS, L> = Sorter<
     OwnedBackend<O, C, (), CS, spillover::sorter::Unkeyed, NativeUnkeyedCore<O, C, CS, L>>,
 >;
 type NativeUnkeyedOutput<C, O> = SortedRecordStream<spillover::Sorted<RunMerge<C, O>>>;
-type NativeUnkeyedBuilt<O, C, CS, L> = NativeUnkeyedSorter<
-    O,
-    DryIceCodec<
-        <C as sealed::ResolveCodec>::S,
-        <C as sealed::ResolveCodec>::Q,
-        <C as sealed::ResolveCodec>::N,
-    >,
-    CS,
-    L,
->;
+type NativeUnkeyedBuilt<O, C, CS, L> = NativeUnkeyedSorter<O, ResolvedCodec<O, C>, CS, L>;
 
 impl<O, C, CS> Builder<OrderedCore<O, ItemLimit, CS>, C, OwnedStorage, CoreUnkeyed>
 where
-    C: sealed::ResolveCodec,
+    C: sealed::ResolveCodec<<O as sealed::Sealed>::CodecPolicy>,
     O: SortOrder<Strategy = Unkeyed>
         + Compare<SeqRecord>
-        + Compare<NativeOrdinaryRecord<DryIceCodec<C::S, C::Q, C::N>>>,
+        + Compare<NativeOrdinaryRecord<ResolvedCodec<O, C>>>,
     CS: ChunkSorter<SeqRecord, O> + sealed::CompatibleChunkSorter<O>,
 {
     /// Build an item-limited sorter using the complete unkeyed order.
@@ -1498,10 +1535,10 @@ where
 
 impl<O, C, CS> Builder<OrderedCore<O, NeedsLimit, CS>, C, OwnedStorage, CoreUnkeyed>
 where
-    C: sealed::ResolveCodec,
+    C: sealed::ResolveCodec<<O as sealed::Sealed>::CodecPolicy>,
     O: SortOrder<Strategy = Unkeyed>
         + Compare<SeqRecord>
-        + Compare<NativeOrdinaryRecord<DryIceCodec<C::S, C::Q, C::N>>>,
+        + Compare<NativeOrdinaryRecord<ResolvedCodec<O, C>>>,
     CS: ChunkSorter<SeqRecord, O>
         + spillover::chunk::EstimateSortMemory<SeqRecord>
         + sealed::CompatibleChunkSorter<O>,
@@ -1515,10 +1552,10 @@ where
 
 impl<O, C, CS> Builder<OrderedCore<O, ByteLimit, CS>, C, OwnedStorage, CoreUnkeyed>
 where
-    C: sealed::ResolveCodec,
+    C: sealed::ResolveCodec<<O as sealed::Sealed>::CodecPolicy>,
     O: SortOrder<Strategy = Unkeyed>
         + Compare<SeqRecord>
-        + Compare<NativeOrdinaryRecord<DryIceCodec<C::S, C::Q, C::N>>>,
+        + Compare<NativeOrdinaryRecord<ResolvedCodec<O, C>>>,
     CS: ChunkSorter<SeqRecord, O>
         + spillover::chunk::EstimateSortMemory<SeqRecord>
         + sealed::CompatibleChunkSorter<O>,
@@ -1601,21 +1638,12 @@ type ArenaUnkeyedCore<'a, O, C, CS> = spillover::sorter::Sorter<
 >;
 type NativeArenaUnkeyed<'a, O, C, CS> =
     Sorter<O, C, (), CS, spillover::sorter::Unkeyed, ArenaUnkeyedCore<'a, O, C, CS>>;
-type NativeArenaBuilt<'a, O, C, CS> = NativeArenaUnkeyed<
-    'a,
-    O,
-    DryIceCodec<
-        <C as sealed::ResolveCodec>::S,
-        <C as sealed::ResolveCodec>::Q,
-        <C as sealed::ResolveCodec>::N,
-    >,
-    CS,
->;
+type NativeArenaBuilt<'a, O, C, CS> = NativeArenaUnkeyed<'a, O, ResolvedCodec<O, C>, CS>;
 
 impl<'a, O, C, CS> Builder<OrderedCore<O, ItemLimit, CS>, C, ArenaStorage<'a>, CoreUnkeyed>
 where
-    C: sealed::ResolveCodec,
-    O: SortOrder<Strategy = Unkeyed> + Compare<NativeOrdinaryRecord<DryIceCodec<C::S, C::Q, C::N>>>,
+    C: sealed::ResolveCodec<<O as sealed::Sealed>::CodecPolicy>,
+    O: SortOrder<Strategy = Unkeyed> + Compare<NativeOrdinaryRecord<ResolvedCodec<O, C>>>,
     for<'v> O: Compare<SeqRecordView<'v>>,
     CS: sealed::CompatibleChunkSorter<O>,
     for<'v> CS: ChunkSorter<SeqRecordView<'v>, O>,
@@ -1678,21 +1706,13 @@ type MeasuredArenaUnkeyedCore<'a, O, C, CS> = spillover::sorter::Sorter<
 >;
 type NativeMeasuredArenaUnkeyed<'a, O, C, CS> =
     Sorter<O, C, (), CS, spillover::sorter::Unkeyed, MeasuredArenaUnkeyedCore<'a, O, C, CS>>;
-type NativeMeasuredArenaBuilt<'a, O, C, CS> = NativeMeasuredArenaUnkeyed<
-    'a,
-    O,
-    DryIceCodec<
-        <C as sealed::ResolveCodec>::S,
-        <C as sealed::ResolveCodec>::Q,
-        <C as sealed::ResolveCodec>::N,
-    >,
-    CS,
->;
+type NativeMeasuredArenaBuilt<'a, O, C, CS> =
+    NativeMeasuredArenaUnkeyed<'a, O, ResolvedCodec<O, C>, CS>;
 
 impl<'a, O, C, CS> Builder<OrderedCore<O, ByteLimit, CS>, C, ArenaStorage<'a>, CoreUnkeyed>
 where
-    C: sealed::ResolveCodec,
-    O: SortOrder<Strategy = Unkeyed> + Compare<NativeOrdinaryRecord<DryIceCodec<C::S, C::Q, C::N>>>,
+    C: sealed::ResolveCodec<<O as sealed::Sealed>::CodecPolicy>,
+    O: SortOrder<Strategy = Unkeyed> + Compare<NativeOrdinaryRecord<ResolvedCodec<O, C>>>,
     for<'v> O: Compare<SeqRecordView<'v>>,
     CS: sealed::CompatibleChunkSorter<O>,
     for<'v> CS:
@@ -1717,8 +1737,8 @@ where
 
 impl<'a, O, C, CS> Builder<OrderedCore<O, NeedsLimit, CS>, C, ArenaStorage<'a>, CoreUnkeyed>
 where
-    C: sealed::ResolveCodec,
-    O: SortOrder<Strategy = Unkeyed> + Compare<NativeOrdinaryRecord<DryIceCodec<C::S, C::Q, C::N>>>,
+    C: sealed::ResolveCodec<<O as sealed::Sealed>::CodecPolicy>,
+    O: SortOrder<Strategy = Unkeyed> + Compare<NativeOrdinaryRecord<ResolvedCodec<O, C>>>,
     for<'v> O: Compare<SeqRecordView<'v>>,
     CS: sealed::CompatibleChunkSorter<O>,
     for<'v> CS:
@@ -1779,7 +1799,7 @@ impl<'a, O, C, CS> Builder<OrderedCore<O, ItemLimit, CS>, C, ArenaStorage<'a>, C
 where
     O: KeyedSortOrder + Compare<NativeRecord<NativeKeyedCodec<O, C>>>,
     <O as RecordKeyer>::RecordKey: RecordKey + Clone + 'static,
-    C: sealed::ResolveCodec,
+    C: sealed::ResolveCodec<<O as sealed::Sealed>::CodecPolicy>,
     CS: sealed::CompatibleChunkSorter<O>,
     for<'v> O: spillover::key::DeriveKey<SeqRecordView<'v>, StoredKey = <O as RecordKeyer>::RecordKey>
         + Compare<SeqRecordView<'v>>,
@@ -1823,7 +1843,7 @@ impl<'a, O, C, CS> Builder<OrderedCore<O, ByteLimit, CS>, C, ArenaStorage<'a>, C
 where
     O: KeyedSortOrder + Compare<NativeRecord<NativeKeyedCodec<O, C>>>,
     <O as RecordKeyer>::RecordKey: RecordKey + Clone + 'static,
-    C: sealed::ResolveCodec,
+    C: sealed::ResolveCodec<<O as sealed::Sealed>::CodecPolicy>,
     CS: sealed::CompatibleChunkSorter<O>
         + spillover::chunk::EstimateSortMemory<
             spillover::key::Keyed<usize, <O as RecordKeyer>::RecordKey>,
@@ -1858,7 +1878,7 @@ impl<'a, O, C, CS> Builder<OrderedCore<O, NeedsLimit, CS>, C, ArenaStorage<'a>, 
 where
     O: KeyedSortOrder + Compare<NativeRecord<NativeKeyedCodec<O, C>>>,
     <O as RecordKeyer>::RecordKey: RecordKey + Clone + 'static,
-    C: sealed::ResolveCodec,
+    C: sealed::ResolveCodec<<O as sealed::Sealed>::CodecPolicy>,
     CS: sealed::CompatibleChunkSorter<O>
         + spillover::chunk::EstimateSortMemory<
             spillover::key::Keyed<usize, <O as RecordKeyer>::RecordKey>,
