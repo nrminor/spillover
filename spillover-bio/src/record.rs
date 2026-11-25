@@ -5,9 +5,12 @@
 //! allocation, and implements [`GetSize`] for accurate memory budget
 //! tracking.
 //!
-//! Conversions to and from `dryice::SeqRecord` are provided via
-//! `From` impls, so records move between spillover-bio and dryice
-//! without manual field copying.
+//! Prefer passing borrowed records directly to dryice writers through
+//! [`SeqRecordLike`]. If an owned dryice record is needed, prefer
+//! [`dryice::SeqRecord::from_slices`] for explicit construction that leaves the
+//! source available. [`TryFrom<SeqRecord>`] is also provided as a consuming
+//! convenience; it copies the fields and rejects unequal sequence and quality
+//! lengths. Conversion from a dryice record uses [`From`] and copies its fields.
 
 use std::alloc::Layout;
 
@@ -452,14 +455,18 @@ impl From<dryice::SeqRecord> for SeqRecord {
     }
 }
 
-impl From<SeqRecord> for dryice::SeqRecord {
-    fn from(rec: SeqRecord) -> Self {
-        dryice::SeqRecord::new(
-            rec.name().to_vec(),
-            rec.sequence().to_vec(),
-            rec.quality().to_vec(),
-        )
-        .expect("spillover-bio SeqRecord fields are valid for dryice")
+impl TryFrom<SeqRecord> for dryice::SeqRecord {
+    type Error = dryice::DryIceError;
+
+    /// Copy the fields into an owned dryice record, consuming the source even
+    /// when conversion fails.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`dryice::DryIceError::MismatchedSequenceAndQualityLengths`] when
+    /// sequence and quality lengths differ.
+    fn try_from(record: SeqRecord) -> Result<Self, Self::Error> {
+        dryice::SeqRecord::from_slices(record.name(), record.sequence(), record.quality())
     }
 }
 
@@ -478,9 +485,43 @@ mod tests {
     #[test]
     fn round_trip_to_dryice() {
         let rec = SeqRecord::new(b"read1", b"ACGT", b"!!!!");
-        let dryice_rec: dryice::SeqRecord = rec.clone().into();
+        let dryice_rec: dryice::SeqRecord = rec
+            .clone()
+            .try_into()
+            .expect("matching sequence and quality lengths");
         let back: SeqRecord = dryice_rec.into();
         assert_eq!(rec, back);
+    }
+
+    #[test]
+    fn conversion_to_dryice_rejects_mismatched_lengths() {
+        for (sequence, quality) in [
+            (b"AC".as_slice(), b"!".as_slice()),
+            (b"A".as_slice(), b"!!".as_slice()),
+            (b"AC".as_slice(), b"".as_slice()),
+        ] {
+            let record = SeqRecord::new(b"read", sequence, quality);
+            let result = dryice::SeqRecord::try_from(record);
+            match result {
+                Err(dryice::DryIceError::MismatchedSequenceAndQualityLengths {
+                    sequence_len,
+                    quality_len,
+                }) => {
+                    assert_eq!(sequence_len, sequence.len());
+                    assert_eq!(quality_len, quality.len());
+                }
+                other => panic!("expected mismatched lengths, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn empty_record_round_trips_through_dryice() {
+        let record = SeqRecord::new(b"", b"", b"");
+        let converted = dryice::SeqRecord::try_from(record.clone())
+            .expect("empty sequence and quality have matching lengths");
+        let recovered = SeqRecord::from(converted);
+        assert_eq!(recovered, record);
     }
 
     #[test]
