@@ -2,7 +2,7 @@ use std::io::{BufReader, BufWriter, Read, Write};
 
 use spillover::{
     codec::{CodecWriter, DecodeRun, EncodeRun},
-    key::Owned,
+    compare::Natural,
     sorter::Builder,
 };
 
@@ -72,7 +72,7 @@ impl EncodeRun<u64> for U64Codec {
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut sorter = Builder::new()
-        .key(Owned(|v: &u64| *v))
+        .order(Natural)
         .codec(U64Codec)
         .max_buffer_items(3)
         .build();
@@ -84,6 +84,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let output_stream = sorter.finish()?;
     let collected: Result<Vec<u64>, _> = output_stream.collect();
     let output = collected?;
+    assert_eq!(output, [1, 3, 7, 9, 42, 100]);
     println!("sorted values: {output:?}");
 
     Ok(())

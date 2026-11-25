@@ -1,7 +1,9 @@
+use std::io::{self, Write};
+
 use spillover_bio::{
     codec::DryIceCodec,
-    record::{SeqRecord, SeqRecordArena, SeqRecordView},
-    sort::Builder,
+    record::{SeqRecordArena, SeqRecordParts, SeqRecordView},
+    sort::{Builder, SeqRecordSink},
 };
 
 struct ParserRecord<'a> {
@@ -13,6 +15,23 @@ struct ParserRecord<'a> {
 impl ParserRecord<'_> {
     fn as_view(&self) -> SeqRecordView<'_> {
         SeqRecordView::new(self.name, self.sequence, self.quality)
+    }
+}
+
+struct TabSeparated<W> {
+    writer: W,
+}
+
+impl<W: Write> SeqRecordSink for TabSeparated<W> {
+    type Error = io::Error;
+
+    fn write_record<R: SeqRecordParts + ?Sized>(&mut self, record: &R) -> io::Result<()> {
+        self.writer.write_all(record.name())?;
+        self.writer.write_all(b"\t")?;
+        self.writer.write_all(record.sequence())?;
+        self.writer.write_all(b"\t")?;
+        self.writer.write_all(record.quality())?;
+        self.writer.write_all(b"\n")
     }
 }
 
@@ -49,21 +68,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         sorter.push(&record.as_view())?;
     }
 
-    let sorted_records: Vec<SeqRecord> = sorter.finish()?.collect::<Result<Vec<_>, _>>()?;
+    let sorted_records = sorter.finish()?;
 
+    // The output owns its runs, so the arena is available before consumption.
     assert!(
         arena.is_empty(),
         "finish releases the active arena contents"
     );
 
-    for record in sorted_records {
-        println!(
-            "{}\t{}\t{}",
-            String::from_utf8_lossy(record.name()),
-            String::from_utf8_lossy(record.sequence()),
-            String::from_utf8_lossy(record.quality())
-        );
-    }
+    let stdout = io::stdout();
+    let mut sink = TabSeparated {
+        writer: stdout.lock(),
+    };
+    sorted_records.write_to(&mut sink)?;
 
     Ok(())
 }

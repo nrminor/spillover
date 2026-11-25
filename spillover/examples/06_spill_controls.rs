@@ -5,7 +5,7 @@ use std::{
 
 use spillover::{
     codec::{CodecWriter, DecodeRun, EncodeRun},
-    key::Owned,
+    compare::Natural,
     merge::MergeConfig,
     sorter::Builder,
 };
@@ -79,7 +79,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     merge_config.max_fan_in = NonZeroUsize::new(2).expect("2 is non-zero");
 
     let mut sorter = Builder::new()
-        .key(Owned(|v: &u64| *v))
+        .order(Natural)
         .codec(U64Codec)
         .max_buffer_items(2)
         .merge_config(merge_config)
@@ -92,6 +92,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let output_stream = sorter.finish()?;
     let collected: Result<Vec<u64>, _> = output_stream.collect();
     let output = collected?;
+    assert_eq!(output, [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]);
     println!(
         "sorted {} values with forced small buffer + fan-in: {output:?}",
         output.len()

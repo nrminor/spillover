@@ -2,8 +2,8 @@ use std::io::{BufReader, BufWriter, Read, Write};
 
 use spillover::{
     codec::{CodecWriter, DecodeRun, EncodeRun},
+    compare::Natural,
     dedup::AdjacentDedup,
-    key::Owned,
     sorter::Builder,
 };
 
@@ -73,7 +73,7 @@ impl EncodeRun<u64> for U64Codec {
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut sorter = Builder::new()
-        .key(Owned(|v: &u64| *v))
+        .order(Natural)
         .codec(U64Codec)
         .dedup(AdjacentDedup::new(|a: &u64, b: &u64| a == b))
         .max_buffer_items(3)
@@ -86,6 +86,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let output_stream = sorter.finish()?;
     let collected: Result<Vec<u64>, _> = output_stream.collect();
     let output = collected?;
+    assert_eq!(output, [1, 2, 3, 4]);
     println!("deduplicated sorted values: {output:?}");
 
     Ok(())

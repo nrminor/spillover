@@ -113,7 +113,7 @@ At a high level, both crates follow the same pipeline:
 Put another way, in `spillover`, sorting is an engine with interchangeable parts:
 
 - Define ordering with a `SortKey`/`Compare` pair or a complete record order; keyed complete orders also implement `KeyedOrder` for stored-key comparison. `ChunkSorter` selects the in-memory sorting algorithm.
-- Define temporary-run reading with `DecodeRun` for ordinary owned-record iterators, or `Codec` / `KeyedCodec` for cursors; define writing with `EncodeRun` / `EncodeKeyedRun`.
+- Define temporary-run reading with `DecodeRun` for ordinary owned-record iterators, or `Codec` / `KeyedCodec` for lower-level control; define writing with `EncodeRun` / `EncodeKeyedRun`.
 - Define what "duplicate" means in your domain with `Dedup`. Custom deduplication logic can be introduced with this interface.
 - Control spilling with byte budgets (`measured_budget`) or item limits (`max_buffer_items`); these are not hard limits on total process memory.
 

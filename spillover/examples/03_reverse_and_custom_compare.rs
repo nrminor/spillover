@@ -7,7 +7,6 @@ use std::{
 use spillover::{
     codec::{CodecWriter, DecodeRun, EncodeRun},
     compare::{Compare, Reverse},
-    key::SortKey,
     sorter::Builder,
 };
 
@@ -64,36 +63,17 @@ impl EncodeRun<String> for LineCodec {
 #[derive(Clone, Copy)]
 struct AsciiCaseInsensitive;
 
-impl Compare<str> for AsciiCaseInsensitive {
-    fn compare(&self, a: &str, b: &str) -> Ordering {
-        a.to_ascii_lowercase().cmp(&b.to_ascii_lowercase())
-    }
-}
-
-impl Compare<&str> for AsciiCaseInsensitive {
-    fn compare(&self, a: &&str, b: &&str) -> Ordering {
-        a.to_ascii_lowercase().cmp(&b.to_ascii_lowercase())
-    }
-}
-
-#[derive(Clone, Copy)]
-struct AsStrKey;
-
-impl SortKey<String> for AsStrKey {
-    type Key<'a>
-        = &'a str
-    where
-        String: 'a;
-
-    fn key<'a>(&self, item: &'a String) -> Self::Key<'a> {
-        item.as_str()
+impl Compare<String> for AsciiCaseInsensitive {
+    fn compare(&self, a: &String, b: &String) -> Ordering {
+        let left = a.bytes().map(|byte| byte.to_ascii_lowercase());
+        let right = b.bytes().map(|byte| byte.to_ascii_lowercase());
+        left.cmp(right)
     }
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut sorter = Builder::new()
-        .key(AsStrKey)
-        .compare(Reverse(AsciiCaseInsensitive))
+        .order(Reverse(AsciiCaseInsensitive))
         .codec(LineCodec)
         .max_buffer_items(2)
         .build();
@@ -105,6 +85,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let output_stream = sorter.finish()?;
     let collected: Result<Vec<String>, _> = output_stream.collect();
     let output = collected?;
+    assert_eq!(output, ["zeta", "Gamma", "delta", "beta", "Alpha"]);
     println!("case-insensitive descending: {output:?}");
 
     Ok(())

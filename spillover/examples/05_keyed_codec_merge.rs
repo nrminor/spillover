@@ -1,11 +1,15 @@
-use std::io::{BufReader, BufWriter, Read, Write};
+use std::{
+    cmp::Ordering,
+    io::{BufReader, BufWriter, Read, Write},
+};
 
 use spillover::{
     codec::{
-        Codec, CodecCursor, DeriveKey, EncodeKeyedRun, KeyedCodec, KeyedCodecCursor,
-        KeyedCodecWriter, TakeOwned,
+        Codec, CodecCursor, EncodeKeyedRun, KeyedCodec, KeyedCodecCursor, KeyedCodecWriter,
+        TakeOwned,
     },
-    key::Owned,
+    compare::Compare,
+    key::{DeriveKey, KeyedOrder},
     sorter::Builder,
 };
 
@@ -120,15 +124,33 @@ impl EncodeKeyedRun<u64> for DecadeKeyedCodec {
     }
 }
 
-impl DeriveKey<u64> for DecadeKeyedCodec {
-    fn derive_key(&self, item: &u64) -> Self::Key {
+// Decade keys accelerate selection; full numeric order resolves their ties.
+#[derive(Clone, Copy)]
+struct DecadeOrder;
+
+impl Compare<u64> for DecadeOrder {
+    fn compare(&self, left: &u64, right: &u64) -> Ordering {
+        left.cmp(right)
+    }
+}
+
+impl KeyedOrder for DecadeOrder {
+    type StoredKey = u8;
+
+    fn compare_keys(&self, left: &Self::StoredKey, right: &Self::StoredKey) -> Ordering {
+        left.cmp(right)
+    }
+}
+
+impl DeriveKey<u64> for DecadeOrder {
+    fn derive_key(&self, item: &u64) -> Self::StoredKey {
         u8::try_from(*item / 10).expect("example values fit in u8 decade key")
     }
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut sorter = Builder::new()
-        .key(Owned(|v: &u64| *v))
+        .order(DecadeOrder)
         .keyed_codec(DecadeKeyedCodec)
         .max_buffer_items(2)
         .build();
@@ -140,6 +162,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let output_stream = sorter.finish()?;
     let collected: Result<Vec<u64>, _> = output_stream.collect();
     let output = collected?;
+    assert_eq!(output, [11, 12, 18, 19, 25, 26]);
     println!("keyed merge output: {output:?}");
 
     Ok(())
