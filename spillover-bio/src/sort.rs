@@ -23,7 +23,7 @@ use spillover::{
     codec::{Codec, CodecCursor, EncodeKeyedRun, EncodeRun, KeyedCodec},
     compare::{Compare, Natural},
     dedup::Identity,
-    key::{KeyCompare, SortKey},
+    key::{DeriveKey, KeyCompare, KeyedOrder, SortKey},
     merge::{KeyedRunMerge, MergeConfig, MergeError, RunMerge},
     sorter::{
         ByteLimit, HasOrder, ItemLimit, Keyed as CoreKeyed, NeedsLimit,
@@ -216,10 +216,10 @@ impl<const N: usize, R: SeqRecordParts + ?Sized> Compare<R> for SequenceOrder<N>
 }
 
 impl<const N: usize> RecordKeyer for SequenceOrder<N> {
-    type RecordKey = PackedSequenceKey<N>;
+    type RecordKey = <Self as KeyedOrder>::StoredKey;
 
     fn record_key<R: SeqRecordParts + ?Sized>(&self, record: &R) -> PackedSequenceKey<N> {
-        PackedSequenceKey::from_sequence(record.sequence())
+        self.derive_key(record)
     }
 }
 
@@ -274,10 +274,10 @@ fn derive_name_key<R: SeqRecordParts + ?Sized>(record: &R) -> dryice::Bytes16Key
 }
 
 impl RecordKeyer for NameOrder {
-    type RecordKey = dryice::Bytes16Key;
+    type RecordKey = <Self as KeyedOrder>::StoredKey;
 
     fn record_key<R: SeqRecordParts + ?Sized>(&self, record: &R) -> dryice::Bytes16Key {
-        derive_name_key(record)
+        self.derive_key(record)
     }
 }
 
@@ -332,10 +332,10 @@ fn derive_length_key<R: SeqRecordParts + ?Sized>(record: &R) -> dryice::Bytes8Ke
 }
 
 impl RecordKeyer for LengthOrder {
-    type RecordKey = dryice::Bytes8Key;
+    type RecordKey = <Self as KeyedOrder>::StoredKey;
 
     fn record_key<R: SeqRecordParts + ?Sized>(&self, record: &R) -> dryice::Bytes8Key {
-        derive_length_key(record)
+        self.derive_key(record)
     }
 }
 
@@ -512,8 +512,7 @@ impl<R: SeqRecordParts + ?Sized> Compare<R> for UnkeyedLengthOrder {
 /// .sort_by(Reverse(ILLUMINA_ORDER))   // Z→A
 /// .sort_by(Reverse(LengthOrder))     // longest first
 /// ```
-#[derive(Debug, Clone, Copy)]
-pub struct Reverse<O>(pub O);
+pub use spillover::compare::Reverse;
 
 impl<O: sealed::Sealed> sealed::Sealed for Reverse<O> {
     type CodecPolicy = O::CodecPolicy;
@@ -538,40 +537,11 @@ impl<O: SortOrder + Send + Sync + 'static> SortOrder for Reverse<O> {
     }
 }
 
-impl<O, R> Compare<R> for Reverse<O>
-where
-    O: SortOrder + Compare<R>,
-    R: SeqRecordParts + ?Sized,
-{
-    fn compare(&self, a: &R, b: &R) -> std::cmp::Ordering {
-        self.0.compare(a, b).reverse()
-    }
-}
-
 impl<O: RecordKeyer> RecordKeyer for Reverse<O> {
     type RecordKey = O::RecordKey;
 
     fn record_key<R: SeqRecordParts + ?Sized>(&self, record: &R) -> Self::RecordKey {
         self.0.record_key(record)
-    }
-}
-
-impl<O: spillover::key::KeyedOrder> spillover::key::KeyedOrder for Reverse<O> {
-    type StoredKey = O::StoredKey;
-    fn compare_keys(&self, left: &Self::StoredKey, right: &Self::StoredKey) -> std::cmp::Ordering {
-        self.0.compare_keys(left, right).reverse()
-    }
-}
-impl<R: ?Sized, O: spillover::key::DeriveKey<R>> spillover::key::DeriveKey<R> for Reverse<O> {
-    fn derive_key(&self, item: &R) -> Self::StoredKey {
-        self.0.derive_key(item)
-    }
-}
-impl<R: ?Sized, O: spillover::key::EstimateKeyMemory<R>> spillover::key::EstimateKeyMemory<R>
-    for Reverse<O>
-{
-    fn estimate_key_memory(&self, item: &R) -> spillover::key::KeyMemory {
-        self.0.estimate_key_memory(item)
     }
 }
 
@@ -1412,7 +1382,7 @@ impl<SK, C, L, CS, S, M> Builder<CoreBuilder<SK, L, CS>, C, S, M> {
 // build() for keyed sort orders.
 
 type NativeKeyedCodec<O, C> = KeyedDryIceCodec<
-    <O as RecordKeyer>::RecordKey,
+    <O as KeyedOrder>::StoredKey,
     <C as sealed::ResolveCodec<<O as sealed::Sealed>::CodecPolicy>>::S,
     <C as sealed::ResolveCodec<<O as sealed::Sealed>::CodecPolicy>>::Q,
     <C as sealed::ResolveCodec<<O as sealed::Sealed>::CodecPolicy>>::N,
@@ -1433,12 +1403,12 @@ macro_rules! owned_keyed_builder {
     ($limit:ty; $($extra:tt)*) => {
         impl<O, C, CS> Builder<OrderedCore<O, $limit, CS>, C, OwnedStorage, CoreKeyed>
         where
-            O: KeyedSortOrder + spillover::key::DeriveKey<SeqRecord, StoredKey = <O as RecordKeyer>::RecordKey>
+            O: KeyedSortOrder + DeriveKey<SeqRecord>
                 + Compare<SeqRecord> + Compare<NativeRecord<NativeKeyedCodec<O, C>>>,
-            <O as RecordKeyer>::RecordKey: RecordKey + Clone + 'static,
+            O::StoredKey: RecordKey + Clone + 'static,
             C: sealed::ResolveCodec<<O as sealed::Sealed>::CodecPolicy>,
             CS: sealed::CompatibleChunkSorter<O>,
-            for<'a> CS: ChunkSorter<spillover::key::Keyed<usize, <O as RecordKeyer>::RecordKey>, spillover::key::KeyedEntryCompare<'a, SeqRecord, O>>,
+            for<'a> CS: ChunkSorter<spillover::key::Keyed<usize, O::StoredKey>, spillover::key::KeyedEntryCompare<'a, SeqRecord, O>>,
             $($extra)*
         {
             /// Build the configured owned keyed sorter.
@@ -1459,25 +1429,23 @@ macro_rules! owned_keyed_builder {
 
 owned_keyed_builder!(ByteLimit;
     O: spillover::key::EstimateKeyMemory<SeqRecord>,
-    CS: spillover::chunk::EstimateSortMemory<spillover::key::Keyed<usize, <O as RecordKeyer>::RecordKey>>,
+    CS: spillover::chunk::EstimateSortMemory<spillover::key::Keyed<usize, O::StoredKey>>,
 );
 owned_keyed_builder!(ItemLimit;);
 
 impl<O, C, CS> Builder<OrderedCore<O, NeedsLimit, CS>, C, OwnedStorage, CoreKeyed>
 where
     O: KeyedSortOrder
-        + spillover::key::DeriveKey<SeqRecord, StoredKey = <O as RecordKeyer>::RecordKey>
+        + DeriveKey<SeqRecord>
         + spillover::key::EstimateKeyMemory<SeqRecord>
         + Compare<SeqRecord>
         + Compare<NativeRecord<NativeKeyedCodec<O, C>>>,
-    <O as RecordKeyer>::RecordKey: RecordKey + Clone + 'static,
+    O::StoredKey: RecordKey + Clone + 'static,
     C: sealed::ResolveCodec<<O as sealed::Sealed>::CodecPolicy>,
     CS: sealed::CompatibleChunkSorter<O>
-        + spillover::chunk::EstimateSortMemory<
-            spillover::key::Keyed<usize, <O as RecordKeyer>::RecordKey>,
-        >,
+        + spillover::chunk::EstimateSortMemory<spillover::key::Keyed<usize, O::StoredKey>>,
     for<'a> CS: ChunkSorter<
-            spillover::key::Keyed<usize, <O as RecordKeyer>::RecordKey>,
+            spillover::key::Keyed<usize, O::StoredKey>,
             spillover::key::KeyedEntryCompare<'a, SeqRecord, O>,
         >,
 {
@@ -1798,13 +1766,12 @@ type NativeArenaKeyed<'a, O, C, CS> =
 impl<'a, O, C, CS> Builder<OrderedCore<O, ItemLimit, CS>, C, ArenaStorage<'a>, CoreKeyed>
 where
     O: KeyedSortOrder + Compare<NativeRecord<NativeKeyedCodec<O, C>>>,
-    <O as RecordKeyer>::RecordKey: RecordKey + Clone + 'static,
+    O::StoredKey: RecordKey + Clone + 'static,
     C: sealed::ResolveCodec<<O as sealed::Sealed>::CodecPolicy>,
     CS: sealed::CompatibleChunkSorter<O>,
-    for<'v> O: spillover::key::DeriveKey<SeqRecordView<'v>, StoredKey = <O as RecordKeyer>::RecordKey>
-        + Compare<SeqRecordView<'v>>,
+    for<'v> O: DeriveKey<SeqRecordView<'v>> + Compare<SeqRecordView<'v>>,
     for<'v, 'order> CS: ChunkSorter<
-            spillover::key::Keyed<usize, <O as RecordKeyer>::RecordKey>,
+            spillover::key::Keyed<usize, O::StoredKey>,
             spillover::key::KeyedEntryCompare<'order, SeqRecordView<'v>, O>,
         >,
 {
@@ -1842,17 +1809,15 @@ type NativeMeasuredArenaKeyed<'a, O, C, CS> =
 impl<'a, O, C, CS> Builder<OrderedCore<O, ByteLimit, CS>, C, ArenaStorage<'a>, CoreKeyed>
 where
     O: KeyedSortOrder + Compare<NativeRecord<NativeKeyedCodec<O, C>>>,
-    <O as RecordKeyer>::RecordKey: RecordKey + Clone + 'static,
+    O::StoredKey: RecordKey + Clone + 'static,
     C: sealed::ResolveCodec<<O as sealed::Sealed>::CodecPolicy>,
     CS: sealed::CompatibleChunkSorter<O>
-        + spillover::chunk::EstimateSortMemory<
-            spillover::key::Keyed<usize, <O as RecordKeyer>::RecordKey>,
-        >,
-    for<'v> O: spillover::key::DeriveKey<SeqRecordView<'v>, StoredKey = <O as RecordKeyer>::RecordKey>
+        + spillover::chunk::EstimateSortMemory<spillover::key::Keyed<usize, O::StoredKey>>,
+    for<'v> O: DeriveKey<SeqRecordView<'v>>
         + spillover::key::EstimateKeyMemory<SeqRecordView<'v>>
         + Compare<SeqRecordView<'v>>,
     for<'v, 'order> CS: ChunkSorter<
-            spillover::key::Keyed<usize, <O as RecordKeyer>::RecordKey>,
+            spillover::key::Keyed<usize, O::StoredKey>,
             spillover::key::KeyedEntryCompare<'order, SeqRecordView<'v>, O>,
         >,
 {
@@ -1877,17 +1842,15 @@ where
 impl<'a, O, C, CS> Builder<OrderedCore<O, NeedsLimit, CS>, C, ArenaStorage<'a>, CoreKeyed>
 where
     O: KeyedSortOrder + Compare<NativeRecord<NativeKeyedCodec<O, C>>>,
-    <O as RecordKeyer>::RecordKey: RecordKey + Clone + 'static,
+    O::StoredKey: RecordKey + Clone + 'static,
     C: sealed::ResolveCodec<<O as sealed::Sealed>::CodecPolicy>,
     CS: sealed::CompatibleChunkSorter<O>
-        + spillover::chunk::EstimateSortMemory<
-            spillover::key::Keyed<usize, <O as RecordKeyer>::RecordKey>,
-        >,
-    for<'v> O: spillover::key::DeriveKey<SeqRecordView<'v>, StoredKey = <O as RecordKeyer>::RecordKey>
+        + spillover::chunk::EstimateSortMemory<spillover::key::Keyed<usize, O::StoredKey>>,
+    for<'v> O: DeriveKey<SeqRecordView<'v>>
         + spillover::key::EstimateKeyMemory<SeqRecordView<'v>>
         + Compare<SeqRecordView<'v>>,
     for<'v, 'order> CS: ChunkSorter<
-            spillover::key::Keyed<usize, <O as RecordKeyer>::RecordKey>,
+            spillover::key::Keyed<usize, O::StoredKey>,
             spillover::key::KeyedEntryCompare<'order, SeqRecordView<'v>, O>,
         >,
 {
