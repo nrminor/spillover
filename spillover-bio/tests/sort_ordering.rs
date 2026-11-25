@@ -1,12 +1,13 @@
 use std::cmp::Ordering;
 
 use proptest::prelude::*;
-use spillover::compare::Compare;
+use spillover::{
+    compare::Compare,
+    key::{DeriveKey, KeyedOrder},
+};
 use spillover_bio::{
     record::{SeqRecord, SeqRecordParts, SeqRecordView},
-    sort::{
-        ILLUMINA_ORDER, LengthOrder, NameOrder, RecordKeyer, Reverse, SequenceOrder, SortOrder,
-    },
+    sort::{ILLUMINA_ORDER, LengthOrder, NameOrder, Reverse, SequenceOrder},
 };
 
 fn rec(sequence: &[u8], quality: &[u8]) -> SeqRecord {
@@ -17,70 +18,61 @@ fn named_rec(name: &[u8], sequence: &[u8], quality: &[u8]) -> SeqRecord {
     SeqRecord::new(name, sequence, quality)
 }
 
-fn assert_record_order<O, R>(order: O, left: &R, right: &R, expected: Ordering)
+fn assert_record_order<O, R>(order: &O, left: &R, right: &R, expected: Ordering)
 where
-    O: SortOrder,
+    O: Compare<R>,
     R: SeqRecordParts + ?Sized,
-    O::Comparator: Compare<R>,
 {
-    assert_eq!(order.comparator().compare(left, right), expected);
+    assert_eq!(order.compare(left, right), expected);
 }
 
-fn assert_record_comparator_is_pairwise_consistent<O, R>(order: O, records: &[R])
+fn assert_record_comparator_is_pairwise_consistent<O, R>(order: &O, records: &[R])
 where
-    O: SortOrder,
+    O: Compare<R>,
     R: SeqRecordParts,
-    O::Comparator: Compare<R>,
 {
-    let cmp = order.comparator();
-
     for left in records {
-        assert_eq!(cmp.compare(left, left), Ordering::Equal);
+        assert_eq!(order.compare(left, left), Ordering::Equal);
 
         for right in records {
-            assert_eq!(cmp.compare(left, right), cmp.compare(right, left).reverse(),);
-        }
-    }
-}
-
-fn assert_key_comparator_is_pairwise_consistent<O, R>(order: O, records: &[R])
-where
-    O: SortOrder + RecordKeyer,
-    R: SeqRecordParts,
-    O::KeyComparator: Compare<O::RecordKey>,
-{
-    let cmp = order.key_comparator();
-
-    for left in records {
-        let left_key = order.record_key(left);
-        assert_eq!(cmp.compare(&left_key, &left_key), Ordering::Equal);
-
-        for right in records {
-            let right_key = order.record_key(right);
             assert_eq!(
-                cmp.compare(&left_key, &right_key),
-                cmp.compare(&right_key, &left_key).reverse(),
+                order.compare(left, right),
+                order.compare(right, left).reverse(),
             );
         }
     }
 }
 
-fn assert_key_and_record_order_are_compatible<O, R>(order: O, records: &[R])
+fn assert_key_comparator_is_pairwise_consistent<O, R>(order: &O, records: &[R])
 where
-    O: SortOrder + RecordKeyer,
+    O: DeriveKey<R>,
     R: SeqRecordParts,
-    O::Comparator: Compare<R>,
-    O::KeyComparator: Compare<O::RecordKey>,
 {
-    let key_cmp = order.key_comparator();
-    let record_cmp = order.comparator();
+    for left in records {
+        let left_key = order.derive_key(left);
+        assert_eq!(order.compare_keys(&left_key, &left_key), Ordering::Equal);
 
+        for right in records {
+            let right_key = order.derive_key(right);
+            assert_eq!(
+                order.compare_keys(&left_key, &right_key),
+                order.compare_keys(&right_key, &left_key).reverse(),
+            );
+        }
+    }
+}
+
+fn assert_key_and_record_order_are_compatible<O, R>(order: &O, records: &[R])
+where
+    O: DeriveKey<R> + Compare<R>,
+    R: SeqRecordParts,
+{
     for left in records {
         for right in records {
-            let left_key = order.record_key(left);
-            let right_key = order.record_key(right);
-            let key_order = key_cmp.compare(&left_key, &right_key);
-            let record_order = record_cmp.compare(left, right);
+            let left_key = order.derive_key(left);
+            let right_key = order.derive_key(right);
+            let key_order = order.compare_keys(&left_key, &right_key);
+            let record_order = order.compare(left, right);
 
             match key_order {
                 Ordering::Less => assert_ne!(record_order, Ordering::Greater),
@@ -91,47 +83,44 @@ where
     }
 }
 
-fn assert_record_comparator_is_consistent<O, R>(order: O, records: &[R])
+fn assert_record_comparator_is_consistent<O, R>(order: &O, records: &[R])
 where
-    O: SortOrder,
+    O: Compare<R>,
     R: SeqRecordParts,
-    O::Comparator: Compare<R>,
 {
-    let cmp = order.comparator();
+    let compare = |left: &R, right: &R| order.compare(left, right);
 
-    assert_comparator_is_consistent(&cmp, records);
+    assert_comparator_is_consistent(compare, records);
 }
 
-fn assert_key_comparator_is_consistent<O>(order: O, keys: &[O::RecordKey])
+fn assert_key_comparator_is_consistent<O>(order: &O, keys: &[O::StoredKey])
 where
-    O: SortOrder + RecordKeyer,
-    O::KeyComparator: Compare<O::RecordKey>,
+    O: KeyedOrder,
 {
-    let cmp = order.key_comparator();
+    let compare = |left: &O::StoredKey, right: &O::StoredKey| order.compare_keys(left, right);
 
-    assert_comparator_is_consistent(&cmp, keys);
+    assert_comparator_is_consistent(compare, keys);
 }
 
-fn assert_comparator_is_consistent<C, T>(cmp: &C, values: &[T])
+fn assert_comparator_is_consistent<C, T>(compare: C, values: &[T])
 where
-    C: Compare<T>,
+    C: Fn(&T, &T) -> Ordering,
 {
     for a in values {
-        assert_eq!(cmp.compare(a, a), Ordering::Equal);
+        assert_eq!(compare(a, a), Ordering::Equal);
     }
 
     for a in values {
         for b in values {
-            assert_eq!(cmp.compare(a, b), cmp.compare(b, a).reverse());
+            assert_eq!(compare(a, b), compare(b, a).reverse());
         }
     }
 
     for a in values {
         for b in values {
             for c in values {
-                if cmp.compare(a, b) != Ordering::Greater && cmp.compare(b, c) != Ordering::Greater
-                {
-                    assert_ne!(cmp.compare(a, c), Ordering::Greater);
+                if compare(a, b) != Ordering::Greater && compare(b, c) != Ordering::Greater {
+                    assert_ne!(compare(a, c), Ordering::Greater);
                 }
             }
         }
@@ -142,40 +131,40 @@ where
 fn ordinary_bases_follow_packed_primary_order() {
     let order = SequenceOrder::<1>;
 
-    assert_record_order(order, &rec(b"A", b"!"), &rec(b"C", b"!"), Ordering::Less);
-    assert_record_order(order, &rec(b"C", b"!"), &rec(b"G", b"!"), Ordering::Less);
-    assert_record_order(order, &rec(b"G", b"!"), &rec(b"T", b"!"), Ordering::Less);
+    assert_record_order(&order, &rec(b"A", b"!"), &rec(b"C", b"!"), Ordering::Less);
+    assert_record_order(&order, &rec(b"C", b"!"), &rec(b"G", b"!"), Ordering::Less);
+    assert_record_order(&order, &rec(b"G", b"!"), &rec(b"T", b"!"), Ordering::Less);
 }
 
 #[test]
 fn ambiguous_bases_follow_packed_primary_order() {
     let order = SequenceOrder::<1>;
-    assert_record_order(order, &rec(b"N", b"!"), &rec(b"C", b"!"), Ordering::Less);
+    assert_record_order(&order, &rec(b"N", b"!"), &rec(b"C", b"!"), Ordering::Less);
 }
 
 #[test]
 fn lowercase_bases_follow_packed_primary_order() {
     let order = SequenceOrder::<1>;
-    assert_record_order(order, &rec(b"a", b"!"), &rec(b"C", b"!"), Ordering::Less);
+    assert_record_order(&order, &rec(b"a", b"!"), &rec(b"C", b"!"), Ordering::Less);
 }
 
 #[test]
 fn ambiguous_packed_ties_refine_by_raw_sequence() {
     let order = SequenceOrder::<1>;
-    assert_record_order(order, &rec(b"A", b"!"), &rec(b"N", b"!"), Ordering::Less);
+    assert_record_order(&order, &rec(b"A", b"!"), &rec(b"N", b"!"), Ordering::Less);
 }
 
 #[test]
 fn zero_padded_packed_ties_refine_by_raw_sequence() {
     let order = SequenceOrder::<1>;
-    assert_record_order(order, &rec(b"A", b"!"), &rec(b"AA", b"!!"), Ordering::Less);
+    assert_record_order(&order, &rec(b"A", b"!"), &rec(b"AA", b"!!"), Ordering::Less);
 }
 
 #[test]
 fn identical_sequences_refine_by_quality() {
     let order = SequenceOrder::<1>;
     assert_record_order(
-        order,
+        &order,
         &rec(b"ACGT", b"!!!!"),
         &rec(b"ACGT", b"IIII"),
         Ordering::Less,
@@ -185,7 +174,7 @@ fn identical_sequences_refine_by_quality() {
 #[test]
 fn empty_sequences_are_ordered() {
     let order = SequenceOrder::<1>;
-    assert_record_order(order, &rec(b"", b""), &rec(b"C", b"!"), Ordering::Less);
+    assert_record_order(&order, &rec(b"", b""), &rec(b"C", b"!"), Ordering::Less);
 }
 
 fn sequence_order_examples() -> Vec<SeqRecord> {
@@ -260,9 +249,9 @@ fn owned_records_have_compatible_key_and_record_order() {
     let order = SequenceOrder::<1>;
     let records = sequence_order_examples();
 
-    assert_record_comparator_is_pairwise_consistent(order, &records);
-    assert_key_comparator_is_pairwise_consistent(order, &records);
-    assert_key_and_record_order_are_compatible(order, &records);
+    assert_record_comparator_is_pairwise_consistent(&order, &records);
+    assert_key_comparator_is_pairwise_consistent(&order, &records);
+    assert_key_and_record_order_are_compatible(&order, &records);
 }
 
 #[test]
@@ -272,9 +261,9 @@ fn borrowed_records_have_compatible_key_and_record_order() {
 
     let views: Vec<SeqRecordView<'_>> = records.iter().map(SeqRecord::as_view).collect();
 
-    assert_record_comparator_is_pairwise_consistent(order, &views);
-    assert_key_comparator_is_pairwise_consistent(order, &views);
-    assert_key_and_record_order_are_compatible(order, &views);
+    assert_record_comparator_is_pairwise_consistent(&order, &views);
+    assert_key_comparator_is_pairwise_consistent(&order, &views);
+    assert_key_and_record_order_are_compatible(&order, &views);
 }
 
 fn illumina_sequence_len() -> impl Strategy<Value = usize> {
@@ -356,7 +345,7 @@ macro_rules! record_comparator_consistency_test {
         fn $test_name() {
             let records = comparator_consistency_examples();
 
-            assert_record_comparator_is_consistent($order, &records);
+            assert_record_comparator_is_consistent(&$order, &records);
         }
     };
 
@@ -366,7 +355,7 @@ macro_rules! record_comparator_consistency_test {
             let records = comparator_consistency_examples();
             let views: Vec<SeqRecordView<'_>> = records.iter().map(SeqRecord::as_view).collect();
 
-            assert_record_comparator_is_consistent($order, &views);
+            assert_record_comparator_is_consistent(&$order, &views);
         }
     };
 }
@@ -379,10 +368,10 @@ macro_rules! key_comparator_consistency_test {
             let records = comparator_consistency_examples();
             let keys: Vec<_> = records
                 .iter()
-                .map(|record| order.record_key(record))
+                .map(|record| order.derive_key(record))
                 .collect();
 
-            assert_key_comparator_is_consistent(order, &keys);
+            assert_key_comparator_is_consistent(&order, &keys);
         }
     };
 }
@@ -497,7 +486,7 @@ key_comparator_consistency_test!(
 fn name_order_key_and_record_order_are_compatible_for_owned_records() {
     let records = name_order_examples();
 
-    assert_key_and_record_order_are_compatible(NameOrder, &records);
+    assert_key_and_record_order_are_compatible(&NameOrder, &records);
 }
 
 #[test]
@@ -505,14 +494,14 @@ fn name_order_key_and_record_order_are_compatible_for_borrowed_records() {
     let records = name_order_examples();
     let views: Vec<SeqRecordView<'_>> = records.iter().map(SeqRecord::as_view).collect();
 
-    assert_key_and_record_order_are_compatible(NameOrder, &views);
+    assert_key_and_record_order_are_compatible(&NameOrder, &views);
 }
 
 #[test]
 fn reverse_name_order_key_and_record_order_are_compatible_for_owned_records() {
     let records = name_order_examples();
 
-    assert_key_and_record_order_are_compatible(Reverse(NameOrder), &records);
+    assert_key_and_record_order_are_compatible(&Reverse(NameOrder), &records);
 }
 
 #[test]
@@ -520,14 +509,14 @@ fn reverse_name_order_key_and_record_order_are_compatible_for_borrowed_records()
     let records = name_order_examples();
     let views: Vec<SeqRecordView<'_>> = records.iter().map(SeqRecord::as_view).collect();
 
-    assert_key_and_record_order_are_compatible(Reverse(NameOrder), &views);
+    assert_key_and_record_order_are_compatible(&Reverse(NameOrder), &views);
 }
 
 #[test]
 fn length_order_key_and_record_order_are_compatible_for_owned_records() {
     let records = length_order_examples();
 
-    assert_key_and_record_order_are_compatible(LengthOrder, &records);
+    assert_key_and_record_order_are_compatible(&LengthOrder, &records);
 }
 
 #[test]
@@ -535,14 +524,14 @@ fn length_order_key_and_record_order_are_compatible_for_borrowed_records() {
     let records = length_order_examples();
     let views: Vec<SeqRecordView<'_>> = records.iter().map(SeqRecord::as_view).collect();
 
-    assert_key_and_record_order_are_compatible(LengthOrder, &views);
+    assert_key_and_record_order_are_compatible(&LengthOrder, &views);
 }
 
 #[test]
 fn reverse_length_order_key_and_record_order_are_compatible_for_owned_records() {
     let records = length_order_examples();
 
-    assert_key_and_record_order_are_compatible(Reverse(LengthOrder), &records);
+    assert_key_and_record_order_are_compatible(&Reverse(LengthOrder), &records);
 }
 
 #[test]
@@ -550,7 +539,7 @@ fn reverse_length_order_key_and_record_order_are_compatible_for_borrowed_records
     let records = length_order_examples();
     let views: Vec<SeqRecordView<'_>> = records.iter().map(SeqRecord::as_view).collect();
 
-    assert_key_and_record_order_are_compatible(Reverse(LengthOrder), &views);
+    assert_key_and_record_order_are_compatible(&Reverse(LengthOrder), &views);
 }
 
 #[test]
@@ -558,13 +547,10 @@ fn length_order_ties_distinct_equal_length_records() {
     let left = named_rec(b"same_len_a", b"AA", b"!!");
     let right = named_rec(b"same_len_b", b"TT", b"II");
 
+    assert_eq!(LengthOrder.compare(&left, &right), Ordering::Equal);
     assert_eq!(
-        LengthOrder.comparator().compare(&left, &right),
-        Ordering::Equal
-    );
-    assert_eq!(
-        LengthOrder.record_key(&left),
-        LengthOrder.record_key(&right)
+        LengthOrder.derive_key(&left),
+        LengthOrder.derive_key(&right)
     );
 }
 
@@ -576,9 +562,9 @@ proptest! {
     ) {
         let records = vec![left, right];
 
-        assert_record_comparator_is_pairwise_consistent(ILLUMINA_ORDER, &records);
-        assert_key_comparator_is_pairwise_consistent(ILLUMINA_ORDER, &records);
-        assert_key_and_record_order_are_compatible(ILLUMINA_ORDER, &records);
+        assert_record_comparator_is_pairwise_consistent(&ILLUMINA_ORDER, &records);
+        assert_key_comparator_is_pairwise_consistent(&ILLUMINA_ORDER, &records);
+        assert_key_and_record_order_are_compatible(&ILLUMINA_ORDER, &records);
     }
 
     #[test]
@@ -587,7 +573,7 @@ proptest! {
     ) {
         let records = [a, b, c];
 
-        assert_record_comparator_is_consistent(SequenceOrder::<1>, &records);
+        assert_record_comparator_is_consistent(&SequenceOrder::<1>, &records);
     }
 
     #[test]
@@ -596,7 +582,7 @@ proptest! {
     ) {
         let records = [a, b, c];
 
-        assert_record_comparator_is_consistent(ILLUMINA_ORDER, &records);
+        assert_record_comparator_is_consistent(&ILLUMINA_ORDER, &records);
     }
 
     #[test]
@@ -605,7 +591,7 @@ proptest! {
     ) {
         let records = [a, b, c];
 
-        assert_record_comparator_is_consistent(NameOrder, &records);
+        assert_record_comparator_is_consistent(&NameOrder, &records);
     }
 
     #[test]
@@ -614,7 +600,7 @@ proptest! {
     ) {
         let records = [a, b, c];
 
-        assert_record_comparator_is_consistent(LengthOrder, &records);
+        assert_record_comparator_is_consistent(&LengthOrder, &records);
     }
 
     #[test]
@@ -624,7 +610,7 @@ proptest! {
     ) {
         let records = [left, right];
 
-        assert_key_and_record_order_are_compatible(NameOrder, &records);
+        assert_key_and_record_order_are_compatible(&NameOrder, &records);
     }
 
     #[test]
@@ -634,6 +620,6 @@ proptest! {
     ) {
         let records = [left, right];
 
-        assert_key_and_record_order_are_compatible(LengthOrder, &records);
+        assert_key_and_record_order_are_compatible(&LengthOrder, &records);
     }
 }

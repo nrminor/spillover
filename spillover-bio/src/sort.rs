@@ -1,8 +1,8 @@
 //! Genomics-specific sort keys, sort orders, and the sorter builder.
 //!
 //! Sort keys extract the value to sort by from record-shaped values.
-//! Sort orders bundle a sort key with a compatible dryice record
-//! key and a merge strategy, preventing invalid combinations.
+//! Sort orders implement core comparison and key-derivation traits;
+//! Bio selects merge strategies and compatible codecs and algorithms.
 //!
 //! Accelerated sequence orders compare packed sequence keys first, then
 //! raw sequence and quality bytes. Exact sequence ordering compares
@@ -20,9 +20,9 @@ use spillover::{
     SortedItemsError,
     chunk::{ChunkSorter, Sequential},
     codec::{Codec, CodecCursor, EncodeKeyedRun, EncodeRun, KeyedCodec},
-    compare::{Compare, Natural},
+    compare::Compare,
     dedup::Identity,
-    key::{DeriveKey, KeyCompare, KeyedOrder, SortKey},
+    key::{DeriveKey, KeyedOrder, SortKey},
     merge::{KeyedRunMerge, MergeConfig, MergeError, RunMerge},
     sorter::{
         ByteLimit, HasOrder, ItemLimit, Keyed as CoreKeyed, NeedsLimit,
@@ -112,52 +112,14 @@ mod sealed {
     }
 }
 
-/// Defines a complete sort order: what to sort by, how to
-/// compare, and what merge strategy to use. Sealed — only
-/// spillover-bio's built-in orders implement this.
+/// Selects Bio's merge strategy for an order.
+///
+/// Comparison and key derivation use core's [`Compare`], [`KeyedOrder`],
+/// and [`DeriveKey`] traits. Sealed — only Bio's built-in orders implement this.
 pub trait SortOrder: sealed::Sealed + Copy {
-    /// The sort key for extracting the comparison value.
-    type SortKey: SortKey<SeqRecord> + Copy + Send + Sync + 'static;
-
-    /// Comparator for record-shaped values under this order.
-    ///
-    /// This is the comparator callers should use when they already have records
-    /// or record views in memory.
-    type Comparator: Copy + Send + Sync + 'static;
-
-    /// Comparator for extracted sort keys and compact merge keys.
-    ///
-    /// Available for explicit key comparisons; the builder passes the complete
-    /// order to the core sorter.
-    type KeyComparator: Copy + Send + Sync + 'static;
-
     /// The merge strategy marker: [`Unkeyed`] or [`Keyed`].
     type Strategy;
-
-    /// The sort key extractor.
-    fn sort_key(&self) -> Self::SortKey;
-
-    /// The record comparator.
-    fn comparator(&self) -> Self::Comparator;
-
-    /// The key comparator.
-    fn key_comparator(&self) -> Self::KeyComparator;
 }
-
-/// Derives dryice record keys from record-shaped values.
-pub trait RecordKeyer: Copy {
-    /// The dryice record key type.
-    type RecordKey: dryice::RecordKey + Clone + Copy;
-
-    /// Derive a record key from any record-shaped value.
-    fn record_key<R: SeqRecordParts + ?Sized>(&self, record: &R) -> Self::RecordKey;
-}
-
-/// Extension for sort orders that use record keys for merge
-/// acceleration. Only available when `Strategy = Keyed`.
-pub trait KeyedSortOrder: SortOrder<Strategy = Keyed> + RecordKeyer {}
-
-impl<O> KeyedSortOrder for O where O: SortOrder<Strategy = Keyed> + RecordKeyer {}
 
 impl<O> sealed::CompatibleChunkSorter<O> for Sequential {}
 
@@ -187,22 +149,7 @@ impl<const N: usize> sealed::Sealed for SequenceOrder<N> {
 }
 
 impl<const N: usize> SortOrder for SequenceOrder<N> {
-    type SortKey = SequenceQualityKey;
-    type Comparator = Self;
-    type KeyComparator = Natural;
     type Strategy = Keyed;
-
-    fn sort_key(&self) -> SequenceQualityKey {
-        SequenceQualityKey
-    }
-
-    fn comparator(&self) -> Self {
-        *self
-    }
-
-    fn key_comparator(&self) -> Natural {
-        Natural
-    }
 }
 
 impl<const N: usize, R: SeqRecordParts + ?Sized> Compare<R> for SequenceOrder<N> {
@@ -211,14 +158,6 @@ impl<const N: usize, R: SeqRecordParts + ?Sized> Compare<R> for SequenceOrder<N>
             .cmp(&PackedSequenceKey::<N>::from_sequence(b.sequence()))
             .then_with(|| a.sequence().cmp(b.sequence()))
             .then_with(|| a.quality().cmp(b.quality()))
-    }
-}
-
-impl<const N: usize> RecordKeyer for SequenceOrder<N> {
-    type RecordKey = <Self as KeyedOrder>::StoredKey;
-
-    fn record_key<R: SeqRecordParts + ?Sized>(&self, record: &R) -> PackedSequenceKey<N> {
-        self.derive_key(record)
     }
 }
 
@@ -241,22 +180,7 @@ impl sealed::Sealed for NameOrder {
 }
 
 impl SortOrder for NameOrder {
-    type SortKey = NameKey;
-    type Comparator = Self;
-    type KeyComparator = Natural;
     type Strategy = Keyed;
-
-    fn sort_key(&self) -> NameKey {
-        NameKey
-    }
-
-    fn comparator(&self) -> Self {
-        *self
-    }
-
-    fn key_comparator(&self) -> Natural {
-        Natural
-    }
 }
 
 impl<R: SeqRecordParts + ?Sized> Compare<R> for NameOrder {
@@ -270,14 +194,6 @@ fn derive_name_key<R: SeqRecordParts + ?Sized>(record: &R) -> dryice::Bytes16Key
     let len = record.name().len().min(16);
     key[..len].copy_from_slice(&record.name()[..len]);
     dryice::Bytes16Key(key)
-}
-
-impl RecordKeyer for NameOrder {
-    type RecordKey = <Self as KeyedOrder>::StoredKey;
-
-    fn record_key<R: SeqRecordParts + ?Sized>(&self, record: &R) -> dryice::Bytes16Key {
-        self.derive_key(record)
-    }
 }
 
 impl NameOrder {
@@ -301,22 +217,7 @@ impl sealed::Sealed for LengthOrder {
 }
 
 impl SortOrder for LengthOrder {
-    type SortKey = LengthKey;
-    type Comparator = Self;
-    type KeyComparator = Natural;
     type Strategy = Keyed;
-
-    fn sort_key(&self) -> LengthKey {
-        LengthKey
-    }
-
-    fn comparator(&self) -> Self {
-        *self
-    }
-
-    fn key_comparator(&self) -> Natural {
-        Natural
-    }
 }
 
 impl<R: SeqRecordParts + ?Sized> Compare<R> for LengthOrder {
@@ -328,14 +229,6 @@ impl<R: SeqRecordParts + ?Sized> Compare<R> for LengthOrder {
 #[allow(clippy::cast_possible_truncation)]
 fn derive_length_key<R: SeqRecordParts + ?Sized>(record: &R) -> dryice::Bytes8Key {
     dryice::Bytes8Key((record.sequence().len() as u64).to_be_bytes())
-}
-
-impl RecordKeyer for LengthOrder {
-    type RecordKey = <Self as KeyedOrder>::StoredKey;
-
-    fn record_key<R: SeqRecordParts + ?Sized>(&self, record: &R) -> dryice::Bytes8Key {
-        self.derive_key(record)
-    }
 }
 
 impl LengthOrder {
@@ -410,22 +303,7 @@ impl sealed::Sealed for UnkeyedSequenceOrder {
 }
 
 impl SortOrder for UnkeyedSequenceOrder {
-    type SortKey = SequenceQualityKey;
-    type Comparator = Self;
-    type KeyComparator = Natural;
     type Strategy = Unkeyed;
-
-    fn sort_key(&self) -> SequenceQualityKey {
-        SequenceQualityKey
-    }
-
-    fn comparator(&self) -> Self {
-        *self
-    }
-
-    fn key_comparator(&self) -> Natural {
-        Natural
-    }
 }
 
 impl<R: SeqRecordParts + ?Sized> Compare<R> for UnkeyedSequenceOrder {
@@ -445,22 +323,7 @@ impl sealed::Sealed for UnkeyedNameOrder {
 }
 
 impl SortOrder for UnkeyedNameOrder {
-    type SortKey = NameKey;
-    type Comparator = Self;
-    type KeyComparator = Natural;
     type Strategy = Unkeyed;
-
-    fn sort_key(&self) -> NameKey {
-        NameKey
-    }
-
-    fn comparator(&self) -> Self {
-        *self
-    }
-
-    fn key_comparator(&self) -> Natural {
-        Natural
-    }
 }
 
 impl<R: SeqRecordParts + ?Sized> Compare<R> for UnkeyedNameOrder {
@@ -478,22 +341,7 @@ impl sealed::Sealed for UnkeyedLengthOrder {
 }
 
 impl SortOrder for UnkeyedLengthOrder {
-    type SortKey = LengthKey;
-    type Comparator = Self;
-    type KeyComparator = Natural;
     type Strategy = Unkeyed;
-
-    fn sort_key(&self) -> LengthKey {
-        LengthKey
-    }
-
-    fn comparator(&self) -> Self {
-        *self
-    }
-
-    fn key_comparator(&self) -> Natural {
-        Natural
-    }
 }
 
 impl<R: SeqRecordParts + ?Sized> Compare<R> for UnkeyedLengthOrder {
@@ -517,31 +365,8 @@ impl<O: sealed::Sealed> sealed::Sealed for Reverse<O> {
     type CodecPolicy = O::CodecPolicy;
 }
 
-impl<O: SortOrder + Send + Sync + 'static> SortOrder for Reverse<O> {
-    type SortKey = O::SortKey;
-    type Comparator = Self;
-    type KeyComparator = spillover::compare::Reverse<O::KeyComparator>;
+impl<O: SortOrder> SortOrder for Reverse<O> {
     type Strategy = O::Strategy;
-
-    fn sort_key(&self) -> Self::SortKey {
-        self.0.sort_key()
-    }
-
-    fn comparator(&self) -> Self {
-        *self
-    }
-
-    fn key_comparator(&self) -> spillover::compare::Reverse<O::KeyComparator> {
-        spillover::compare::Reverse(self.0.key_comparator())
-    }
-}
-
-impl<O: RecordKeyer> RecordKeyer for Reverse<O> {
-    type RecordKey = O::RecordKey;
-
-    fn record_key<R: SeqRecordParts + ?Sized>(&self, record: &R) -> Self::RecordKey {
-        self.0.record_key(record)
-    }
 }
 
 // ── Convenience aliases ──────────────────────────────────
@@ -684,32 +509,10 @@ impl RecordDedupState {
     }
 }
 
-/// Legacy marker for a builder with no sort order.
-///
-/// Retained as a public name; the current [`Builder`] does not use it.
-pub struct NeedsOrder;
-/// Legacy marker for a builder with a keyed sort order.
-///
-/// Retained as a public name; the current [`Builder`] does not use it.
-pub struct HasKeyedOrder<O>(O);
-/// Legacy marker for a builder with an unkeyed sort order.
-///
-/// Retained as a public name; the current [`Builder`] does not use it.
-pub struct HasUnkeyedOrder<O>(O);
-
 /// Builder marker: no codec chosen yet.
 pub struct NeedsCodec;
 /// Builder marker: codec has been chosen.
 pub struct HasCodec<S, Q, N>(DryIceCodec<S, Q, N>);
-
-/// Legacy marker for a builder with no flush strategy.
-///
-/// Retained as a public name; the current [`Builder`] does not use it.
-pub struct NeedsFlush;
-/// Legacy marker for a builder with a flush strategy.
-///
-/// Retained as a public name; the current [`Builder`] does not use it.
-pub struct HasFlush<L = spillover::sorter::ByteLimit>(L);
 
 /// Builder marker: use the default owned-record buffer.
 pub struct OwnedStorage;
@@ -717,13 +520,6 @@ pub struct OwnedStorage;
 /// Builder marker: use caller-provided arena storage for the spill window.
 pub struct ArenaStorage<'a> {
     arena: &'a mut SeqRecordArena,
-}
-
-// Retained for public compatibility.
-#[doc(hidden)]
-pub enum FlushConfig {
-    MeasuredBudget(usize),
-    MaxItems(usize),
 }
 
 /// Default memory budget when `.measured_budget()` is not called:
@@ -832,7 +628,7 @@ type InitialCore = CoreBuilder<CoreNeedsOrder, NeedsLimit, Sequential>;
 ///
 /// Construct a sorter with [`Builder`], push unsorted records into it, then call
 /// [`finish`](Self::finish) to produce a [`SortedRecordStream`].
-pub struct Sorter<SK, Cod, Cmp, CS, M, B = OwnedBackend<SK, Cod, Cmp, CS, M>> {
+pub struct Sorter<SK, Cod, Cmp, CS, M, B> {
     inner: B,
     dedup: RecordDedup,
     _types: std::marker::PhantomData<SorterTypeMarker<SK, Cod, Cmp, CS, M>>,
@@ -840,16 +636,9 @@ pub struct Sorter<SK, Cod, Cmp, CS, M, B = OwnedBackend<SK, Cod, Cmp, CS, M>> {
 
 type SorterTypeMarker<SK, Cod, Cmp, CS, M> = fn() -> (SK, Cod, Cmp, CS, M);
 
-/// Default owned-record backend for [`Sorter`].
+/// Owned-record backend for [`Sorter`].
 #[doc(hidden)]
-pub struct OwnedBackend<
-    SK,
-    Cod,
-    Cmp,
-    CS,
-    M,
-    Inner = spillover::sorter::Sorter<SeqRecord, SK, Cod, Cmp, Identity, CS, M>,
-> {
+pub struct OwnedBackend<SK, Cod, Cmp, CS, M, Inner> {
     inner: Inner,
     _types: std::marker::PhantomData<SorterTypeMarker<SK, Cod, Cmp, CS, M>>,
 }
@@ -995,104 +784,6 @@ impl Default for Builder {
     }
 }
 
-// These bounds intentionally mirror the core sorter's record and keyed
-// push/finish implementations. The bio wrapper owns the public lifecycle
-// vocabulary; core owns the sorting mechanics.
-
-impl<SK, Cod, Cmp, CS>
-    Sorter<
-        SK,
-        Cod,
-        Cmp,
-        CS,
-        spillover::sorter::Unkeyed,
-        OwnedBackend<SK, Cod, Cmp, CS, spillover::sorter::Unkeyed>,
-    >
-where
-    SK: SortKey<SeqRecord> + Copy + Send + Sync + 'static,
-    Cod: Codec + Copy + 'static,
-    Cod: EncodeRun<SeqRecord>,
-    Cod: EncodeRun<<<Cod as Codec>::Cursor<BufReader<File>> as CodecCursor>::Record>,
-    Cmp: for<'a> Compare<SK::Key<'a>> + Copy + Send + Sync + 'static,
-    KeyCompare<SK, Cmp>: Compare<<<Cod as Codec>::Cursor<BufReader<File>> as CodecCursor>::Record>,
-    CS: ChunkSorter<SeqRecord, KeyCompare<SK, Cmp>>,
-{
-    /// Add an unsorted record to the sorter.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if flushing buffered records to disk fails.
-    pub fn push(&mut self, record: impl Into<SeqRecord>) -> Result<(), MergeError<Cod::Error>> {
-        self.inner.inner.push(record.into())
-    }
-
-    /// Finish sorting and return the finalized sorted record stream.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if flushing or merging fails.
-    #[allow(clippy::type_complexity)]
-    pub fn finish(
-        self,
-    ) -> Result<
-        SortedRecordStream<spillover::Sorted<RunMerge<Cod, KeyCompare<SK, Cmp>>>>,
-        MergeError<Cod::Error>,
-    > {
-        let inner = self.inner.inner.finish()?;
-        let dedup = RecordDedupState::new(self.dedup);
-        Ok(SortedRecordStream::new(inner, dedup))
-    }
-}
-
-impl<SK, Cod, Cmp, CS>
-    Sorter<
-        SK,
-        Cod,
-        Cmp,
-        CS,
-        spillover::sorter::Keyed,
-        OwnedBackend<SK, Cod, Cmp, CS, spillover::sorter::Keyed>,
-    >
-where
-    SK: SortKey<SeqRecord> + Copy + Send + Sync + 'static,
-    Cod: KeyedCodec
-        + EncodeKeyedRun<SeqRecord>
-        + spillover::codec::DeriveKey<SeqRecord>
-        + Copy
-        + 'static,
-    Cod: EncodeKeyedRun<<<Cod as KeyedCodec>::KeyedCursor<BufReader<File>> as CodecCursor>::Record>,
-    Cmp: for<'a> Compare<SK::Key<'a>> + Compare<Cod::Key> + Copy + Send + Sync + 'static,
-    KeyCompare<SK, Cmp>:
-        Compare<<<Cod as KeyedCodec>::KeyedCursor<BufReader<File>> as CodecCursor>::Record>,
-    CS: ChunkSorter<SeqRecord, KeyCompare<SK, Cmp>>,
-{
-    /// Add an unsorted record to the sorter.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if flushing buffered records to disk fails.
-    pub fn push(&mut self, record: impl Into<SeqRecord>) -> Result<(), MergeError<Cod::Error>> {
-        self.inner.inner.push(record.into())
-    }
-
-    /// Finish sorting and return the finalized sorted record stream.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if flushing or merging fails.
-    #[allow(clippy::type_complexity)]
-    pub fn finish(
-        self,
-    ) -> Result<
-        SortedRecordStream<spillover::Sorted<KeyedRunMerge<Cod, Cmp, KeyCompare<SK, Cmp>>>>,
-        MergeError<Cod::Error>,
-    > {
-        let inner = self.inner.inner.finish()?;
-        let dedup = RecordDedupState::new(self.dedup);
-        Ok(SortedRecordStream::new(inner, dedup))
-    }
-}
-
 macro_rules! native_keyed_methods {
     ($limit:ty; $($extra:tt)*) => {
         impl<O, C, CS> NativeSorter<O, C, CS, $limit>
@@ -1151,7 +842,7 @@ impl<Core, C, M> Builder<Core, C, OwnedStorage, M> {
 impl<C, L, CS, S> Builder<CoreBuilder<CoreNeedsOrder, L, CS>, C, S> {
     /// Set a keyed sort order (merge compares record keys).
     #[must_use]
-    pub fn sort_by<O: KeyedSortOrder>(
+    pub fn sort_by<O: SortOrder<Strategy = Keyed> + KeyedOrder>(
         self,
         order: O,
     ) -> Builder<OrderedCore<O, L, CS>, C, S, CoreKeyed> {
@@ -1386,7 +1077,7 @@ macro_rules! owned_keyed_builder {
     ($limit:ty; $($extra:tt)*) => {
         impl<O, C, CS> Builder<OrderedCore<O, $limit, CS>, C, OwnedStorage, CoreKeyed>
         where
-            O: KeyedSortOrder + DeriveKey<SeqRecord>
+            O: SortOrder<Strategy = Keyed> + DeriveKey<SeqRecord>
                 + Compare<SeqRecord> + Compare<NativeRecord<NativeKeyedCodec<O, C>>>,
             O::StoredKey: RecordKey + Clone + 'static,
             C: sealed::ResolveCodec<<O as sealed::Sealed>::CodecPolicy>,
@@ -1418,7 +1109,7 @@ owned_keyed_builder!(ItemLimit;);
 
 impl<O, C, CS> Builder<OrderedCore<O, NeedsLimit, CS>, C, OwnedStorage, CoreKeyed>
 where
-    O: KeyedSortOrder
+    O: SortOrder<Strategy = Keyed>
         + DeriveKey<SeqRecord>
         + spillover::key::EstimateKeyMemory<SeqRecord>
         + Compare<SeqRecord>
@@ -1748,7 +1439,7 @@ type NativeArenaKeyed<'a, O, C, CS> =
 
 impl<'a, O, C, CS> Builder<OrderedCore<O, ItemLimit, CS>, C, ArenaStorage<'a>, CoreKeyed>
 where
-    O: KeyedSortOrder + Compare<NativeRecord<NativeKeyedCodec<O, C>>>,
+    O: SortOrder<Strategy = Keyed> + KeyedOrder + Compare<NativeRecord<NativeKeyedCodec<O, C>>>,
     O::StoredKey: RecordKey + Clone + 'static,
     C: sealed::ResolveCodec<<O as sealed::Sealed>::CodecPolicy>,
     CS: sealed::CompatibleChunkSorter<O>,
@@ -1791,7 +1482,7 @@ type NativeMeasuredArenaKeyed<'a, O, C, CS> =
 
 impl<'a, O, C, CS> Builder<OrderedCore<O, ByteLimit, CS>, C, ArenaStorage<'a>, CoreKeyed>
 where
-    O: KeyedSortOrder + Compare<NativeRecord<NativeKeyedCodec<O, C>>>,
+    O: SortOrder<Strategy = Keyed> + KeyedOrder + Compare<NativeRecord<NativeKeyedCodec<O, C>>>,
     O::StoredKey: RecordKey + Clone + 'static,
     C: sealed::ResolveCodec<<O as sealed::Sealed>::CodecPolicy>,
     CS: sealed::CompatibleChunkSorter<O>
@@ -1824,7 +1515,7 @@ where
 
 impl<'a, O, C, CS> Builder<OrderedCore<O, NeedsLimit, CS>, C, ArenaStorage<'a>, CoreKeyed>
 where
-    O: KeyedSortOrder + Compare<NativeRecord<NativeKeyedCodec<O, C>>>,
+    O: SortOrder<Strategy = Keyed> + KeyedOrder + Compare<NativeRecord<NativeKeyedCodec<O, C>>>,
     O::StoredKey: RecordKey + Clone + 'static,
     C: sealed::ResolveCodec<<O as sealed::Sealed>::CodecPolicy>,
     CS: sealed::CompatibleChunkSorter<O>
@@ -2075,7 +1766,7 @@ mod tests {
     #[test]
     fn illumina_order_produces_correct_key() {
         let rec = make_record(b"r1", b"ACGT", b"!!!!");
-        let key = ILLUMINA_ORDER.record_key(&rec);
+        let key = ILLUMINA_ORDER.derive_key(&rec);
         let expected = crate::key::PackedSequenceKey::<38>::from_sequence(b"ACGT");
         assert_eq!(key, expected);
     }
@@ -2154,7 +1845,7 @@ mod tests {
     #[test]
     fn name_order_produces_correct_key() {
         let rec = make_record(b"read_001", b"ACGT", b"!!!!");
-        let key = NameOrder.record_key(&rec);
+        let key = NameOrder.derive_key(&rec);
         let mut expected = [0u8; 16];
         expected[..8].copy_from_slice(b"read_001");
         assert_eq!(key, dryice::Bytes16Key(expected));
@@ -2163,14 +1854,14 @@ mod tests {
     #[test]
     fn name_order_truncates_long_names() {
         let rec = make_record(b"a_very_long_name_that_exceeds_16_bytes", b"ACGT", b"!!!!");
-        let key = NameOrder.record_key(&rec);
+        let key = NameOrder.derive_key(&rec);
         assert_eq!(&key.0, b"a_very_long_name");
     }
 
     #[test]
     fn length_order_produces_correct_key() {
         let rec = make_record(b"r1", b"ACGTACGT", b"!!!!!!!!");
-        let key = LengthOrder.record_key(&rec);
+        let key = LengthOrder.derive_key(&rec);
         assert_eq!(key, dryice::Bytes8Key(8u64.to_be_bytes()));
     }
 
@@ -2178,8 +1869,8 @@ mod tests {
     fn length_order_big_endian_preserves_ord() {
         let short = make_record(b"r1", b"AC", b"!!");
         let long = make_record(b"r2", b"ACGTACGT", b"!!!!!!!!");
-        let key_short = LengthOrder.record_key(&short);
-        let key_long = LengthOrder.record_key(&long);
+        let key_short = LengthOrder.derive_key(&short);
+        let key_long = LengthOrder.derive_key(&long);
         assert!(
             key_short < key_long,
             "big-endian u64 should preserve ordering"
@@ -2187,38 +1878,35 @@ mod tests {
     }
 
     #[test]
-    fn sequence_order_uses_tuple_key_with_tiebreaker() {
+    fn sequence_order_refines_stored_key_ties_with_quality() {
         let order = ILLUMINA_ORDER;
-        let sk = order.sort_key();
-        let cmp = order.key_comparator();
 
         let a = make_record(b"r1", b"ACGT", b"IIII");
         let b = make_record(b"r2", b"ACGT", b"!!!!");
 
-        let ka = sk.key(&a);
-        let kb = sk.key(&b);
+        let ka = order.derive_key(&a);
+        let kb = order.derive_key(&b);
 
+        assert_eq!(order.compare_keys(&ka, &kb), Ordering::Equal);
         assert_eq!(
-            cmp.compare(&ka, &kb),
+            order.compare(&a, &b),
             Ordering::Greater,
-            "same sequence, IIII > !!!! via tuple Ord"
+            "same sequence, IIII > !!!! under the complete order"
         );
     }
 
     #[test]
     fn reverse_flips_key_ordering() {
         let order = Reverse(ILLUMINA_ORDER);
-        let sk = order.sort_key();
-        let cmp = order.key_comparator();
 
         let a = make_record(b"r1", b"AAAA", b"!!!!");
         let b = make_record(b"r2", b"TTTT", b"!!!!");
 
-        let ka = sk.key(&a);
-        let kb = sk.key(&b);
+        let ka = order.derive_key(&a);
+        let kb = order.derive_key(&b);
 
         assert_eq!(
-            cmp.compare(&ka, &kb),
+            order.compare_keys(&ka, &kb),
             Ordering::Greater,
             "reversed: AAAA key should be greater than TTTT key"
         );
@@ -2227,8 +1915,8 @@ mod tests {
     #[test]
     fn reverse_preserves_record_key() {
         let rec = make_record(b"r1", b"ACGT", b"!!!!");
-        let forward_key = ILLUMINA_ORDER.record_key(&rec);
-        let reverse_key = Reverse(ILLUMINA_ORDER).record_key(&rec);
+        let forward_key = ILLUMINA_ORDER.derive_key(&rec);
+        let reverse_key = Reverse(ILLUMINA_ORDER).derive_key(&rec);
         assert_eq!(
             forward_key, reverse_key,
             "reverse should not change the record key"
