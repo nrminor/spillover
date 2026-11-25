@@ -241,20 +241,19 @@ impl<R: SeqRecordParts + ?Sized> SeqRecordLike for SeqRecordPartsAdapter<'_, R> 
     }
 }
 
-/// Newtype wrapping an unkeyed [`DryIceWriter`] to implement
-/// spillover's [`CodecWriter`].
-pub struct UnkeyedWriterAdapter<W, S: SequenceCodec, Q: QualityCodec, N: NameCodec>(
-    DryIceWriter<W, S, Q, N, dryice::NoRecordKey>,
+/// Dryice writer implementing Core's ordinary or keyed writing capability.
+pub struct WriterAdapter<W, S: SequenceCodec, Q: QualityCodec, N: NameCodec, K>(
+    DryIceWriter<W, S, Q, N, K>,
 );
 
-impl<W: Write, S: SequenceCodec, Q: QualityCodec, N: NameCodec> UnkeyedWriterAdapter<W, S, Q, N> {
+impl<W: Write, S: SequenceCodec, Q: QualityCodec, N: NameCodec, K> WriterAdapter<W, S, Q, N, K> {
     fn finish(self) -> Result<(), DryIceError> {
         self.0.finish().map(|_| ())
     }
 }
 
 impl<W: Write, S: SequenceCodec, Q: QualityCodec, N: NameCodec, R: SeqRecordParts + ?Sized>
-    CodecWriter<R> for UnkeyedWriterAdapter<W, S, Q, N>
+    CodecWriter<R> for WriterAdapter<W, S, Q, N, dryice::NoRecordKey>
 {
     type Error = DryIceError;
 
@@ -267,19 +266,6 @@ impl<W: Write, S: SequenceCodec, Q: QualityCodec, N: NameCodec, R: SeqRecordPart
     }
 }
 
-/// Newtype wrapping a keyed [`DryIceWriter`] to implement [`KeyedCodecWriter`].
-pub struct KeyedWriterAdapter<W, S: SequenceCodec, Q: QualityCodec, N: NameCodec, K>(
-    DryIceWriter<W, S, Q, N, K>,
-);
-
-impl<W: Write, S: SequenceCodec, Q: QualityCodec, N: NameCodec, K>
-    KeyedWriterAdapter<W, S, Q, N, K>
-{
-    fn finish(self) -> Result<(), DryIceError> {
-        self.0.finish().map(|_| ())
-    }
-}
-
 impl<
     W: Write,
     S: SequenceCodec,
@@ -287,7 +273,7 @@ impl<
     N: NameCodec,
     K: RecordKey,
     R: SeqRecordParts + ?Sized,
-> KeyedCodecWriter<R, K> for KeyedWriterAdapter<W, S, Q, N, K>
+> KeyedCodecWriter<R, K> for WriterAdapter<W, S, Q, N, K>
 {
     type Error = DryIceError;
 
@@ -337,65 +323,20 @@ fn own_record<R: SeqRecordParts + ?Sized>(record: &R) -> SeqRecord {
     SeqRecord::from_slices(name, sequence, quality)
 }
 
-/// Unkeyed dryice cursor with borrowed record access and optional owned output.
-pub struct UnkeyedReaderAdapter<R, S: SequenceCodec, Q: QualityCodec, N: NameCodec>(
-    DecodedRecord<R, S, Q, N, dryice::NoRecordKey>,
-);
-
-impl<R: Read, S: SequenceCodec, Q: QualityCodec, N: NameCodec> UnkeyedReaderAdapter<R, S, Q, N> {
-    fn open(source: R) -> Result<Self, DryIceError> {
-        let reader = DryIceReader::with_codecs(source)?;
-        let record = DecodedRecord { reader };
-        Ok(Self(record))
-    }
-}
-
-impl<R: Read, S: SequenceCodec, Q: QualityCodec, N: NameCodec> CodecCursor
-    for UnkeyedReaderAdapter<R, S, Q, N>
-{
-    type Record = DecodedRecord<R, S, Q, N, dryice::NoRecordKey>;
-    type Error = DryIceError;
-
-    fn advance(&mut self) -> Result<bool, DryIceError> {
-        self.0.reader.next_record()
-    }
-
-    fn with_current<Output>(
-        &mut self,
-        visit: impl FnOnce(&Self::Record) -> Output,
-    ) -> Result<Output, DryIceError> {
-        Ok(visit(&self.0))
-    }
-}
-
-impl<R: Read, S: SequenceCodec, Q: QualityCodec, N: NameCodec> TakeOwned
-    for UnkeyedReaderAdapter<R, S, Q, N>
-{
-    type Owned = SeqRecord;
-
-    fn take_owned(&mut self) -> Result<Option<Self::Owned>, DryIceError> {
-        let record = self.with_current(own_record)?;
-        Ok(Some(record))
-    }
-}
-
-/// Keyed dryice cursor with borrowed record access and optional owned output.
-pub struct KeyedReaderAdapter<R, S: SequenceCodec, Q: QualityCodec, N: NameCodec, K>(
+/// Dryice cursor with borrowed record access and optional owned output.
+pub struct ReaderAdapter<R, S: SequenceCodec, Q: QualityCodec, N: NameCodec, K>(
     DecodedRecord<R, S, Q, N, K>,
 );
 
-impl<R: Read, S: SequenceCodec, Q: QualityCodec, N: NameCodec, K: RecordKey>
-    KeyedReaderAdapter<R, S, Q, N, K>
-{
-    fn open(source: R) -> Result<Self, DryIceError> {
-        let reader = DryIceReader::open(source)?;
+impl<R, S: SequenceCodec, Q: QualityCodec, N: NameCodec, K> ReaderAdapter<R, S, Q, N, K> {
+    fn new(reader: DryIceReader<R, S, Q, N, K>) -> Self {
         let record = DecodedRecord { reader };
-        Ok(Self(record))
+        Self(record)
     }
 }
 
-impl<R: Read, S: SequenceCodec, Q: QualityCodec, N: NameCodec, K: RecordKey> CodecCursor
-    for KeyedReaderAdapter<R, S, Q, N, K>
+impl<R: Read, S: SequenceCodec, Q: QualityCodec, N: NameCodec, K> CodecCursor
+    for ReaderAdapter<R, S, Q, N, K>
 {
     type Record = DecodedRecord<R, S, Q, N, K>;
     type Error = DryIceError;
@@ -412,8 +353,8 @@ impl<R: Read, S: SequenceCodec, Q: QualityCodec, N: NameCodec, K: RecordKey> Cod
     }
 }
 
-impl<R: Read, S: SequenceCodec, Q: QualityCodec, N: NameCodec, K: RecordKey> TakeOwned
-    for KeyedReaderAdapter<R, S, Q, N, K>
+impl<R: Read, S: SequenceCodec, Q: QualityCodec, N: NameCodec, K> TakeOwned
+    for ReaderAdapter<R, S, Q, N, K>
 {
     type Owned = SeqRecord;
 
@@ -424,7 +365,7 @@ impl<R: Read, S: SequenceCodec, Q: QualityCodec, N: NameCodec, K: RecordKey> Tak
 }
 
 impl<R: Read, S: SequenceCodec, Q: QualityCodec, N: NameCodec, K: RecordKey + Clone>
-    KeyedCodecCursor<K> for KeyedReaderAdapter<R, S, Q, N, K>
+    KeyedCodecCursor<K> for ReaderAdapter<R, S, Q, N, K>
 {
     fn current_key(&self) -> Result<K, DryIceError> {
         self.0.reader.record_key()
@@ -435,20 +376,21 @@ impl<R: Read, S: SequenceCodec, Q: QualityCodec, N: NameCodec, K: RecordKey + Cl
 
 impl<S: SequenceCodec, Q: QualityCodec, N: NameCodec> Codec for DryIceCodec<S, Q, N> {
     type Error = DryIceError;
-    type Cursor<R: Read> = UnkeyedReaderAdapter<R, S, Q, N>;
+    type Cursor<R: Read> = ReaderAdapter<R, S, Q, N, dryice::NoRecordKey>;
 
     fn cursor<R: Read>(&self, source: R) -> Result<Self::Cursor<R>, Self::Error> {
-        UnkeyedReaderAdapter::open(source)
+        let reader = DryIceReader::with_codecs(source)?;
+        Ok(ReaderAdapter::new(reader))
     }
 }
 
 impl<R: SeqRecordParts + ?Sized, S: SequenceCodec, Q: QualityCodec, N: NameCodec> EncodeRun<R>
     for DryIceCodec<S, Q, N>
 {
-    type Writer<W: Write> = UnkeyedWriterAdapter<W, S, Q, N>;
+    type Writer<W: Write> = WriterAdapter<W, S, Q, N, dryice::NoRecordKey>;
 
     fn writer<W: Write>(&self, dest: W) -> Self::Writer<W> {
-        UnkeyedWriterAdapter(
+        WriterAdapter(
             DryIceWriter::builder()
                 .inner(dest)
                 .sequence_codec::<S>()
@@ -464,10 +406,11 @@ impl<K: RecordKey + Clone, S: SequenceCodec, Q: QualityCodec, N: NameCodec> Code
     for KeyedDryIceCodec<K, S, Q, N>
 {
     type Error = DryIceError;
-    type Cursor<R: Read> = KeyedReaderAdapter<R, S, Q, N, K>;
+    type Cursor<R: Read> = ReaderAdapter<R, S, Q, N, K>;
 
     fn cursor<R: Read>(&self, source: R) -> Result<Self::Cursor<R>, Self::Error> {
-        KeyedReaderAdapter::open(source)
+        let reader = DryIceReader::open(source)?;
+        Ok(ReaderAdapter::new(reader))
     }
 }
 
@@ -475,10 +418,10 @@ impl<K: RecordKey + Clone, S: SequenceCodec, Q: QualityCodec, N: NameCodec> Keye
     for KeyedDryIceCodec<K, S, Q, N>
 {
     type Key = K;
-    type KeyedCursor<R: Read> = KeyedReaderAdapter<R, S, Q, N, K>;
+    type KeyedCursor<R: Read> = ReaderAdapter<R, S, Q, N, K>;
 
     fn keyed_cursor<R: Read>(&self, source: R) -> Result<Self::KeyedCursor<R>, Self::Error> {
-        KeyedReaderAdapter::open(source)
+        self.cursor(source)
     }
 }
 
@@ -490,10 +433,10 @@ impl<
     N: NameCodec,
 > EncodeKeyedRun<R> for KeyedDryIceCodec<K, S, Q, N>
 {
-    type KeyedWriter<W: Write> = KeyedWriterAdapter<W, S, Q, N, K>;
+    type KeyedWriter<W: Write> = WriterAdapter<W, S, Q, N, K>;
 
     fn keyed_writer<W: Write>(&self, dest: W) -> Self::KeyedWriter<W> {
-        KeyedWriterAdapter(
+        WriterAdapter(
             DryIceWriter::builder()
                 .inner(dest)
                 .sequence_codec::<S>()
@@ -514,12 +457,83 @@ mod tests {
 
     use super::*;
 
+    struct TestRecord<T: ?Sized>(T);
+
+    impl<T: AsRef<[u8]> + ?Sized> SeqRecordParts for TestRecord<T> {
+        fn name(&self) -> &[u8] {
+            b"read"
+        }
+
+        fn sequence(&self) -> &[u8] {
+            self.0.as_ref()
+        }
+
+        fn quality(&self) -> &[u8] {
+            b"!"
+        }
+    }
+
     fn test_records() -> Vec<SeqRecord> {
         vec![
             SeqRecord::new(b"r1", b"ACGT", b"!!!!"),
             SeqRecord::new(b"r2", b"TGCA", b"####"),
             SeqRecord::new(b"r3", b"AAAA", b"IIII"),
         ]
+    }
+
+    #[test]
+    fn unkeyed_writer_accepts_unsized_records() -> Result<(), DryIceError> {
+        let record = TestRecord([b'A']);
+        let record: &TestRecord<[u8]> = &record;
+        let codec = DryIceCodec::new();
+        let mut bytes = Vec::new();
+        let mut writer = <_ as EncodeRun<TestRecord<[u8]>>>::writer(&codec, &mut bytes);
+        writer.write(record)?;
+        CodecWriter::<TestRecord<[u8]>>::finish(writer)?;
+
+        let mut cursor = codec.cursor(bytes.as_slice())?;
+        assert!(cursor.advance()?);
+        cursor.with_current(|decoded| {
+            assert_eq!(decoded.name(), b"read");
+            assert_eq!(decoded.sequence(), b"A");
+            assert_eq!(decoded.quality(), b"!");
+        })?;
+        assert_eq!(
+            cursor.take_owned()?,
+            Some(SeqRecord::new(b"read", b"A", b"!"))
+        );
+        assert!(!cursor.advance()?);
+        Ok(())
+    }
+
+    #[test]
+    fn keyed_writer_accepts_unsized_records_through_both_cursors() -> Result<(), DryIceError> {
+        let record = TestRecord([b'A']);
+        let record: &TestRecord<[u8]> = &record;
+        let codec = DryIceCodec::new().with_illumina_key();
+        let entry = spillover::key::Keyed::derive(record, &crate::sort::ILLUMINA_ORDER);
+        let mut bytes = Vec::new();
+        let mut writer = <_ as EncodeKeyedRun<TestRecord<[u8]>>>::keyed_writer(&codec, &mut bytes);
+        writer.write_keyed(entry.borrowed())?;
+        KeyedCodecWriter::<TestRecord<[u8]>, _>::finish(writer)?;
+
+        let mut keyed_cursor = codec.keyed_cursor(bytes.as_slice())?;
+        let mut ordinary_cursor = codec.cursor(bytes.as_slice())?;
+        for cursor in [&mut keyed_cursor, &mut ordinary_cursor] {
+            assert!(cursor.advance()?);
+            assert_eq!(&cursor.current_key()?, entry.stored_key());
+            cursor.with_current(|decoded| {
+                assert_eq!(decoded.name(), b"read");
+                assert_eq!(decoded.sequence(), b"A");
+                assert_eq!(decoded.quality(), b"!");
+            })?;
+            assert_eq!(
+                cursor.take_owned()?,
+                Some(SeqRecord::new(b"read", b"A", b"!"))
+            );
+            assert!(!cursor.advance()?);
+        }
+        Ok(())
     }
 
     #[test]
