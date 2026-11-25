@@ -25,11 +25,11 @@ use spillover::merge::{MergeConfig, MergeError, RunMerger};
 use spillover::sorter::{ByteLimit, VisitSortedItems};
 use spillover_bio::{
     codec::DryIceCodec,
-    error::SortedRecordStreamError,
     radix::RadixThenRefine,
     record::{SeqRecord, SeqRecordArena, SeqRecordParts, SeqRecordView},
     sort::{
-        Builder, ILLUMINA_ORDER, LENGTH_ORDER, NAME_ORDER, Reverse, SeqRecordSink, SequenceOrder,
+        Builder, ILLUMINA_ORDER, LENGTH_ORDER, NAME_ORDER, OrderCodecPolicy, RawRecords,
+        RecordDedup, Reverse, SeqRecordSink, SequenceOrder,
     },
 };
 use thiserror::Error;
@@ -1279,6 +1279,103 @@ fn make_record(name: &[u8], seq: &[u8], qual: &[u8]) -> SeqRecord {
     SeqRecord::new(name, seq, qual)
 }
 
+struct DownstreamNameOrder {
+    descending: Box<bool>,
+}
+
+impl<R: SeqRecordParts> Compare<R> for DownstreamNameOrder {
+    fn compare(&self, left: &R, right: &R) -> Ordering {
+        let ordering = left.name().cmp(right.name());
+        if *self.descending {
+            ordering.reverse()
+        } else {
+            ordering
+        }
+    }
+}
+
+impl OrderCodecPolicy for DownstreamNameOrder {
+    type Policy = RawRecords;
+}
+
+#[test]
+fn downstream_non_copy_order_and_chunk_sorter_work_with_owned_and_arena_storage() {
+    let mut sorter = Builder::new()
+        .sort_by_unkeyed(DownstreamNameOrder {
+            descending: Box::new(true),
+        })
+        .chunk_sort(ComparisonSort)
+        .max_buffer_items(2)
+        .build();
+    for name in [b"b", b"a", b"c", b"d", b"e"] {
+        sorter.push(make_record(name, b"A", b"!")).expect("push");
+    }
+    let mut sink = VecSink::default();
+    sorter
+        .finish()
+        .expect("finish")
+        .items()
+        .try_for_each(|record| sink.write_record(record))
+        .expect("borrowed owned-buffer output");
+    let names: Vec<&[u8]> = sink.records.iter().map(SeqRecord::name).collect();
+    assert_eq!(names, [b"e", b"d", b"c", b"b", b"a"]);
+
+    let mut arena = SeqRecordArena::new();
+    let mut sorter = Builder::new()
+        .sort_by_unkeyed(DownstreamNameOrder {
+            descending: Box::new(false),
+        })
+        .chunk_sort(ComparisonSort)
+        .arena(&mut arena)
+        .max_buffer_items(2)
+        .build();
+    for name in [b"b", b"a", b"c", b"d", b"e"] {
+        let record = SeqRecordView::new(name, b"A", b"!");
+        sorter.push(&record).expect("push borrowed view");
+    }
+    let mut sink = VecSink::default();
+    sorter
+        .finish()
+        .expect("finish")
+        .items()
+        .try_for_each(|record| sink.write_record(record))
+        .expect("borrowed arena-buffer output");
+    assert!(arena.is_empty(), "finish must release arena records");
+    let names: Vec<&[u8]> = sink.records.iter().map(SeqRecord::name).collect();
+    assert_eq!(names, [b"a", b"b", b"c", b"d", b"e"]);
+}
+
+#[test]
+fn downstream_chunk_sorter_obeys_keyed_full_record_tiebreaks_across_spills() {
+    let mut sorter = Builder::new()
+        .sort_by_illumina()
+        .chunk_sort(ComparisonSort)
+        .max_buffer_items(2)
+        .build();
+    for record in [
+        make_record(b"c", b"C", b"!"),
+        make_record(b"n", b"N", b"!"),
+        make_record(b"a-high", b"A", b"#"),
+        make_record(b"a-low", b"A", b"!"),
+    ] {
+        sorter.push(record).expect("push");
+    }
+    let records: Vec<SeqRecord> = sorter
+        .finish()
+        .expect("finish")
+        .map(|record| record.expect("decode"))
+        .collect();
+    assert_eq!(
+        records,
+        [
+            make_record(b"a-low", b"A", b"!"),
+            make_record(b"a-high", b"A", b"#"),
+            make_record(b"n", b"N", b"!"),
+            make_record(b"c", b"C", b"!"),
+        ]
+    );
+}
+
 #[test]
 fn owned_unkeyed_budget_includes_spill_writer() {
     let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("Cargo.toml");
@@ -1379,7 +1476,7 @@ fn unsorted_records_come_out_sorted_by_sequence() {
 }
 
 #[test]
-fn keyed_sorter_accepts_borrowed_record_views() {
+fn owned_keyed_sorter_accepts_explicitly_owned_record_views() {
     let mut sorter = Builder::new()
         .sort_by_illumina()
         .codec(DryIceCodec::new())
@@ -1393,7 +1490,9 @@ fn keyed_sorter_accepts_borrowed_record_views() {
     ];
 
     for rec in &records {
-        sorter.push(rec.as_view()).expect("push should succeed");
+        let view = rec.as_view();
+        let owned_record = view.into();
+        sorter.push(owned_record).expect("push should succeed");
     }
 
     let results: Vec<SeqRecord> = sorter
@@ -1409,7 +1508,7 @@ fn keyed_sorter_accepts_borrowed_record_views() {
 }
 
 #[test]
-fn unkeyed_sorter_accepts_borrowed_record_views() {
+fn owned_unkeyed_sorter_accepts_explicitly_owned_record_views() {
     let mut sorter = Builder::new()
         .sort_by_unkeyed(ILLUMINA_ORDER.unkeyed())
         .codec(DryIceCodec::new())
@@ -1423,7 +1522,9 @@ fn unkeyed_sorter_accepts_borrowed_record_views() {
     ];
 
     for rec in &records {
-        sorter.push(rec.as_view()).expect("push should succeed");
+        let view = rec.as_view();
+        let owned_record = view.into();
+        sorter.push(owned_record).expect("push should succeed");
     }
 
     let results: Vec<SeqRecord> = sorter
@@ -1858,8 +1959,9 @@ fn sorted_record_stream_writes_to_custom_sink() {
     sorter
         .finish()
         .expect("finish should succeed")
-        .write_to(&mut sink)
-        .expect("write_to should succeed");
+        .items()
+        .try_for_each(|record| sink.write_record(record))
+        .expect("borrowed traversal should succeed");
 
     assert_eq!(sink.records.len(), 3);
     assert_eq!(sink.records[0].sequence(), b"AAAAAAAA");
@@ -1895,12 +1997,137 @@ fn mixed_output_preserves_name_history() {
     assert_eq!(first.quality(), b"!!!!");
 
     let mut sink = VecSink::default();
-    stream.write_to(&mut sink).expect("write_to should succeed");
+    stream
+        .items()
+        .try_for_each(|record| sink.write_record(record))
+        .expect("borrowed traversal should succeed");
 
     assert_eq!(sink.records.len(), 1);
     assert_eq!(sink.records[0].name(), b"b");
     assert_eq!(sink.records[0].sequence(), b"CCCC");
     assert_eq!(sink.records[0].quality(), b"####");
+}
+
+#[test]
+fn mixed_output_preserves_adjacent_sequence_history_without_global_dedup() {
+    let mut sorter = Builder::new()
+        .sort_by_name()
+        .dedup_by_sequence()
+        .max_buffer_items(1)
+        .build();
+    for record in [
+        make_record(b"d", b"A", b"$"),
+        make_record(b"c", b"C", b"#"),
+        make_record(b"b", b"A", b"!"),
+        make_record(b"a", b"A", b"!"),
+    ] {
+        sorter.push(record).expect("push");
+    }
+
+    let mut output = sorter.finish().expect("finish");
+    let first = output.next().expect("first record").expect("decode");
+    assert_eq!(first.name(), b"a");
+    assert_eq!(first.sequence(), b"A");
+    assert_eq!(first.quality(), b"!");
+
+    let mut sink = VecSink::default();
+    output
+        .items()
+        .try_for_each(|record| sink.write_record(record))
+        .expect("borrowed traversal");
+
+    // Dedup compares adjacent records: the A after C must survive.
+    assert_eq!(
+        sink.records,
+        [make_record(b"c", b"C", b"#"), make_record(b"d", b"A", b"$")]
+    );
+}
+
+struct BioEvents(std::vec::IntoIter<Result<SeqRecord, &'static str>>);
+
+impl Iterator for BioEvents {
+    type Item = Result<SeqRecord, &'static str>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        self.0.next()
+    }
+}
+
+impl VisitSortedItems for BioEvents {
+    type Record = SeqRecord;
+    type Error = &'static str;
+
+    fn visit_items<F, FE>(self, mut callback: F) -> Result<(), SortedItemsError<Self::Error, FE>>
+    where
+        F: FnMut(&Self::Record) -> Result<(), FE>,
+    {
+        for event in self {
+            let record = event.map_err(SortedItemsError::Source)?;
+            callback(&record).map_err(SortedItemsError::Sink)?;
+        }
+        Ok(())
+    }
+}
+
+#[test]
+fn bio_dedup_source_error_fuses_owned_and_borrowed_delivery() {
+    let events = vec![
+        Ok(make_record(b"a", b"A", b"!")),
+        Err("source failed"),
+        Ok(make_record(b"c", b"C", b"!")),
+    ];
+    let source = BioEvents(events.into_iter());
+    let mut output = RecordDedup::Sequence.dedup(source);
+    assert_eq!(
+        output.next().expect("first event").expect("record"),
+        make_record(b"a", b"A", b"!")
+    );
+    assert!(matches!(output.next(), Some(Err("source failed"))));
+    assert!(output.next().is_none(), "source errors must fuse iteration");
+
+    let mut visited = 0;
+    output
+        .visit_items(|_| -> Result<(), Infallible> {
+            visited += 1;
+            Ok(())
+        })
+        .expect("fused borrowed traversal");
+    assert_eq!(visited, 0, "borrowed traversal must not resume the source");
+}
+
+#[test]
+fn bio_dedup_borrowed_delivery_preserves_source_and_sink_errors() {
+    let events = vec![
+        Ok(make_record(b"a", b"A", b"!")),
+        Err("source failed"),
+        Ok(make_record(b"c", b"C", b"!")),
+    ];
+    let source = BioEvents(events.into_iter());
+    let output = RecordDedup::Sequence.dedup(source);
+    let mut visited = Vec::new();
+    let result = output.visit_items(|record| -> Result<(), Infallible> {
+        visited.push(record.sequence().to_vec());
+        Ok(())
+    });
+    assert_eq!(visited, [b"A"]);
+    assert!(matches!(
+        result,
+        Err(SortedItemsError::Source("source failed"))
+    ));
+
+    let events = vec![
+        Ok(make_record(b"a", b"A", b"!")),
+        Ok(make_record(b"c", b"C", b"!")),
+    ];
+    let source = BioEvents(events.into_iter());
+    let output = RecordDedup::Sequence.dedup(source);
+    let mut visited = 0;
+    let result = output.visit_items(|_| {
+        visited += 1;
+        Err::<(), _>(Stop(42))
+    });
+    assert_eq!(visited, 1, "sink failure must stop delivery immediately");
+    assert!(matches!(result, Err(SortedItemsError::Sink(Stop(42)))));
 }
 
 #[test]
@@ -1926,8 +2153,9 @@ fn sorted_record_stream_applies_dedup_when_writing_to_sink() {
     sorter
         .finish()
         .expect("finish should succeed")
-        .write_to(&mut sink)
-        .expect("write_to should succeed");
+        .items()
+        .try_for_each(|record| sink.write_record(record))
+        .expect("borrowed traversal should succeed");
 
     assert_eq!(sink.records.len(), 2);
     assert_eq!(sink.records[0].sequence(), b"AAAAAAAA");
@@ -1946,13 +2174,17 @@ fn sorted_record_stream_wraps_sink_errors() {
         .push(make_record(b"r1", b"AAAAAAAA", b"!!!!!!!!"))
         .expect("push");
 
+    let mut sink = FailingSink;
     let err = sorter
         .finish()
         .expect("finish should succeed")
-        .write_to(&mut FailingSink)
+        .items()
+        .try_for_each(|record| sink.write_record(record))
         .expect_err("sink error should be wrapped");
 
-    assert!(matches!(err, SortedRecordStreamError::Sink(_)));
+    assert!(
+        matches!(err, SortedItemsError::Sink(error) if error.kind() == io::ErrorKind::BrokenPipe)
+    );
 }
 
 #[test]
@@ -1978,8 +2210,9 @@ fn sorted_record_stream_writes_to_dryice_writer() {
     sorter
         .finish()
         .expect("finish should succeed")
-        .write_to(&mut writer)
-        .expect("write_to should succeed");
+        .items()
+        .try_for_each(|record| SeqRecordSink::write_record(&mut writer, record))
+        .expect("borrowed traversal should succeed");
     writer.finish().expect("writer should finish");
 
     let mut reader = dryice::DryIceReader::new(output.as_slice()).expect("reader should open");

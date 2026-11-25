@@ -80,7 +80,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut sink = TabSeparated {
         writer: stdout.lock(),
     };
-    sorted_records.write_to(&mut sink)?;
+    sorted_records
+        .items()
+        .try_for_each(|record| sink.write_record(record))?;
 
     Ok(())
 }

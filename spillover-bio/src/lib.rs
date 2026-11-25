@@ -7,7 +7,6 @@
 //! temporary on-disk storage.
 
 pub mod codec;
-pub mod error;
 pub mod key;
 pub mod radix;
 pub mod record;

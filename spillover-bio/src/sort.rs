@@ -19,11 +19,10 @@ use dryice::{
 use spillover::{
     SortedItemsError,
     chunk::{ChunkSorter, Sequential},
-    codec::{Codec, CodecCursor, EncodeKeyedRun, EncodeRun, KeyedCodec},
+    codec::{Codec, CodecCursor, KeyedCodec},
     compare::Compare,
-    dedup::Identity,
     key::{DeriveKey, KeyedOrder, SortKey},
-    merge::{KeyedRunMerge, MergeConfig, MergeError, RunMerge},
+    merge::MergeConfig,
     sorter::{
         ByteLimit, HasOrder, ItemLimit, Keyed as CoreKeyed, NeedsLimit,
         NeedsOrder as CoreNeedsOrder, Unkeyed as CoreUnkeyed, VisitSortedItems,
@@ -32,7 +31,6 @@ use spillover::{
 
 use crate::{
     codec::{DryIceCodec, KeyedDryIceCodec, SeqRecordPartsAdapter},
-    error::SortedRecordStreamError,
     key::PackedSequenceKey,
     radix::RadixThenRefine,
     record::{SeqRecord, SeqRecordArena, SeqRecordParts, SeqRecordView},
@@ -88,17 +86,11 @@ impl<R: SeqRecordParts> SortKey<R> for LengthKey {
     }
 }
 
-// ── Sort order traits (sealed) ────────────────────────────
+// ── Order-owned codec policy ─────────────────────────────
 
 mod sealed {
     pub struct ExistingCodecChoices;
     pub struct ExactSequenceThenQuality;
-
-    pub trait Sealed {
-        type CodecPolicy;
-    }
-
-    pub trait CompatibleChunkSorter<O> {}
 
     /// Resolves codec type-state to a concrete [`crate::codec::DryIceCodec`].
     /// `NeedsCodec` yields the raw (no-encoding) default;
@@ -112,27 +104,122 @@ mod sealed {
     }
 }
 
-/// Selects Bio's merge strategy for an order.
+/// Declares which codec policy Bio applies to an order.
 ///
 /// Comparison and key derivation use core's [`Compare`], [`KeyedOrder`],
-/// and [`DeriveKey`] traits. Sealed — only Bio's built-in orders implement this.
-pub trait SortOrder: sealed::Sealed + Copy {
-    /// The merge strategy marker: [`Unkeyed`] or [`Keyed`].
-    type Strategy;
+/// and [`DeriveKey`] traits. Builder methods select the merge mode.
+///
+/// External orders can select [`RawRecords`] to retain every record field.
+/// A policy declaration is not a proof of codec/order coherence: extension
+/// authors are responsible for preserving their ordering through codec round
+/// trips. Reusing a builtin order's policy does not establish those laws.
+///
+/// ```
+/// use std::cmp::Ordering;
+/// use spillover::compare::Compare;
+/// use spillover_bio::{
+///     codec::DryIceCodec,
+///     record::{SeqRecord, SeqRecordParts},
+///     sort::{Builder, OrderCodecPolicy, RawRecords},
+/// };
+///
+/// struct QualityThenName;
+///
+/// impl<R: SeqRecordParts + ?Sized> Compare<R> for QualityThenName {
+///     fn compare(&self, left: &R, right: &R) -> Ordering {
+///         let quality = left.quality().cmp(right.quality());
+///         quality.then_with(|| left.name().cmp(right.name()))
+///     }
+/// }
+///
+/// impl OrderCodecPolicy for QualityThenName {
+///     type Policy = RawRecords;
+/// }
+///
+/// let mut sorter = Builder::new()
+///     .sort_by_unkeyed(QualityThenName)
+///     .codec(DryIceCodec::new())
+///     .max_buffer_items(1)
+///     .build();
+/// sorter.push(SeqRecord::new(b"read", b"A", b"!"))?;
+/// let collected: Result<Vec<SeqRecord>, _> = sorter.finish()?.collect();
+/// assert_eq!(collected?.len(), 1);
+/// # Ok::<(), Box<dyn std::error::Error>>(())
+/// ```
+pub trait OrderCodecPolicy {
+    /// Codec eligibility applied by Bio's private resolver.
+    type Policy;
 }
 
-impl<O> sealed::CompatibleChunkSorter<O> for Sequential {}
-
-#[cfg(feature = "rayon")]
-impl<O> sealed::CompatibleChunkSorter<O> for spillover::chunk::Parallel {}
-
-impl<const N: usize> sealed::CompatibleChunkSorter<SequenceOrder<N>> for RadixThenRefine<N> {}
-
-/// Marker: unkeyed merge path (no record keys).
-pub struct Unkeyed;
-
-/// Marker: keyed merge path (record keys for merge acceleration).
-pub struct Keyed;
+/// Accept only raw sequence, quality, and name codecs.
+///
+/// This conservative policy excludes even non-raw encodings that might be
+/// lossless. No codec/order law is inferred from a comparator implementation.
+///
+/// Name encoding is restricted too, since an external order may compare names:
+///
+/// ```compile_fail
+/// use std::cmp::Ordering;
+/// use spillover::compare::Compare;
+/// use spillover_bio::{
+///     codec::DryIceCodec,
+///     record::SeqRecordParts,
+///     sort::{Builder, OrderCodecPolicy, RawRecords},
+/// };
+///
+/// struct ByName;
+/// impl<R: SeqRecordParts + ?Sized> Compare<R> for ByName {
+///     fn compare(&self, left: &R, right: &R) -> Ordering {
+///         left.name().cmp(right.name())
+///     }
+/// }
+/// impl OrderCodecPolicy for ByName {
+///     type Policy = RawRecords;
+/// }
+/// let codec = DryIceCodec::new().omit_names();
+/// let _sorter = Builder::new()
+///     .sort_by_unkeyed(ByName)
+///     .codec(codec)
+///     .max_buffer_items(1)
+///     .build();
+/// ```
+///
+/// Sequence and quality encodings must also remain raw:
+///
+/// ```compile_fail
+/// # use std::cmp::Ordering;
+/// # use spillover::compare::Compare;
+/// # use spillover_bio::{codec::DryIceCodec, record::SeqRecordParts, sort::{Builder, OrderCodecPolicy, RawRecords}};
+/// # struct ByName;
+/// # impl<R: SeqRecordParts + ?Sized> Compare<R> for ByName {
+/// #     fn compare(&self, left: &R, right: &R) -> Ordering { left.name().cmp(right.name()) }
+/// # }
+/// # impl OrderCodecPolicy for ByName { type Policy = RawRecords; }
+/// let codec = DryIceCodec::new().two_bit_lossy_n();
+/// let _sorter = Builder::new()
+///     .sort_by_unkeyed(ByName)
+///     .codec(codec)
+///     .max_buffer_items(1)
+///     .build();
+/// ```
+///
+/// ```compile_fail
+/// # use std::cmp::Ordering;
+/// # use spillover::compare::Compare;
+/// # use spillover_bio::{codec::DryIceCodec, record::SeqRecordParts, sort::{Builder, OrderCodecPolicy, RawRecords}};
+/// # struct ByName;
+/// # impl<R: SeqRecordParts + ?Sized> Compare<R> for ByName {
+/// #     fn compare(&self, left: &R, right: &R) -> Ordering { left.name().cmp(right.name()) }
+/// # }
+/// # impl OrderCodecPolicy for ByName { type Policy = RawRecords; }
+/// let codec = DryIceCodec::new().binned_quality();
+/// let _sorter = Builder::new()
+///     .sort_by_unkeyed(ByName)
+///     .codec(codec)
+///     .max_buffer_items(1)
+///     .build();
+/// ```
+pub struct RawRecords;
 
 // ── Keyed sort orders ────────────────────────────────────
 
@@ -144,12 +231,8 @@ pub struct Keyed;
 #[derive(Debug, Clone, Copy)]
 pub struct SequenceOrder<const N: usize>;
 
-impl<const N: usize> sealed::Sealed for SequenceOrder<N> {
-    type CodecPolicy = sealed::ExistingCodecChoices;
-}
-
-impl<const N: usize> SortOrder for SequenceOrder<N> {
-    type Strategy = Keyed;
+impl<const N: usize> OrderCodecPolicy for SequenceOrder<N> {
+    type Policy = sealed::ExistingCodecChoices;
 }
 
 impl<const N: usize, R: SeqRecordParts + ?Sized> Compare<R> for SequenceOrder<N> {
@@ -175,12 +258,8 @@ impl<const N: usize> SequenceOrder<N> {
 #[derive(Debug, Clone, Copy)]
 pub struct NameOrder;
 
-impl sealed::Sealed for NameOrder {
-    type CodecPolicy = sealed::ExistingCodecChoices;
-}
-
-impl SortOrder for NameOrder {
-    type Strategy = Keyed;
+impl OrderCodecPolicy for NameOrder {
+    type Policy = sealed::ExistingCodecChoices;
 }
 
 impl<R: SeqRecordParts + ?Sized> Compare<R> for NameOrder {
@@ -212,12 +291,8 @@ impl NameOrder {
 #[derive(Debug, Clone, Copy)]
 pub struct LengthOrder;
 
-impl sealed::Sealed for LengthOrder {
-    type CodecPolicy = sealed::ExistingCodecChoices;
-}
-
-impl SortOrder for LengthOrder {
-    type Strategy = Keyed;
+impl OrderCodecPolicy for LengthOrder {
+    type Policy = sealed::ExistingCodecChoices;
 }
 
 impl<R: SeqRecordParts + ?Sized> Compare<R> for LengthOrder {
@@ -298,12 +373,8 @@ impl<R: SeqRecordParts + ?Sized> spillover::key::EstimateKeyMemory<R> for Length
 #[derive(Debug, Clone, Copy)]
 pub struct UnkeyedSequenceOrder;
 
-impl sealed::Sealed for UnkeyedSequenceOrder {
-    type CodecPolicy = sealed::ExactSequenceThenQuality;
-}
-
-impl SortOrder for UnkeyedSequenceOrder {
-    type Strategy = Unkeyed;
+impl OrderCodecPolicy for UnkeyedSequenceOrder {
+    type Policy = sealed::ExactSequenceThenQuality;
 }
 
 impl<R: SeqRecordParts + ?Sized> Compare<R> for UnkeyedSequenceOrder {
@@ -318,12 +389,8 @@ impl<R: SeqRecordParts + ?Sized> Compare<R> for UnkeyedSequenceOrder {
 #[derive(Debug, Clone, Copy)]
 pub struct UnkeyedNameOrder;
 
-impl sealed::Sealed for UnkeyedNameOrder {
-    type CodecPolicy = sealed::ExistingCodecChoices;
-}
-
-impl SortOrder for UnkeyedNameOrder {
-    type Strategy = Unkeyed;
+impl OrderCodecPolicy for UnkeyedNameOrder {
+    type Policy = sealed::ExistingCodecChoices;
 }
 
 impl<R: SeqRecordParts + ?Sized> Compare<R> for UnkeyedNameOrder {
@@ -336,12 +403,8 @@ impl<R: SeqRecordParts + ?Sized> Compare<R> for UnkeyedNameOrder {
 #[derive(Debug, Clone, Copy)]
 pub struct UnkeyedLengthOrder;
 
-impl sealed::Sealed for UnkeyedLengthOrder {
-    type CodecPolicy = sealed::ExistingCodecChoices;
-}
-
-impl SortOrder for UnkeyedLengthOrder {
-    type Strategy = Unkeyed;
+impl OrderCodecPolicy for UnkeyedLengthOrder {
+    type Policy = sealed::ExistingCodecChoices;
 }
 
 impl<R: SeqRecordParts + ?Sized> Compare<R> for UnkeyedLengthOrder {
@@ -361,12 +424,8 @@ impl<R: SeqRecordParts + ?Sized> Compare<R> for UnkeyedLengthOrder {
 /// ```
 pub use spillover::compare::Reverse;
 
-impl<O: sealed::Sealed> sealed::Sealed for Reverse<O> {
-    type CodecPolicy = O::CodecPolicy;
-}
-
-impl<O: SortOrder> SortOrder for Reverse<O> {
-    type Strategy = O::Strategy;
+impl<O: OrderCodecPolicy> OrderCodecPolicy for Reverse<O> {
+    type Policy = O::Policy;
 }
 
 // ── Convenience aliases ──────────────────────────────────
@@ -388,11 +447,20 @@ pub const LENGTH_ORDER: LengthOrder = LengthOrder;
 
 // ── Builder ──────────────────────────────────────────────
 
+/// Post-merge adjacent deduplication, applied through Core's [`spillover::dedup::Dedup`].
+///
+/// Each enabled mode keeps the first record in a consecutive group of matches.
+/// Global deduplication requires an order that makes all matching records
+/// contiguous. Owned iteration and borrowed visits share the same history.
 #[derive(Debug, Clone, Copy)]
-enum RecordDedup {
+pub enum RecordDedup {
+    /// Retain every record.
     None,
+    /// Match record names.
     Name,
+    /// Match sequence bytes.
     Sequence,
+    /// Match both sequence and quality bytes.
     SequenceAndQuality,
 }
 
@@ -493,20 +561,6 @@ impl RecordDedupState {
         previous.copy_from(record);
         true
     }
-
-    fn write<R, W>(&mut self, record: &R, writer: &mut W) -> Result<(), W::Error>
-    where
-        R: SeqRecordParts + ?Sized,
-        W: SeqRecordSink,
-    {
-        if !self.accept(record) {
-            return Ok(());
-        }
-        match &self.previous {
-            Some(previous) => writer.write_record(previous),
-            None => writer.write_record(record),
-        }
-    }
 }
 
 /// Builder marker: no codec chosen yet.
@@ -535,6 +589,16 @@ impl<P> sealed::ResolveCodec<P> for NeedsCodec {
 
     fn resolve(self) -> DryIceCodec {
         DryIceCodec::new()
+    }
+}
+
+impl sealed::ResolveCodec<RawRecords> for HasCodec<RawAsciiCodec, RawQualityCodec, RawNameCodec> {
+    type S = RawAsciiCodec;
+    type Q = RawQualityCodec;
+    type N = RawNameCodec;
+
+    fn resolve(self) -> DryIceCodec {
+        self.0
     }
 }
 
@@ -568,6 +632,13 @@ where
 }
 
 /// Builder for configuring a genomics-oriented external sorter.
+///
+/// Built sorters are Core sorters: owned ingress accepts [`SeqRecord`], and
+/// arena ingress can use [`SeqRecordView`]. Convert other owned inputs explicitly
+/// before pushing; normalize parser records to views for measured keyed arenas.
+/// Final output supports owned iteration or Core's `items().try_for_each(...)`
+/// borrowed traversal. Bio supplies codec policy and deduplication, not another
+/// sorter lifecycle.
 ///
 /// Only a sort order is required — everything else has sensible
 /// defaults:
@@ -614,40 +685,22 @@ where
 pub struct Builder<Core = InitialCore, C = NeedsCodec, S = OwnedStorage, M = ()> {
     core: Core,
     codec: C,
-    dedup: RecordDedup,
     storage: S,
     mode: PhantomData<fn() -> M>,
 }
 
 type CoreBuilder<SK, L, CS> =
-    spillover::sorter::Builder<SK, spillover::sorter::NeedsCodec, L, (), Identity, CS>;
+    spillover::sorter::Builder<SK, spillover::sorter::NeedsCodec, L, (), RecordDedup, CS>;
 type OrderedCore<O, L, CS> = CoreBuilder<HasOrder<O>, L, CS>;
 type InitialCore = CoreBuilder<CoreNeedsOrder, NeedsLimit, Sequential>;
 
-/// Active genomics sorter.
-///
-/// Construct a sorter with [`Builder`], push unsorted records into it, then call
-/// [`finish`](Self::finish) to produce a [`SortedRecordStream`].
-pub struct Sorter<SK, Cod, Cmp, CS, M, B> {
-    inner: B,
-    dedup: RecordDedup,
-    _types: std::marker::PhantomData<SorterTypeMarker<SK, Cod, Cmp, CS, M>>,
-}
-
-type SorterTypeMarker<SK, Cod, Cmp, CS, M> = fn() -> (SK, Cod, Cmp, CS, M);
-
-/// Owned-record backend for [`Sorter`].
-#[doc(hidden)]
-pub struct OwnedBackend<SK, Cod, Cmp, CS, M, Inner> {
-    inner: Inner,
-    _types: std::marker::PhantomData<SorterTypeMarker<SK, Cod, Cmp, CS, M>>,
-}
-
 /// Finalized stream of sorted sequence records.
 ///
-/// `SortedRecordStream` owns the sorted output source after a [`Sorter`] has
+/// `SortedRecordStream` owns the sorted output source after a sorter has
 /// been finished. It implements [`Iterator`] for owned materialization, so
 /// ordinary `.collect()` callsites continue to work.
+/// Core wraps this adapter in [`spillover::Sorted`]. Its borrowed traversal uses
+/// the same deduplication history as owned iteration.
 pub struct SortedRecordStream<I> {
     inner: I,
     dedup: RecordDedupState,
@@ -664,7 +717,20 @@ impl<I> SortedRecordStream<I> {
     }
 }
 
+impl<S> spillover::dedup::Dedup<S> for RecordDedup {
+    type Deduped = SortedRecordStream<S>;
+
+    fn dedup(self, source: S) -> Self::Deduped {
+        let state = RecordDedupState::new(self);
+        SortedRecordStream::new(source, state)
+    }
+}
+
 /// Destination for sequence records produced by a sorted stream.
+///
+/// Use Core's `output.items().try_for_each(...)` to deliver borrowed records.
+/// For writers with an inherent `write_record` method, such as [`DryIceWriter`],
+/// call `SeqRecordSink::write_record(&mut writer, record)` to select this adapter.
 pub trait SeqRecordSink {
     /// Error returned when the destination fails to write a record.
     type Error: std::error::Error + Send + Sync + 'static;
@@ -724,26 +790,17 @@ where
     }
 }
 
-impl<I, RE> SortedRecordStream<I>
+impl<S> VisitSortedItems for SortedRecordStream<S>
 where
-    I: VisitSortedItems<Error = RE>,
-    I::Record: SeqRecordParts,
-    RE: std::error::Error + Send + Sync + 'static,
+    S: VisitSortedItems,
+    S::Record: SeqRecordParts,
 {
-    /// Write all sorted records to a destination sink.
-    ///
-    /// This drains through the core current-item traversal seam. Keyed dryice
-    /// sources can write borrowed current record views, while sources without a
-    /// borrowed current representation may still materialize internally.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`SortedRecordStreamError::Source`] if the sorted stream fails to
-    /// produce a record, or [`SortedRecordStreamError::Sink`] if the destination
-    /// sink fails to write a record.
-    pub fn write_to<W>(self, writer: &mut W) -> Result<(), SortedRecordStreamError<RE, W::Error>>
+    type Record = S::Record;
+    type Error = S::Error;
+
+    fn visit_items<F, FE>(self, mut f: F) -> Result<(), SortedItemsError<Self::Error, FE>>
     where
-        W: SeqRecordSink,
+        F: FnMut(&Self::Record) -> Result<(), FE>,
     {
         let Self {
             inner,
@@ -755,12 +812,13 @@ where
             return Ok(());
         }
 
-        inner
-            .visit_items(|record| dedup.write(record, writer))
-            .map_err(|err| match err {
-                SortedItemsError::Source(err) => SortedRecordStreamError::Source(err),
-                SortedItemsError::Sink(err) => SortedRecordStreamError::Sink(err),
-            })
+        inner.visit_items(|record| {
+            if dedup.accept(record) {
+                f(record)
+            } else {
+                Ok(())
+            }
+        })
     }
 }
 
@@ -769,9 +827,8 @@ impl Builder {
     #[must_use]
     pub fn new() -> Self {
         Builder {
-            core: spillover::sorter::Builder::for_order(),
+            core: spillover::sorter::Builder::for_order().dedup(RecordDedup::None),
             codec: NeedsCodec,
-            dedup: RecordDedup::None,
             storage: OwnedStorage,
             mode: PhantomData,
         }
@@ -784,45 +841,6 @@ impl Default for Builder {
     }
 }
 
-macro_rules! native_keyed_methods {
-    ($limit:ty; $($extra:tt)*) => {
-        impl<O, C, CS> NativeSorter<O, C, CS, $limit>
-        where
-            C: KeyedCodec + EncodeKeyedRun<SeqRecord> + EncodeKeyedRun<NativeRecord<C>>,
-            O: spillover::key::DeriveKey<SeqRecord, StoredKey = C::Key> + Compare<SeqRecord> + Compare<NativeRecord<C>>,
-            for<'a> CS: ChunkSorter<spillover::key::Keyed<usize, C::Key>, spillover::key::KeyedEntryCompare<'a, SeqRecord, O>>,
-            $($extra)*
-        {
-            /// Add an unsorted record.
-            ///
-            /// # Errors
-            /// Returns an error if spilling fails.
-            pub fn push(&mut self, record: impl Into<SeqRecord>) -> Result<(), MergeError<C::Error>> {
-                self.inner.inner.push(record.into())
-            }
-
-            /// Finish sorting and return a sorted stream.
-            ///
-            /// # Errors
-            /// Returns an error if spilling or merging fails.
-            pub fn finish(self) -> Result<NativeOutput<C, O>, MergeError<C::Error>> {
-                let inner = self.inner.inner.finish()?;
-                let dedup = RecordDedupState::new(self.dedup);
-                Ok(SortedRecordStream::new(inner, dedup))
-            }
-        }
-    };
-}
-
-type NativeOutput<C, O> =
-    SortedRecordStream<spillover::Sorted<KeyedRunMerge<C, O, (), spillover::sorter::Keyed>>>;
-
-native_keyed_methods!(spillover::sorter::ItemLimit;);
-native_keyed_methods!(spillover::sorter::ByteLimit;
-    O: spillover::key::EstimateKeyMemory<SeqRecord>,
-    CS: spillover::chunk::EstimateSortMemory<spillover::key::Keyed<usize, C::Key>>,
-);
-
 // Sort order selection.
 
 impl<Core, C, M> Builder<Core, C, OwnedStorage, M> {
@@ -831,7 +849,6 @@ impl<Core, C, M> Builder<Core, C, OwnedStorage, M> {
     pub fn arena(self, arena: &mut SeqRecordArena) -> Builder<Core, C, ArenaStorage<'_>, M> {
         Builder {
             codec: self.codec,
-            dedup: self.dedup,
             core: self.core,
             storage: ArenaStorage { arena },
             mode: self.mode,
@@ -842,7 +859,7 @@ impl<Core, C, M> Builder<Core, C, OwnedStorage, M> {
 impl<C, L, CS, S> Builder<CoreBuilder<CoreNeedsOrder, L, CS>, C, S> {
     /// Set a keyed sort order (merge compares record keys).
     #[must_use]
-    pub fn sort_by<O: SortOrder<Strategy = Keyed> + KeyedOrder>(
+    pub fn sort_by<O: OrderCodecPolicy + KeyedOrder>(
         self,
         order: O,
     ) -> Builder<OrderedCore<O, L, CS>, C, S, CoreKeyed> {
@@ -851,7 +868,7 @@ impl<C, L, CS, S> Builder<CoreBuilder<CoreNeedsOrder, L, CS>, C, S> {
 
     /// Set an unkeyed sort order (merge deserializes full records).
     #[must_use]
-    pub fn sort_by_unkeyed<O: SortOrder<Strategy = Unkeyed>>(
+    pub fn sort_by_unkeyed<O: OrderCodecPolicy>(
         self,
         order: O,
     ) -> Builder<OrderedCore<O, L, CS>, C, S, CoreUnkeyed> {
@@ -935,7 +952,6 @@ impl<Core, St, M> Builder<Core, NeedsCodec, St, M> {
     ) -> Builder<Core, HasCodec<S, Q, N>, St, M> {
         Builder {
             codec: HasCodec(codec),
-            dedup: self.dedup,
             core: self.core,
             storage: self.storage,
             mode: self.mode,
@@ -978,30 +994,28 @@ impl<Core, C, S, M> Builder<Core, C, S, M> {
             core,
             codec: self.codec,
             storage: self.storage,
-            dedup: self.dedup,
             mode: PhantomData,
         }
     }
+}
 
+impl<SK, C, L, CS, S, M> Builder<CoreBuilder<SK, L, CS>, C, S, M> {
     /// Deduplicate adjacent records with identical names.
     #[must_use]
-    pub fn dedup_by_name(mut self) -> Self {
-        self.dedup = RecordDedup::Name;
-        self
+    pub fn dedup_by_name(self) -> Self {
+        self.map_core(|core| core.dedup(RecordDedup::Name))
     }
 
     /// Deduplicate adjacent records with identical sequences.
     #[must_use]
-    pub fn dedup_by_sequence(mut self) -> Self {
-        self.dedup = RecordDedup::Sequence;
-        self
+    pub fn dedup_by_sequence(self) -> Self {
+        self.map_core(|core| core.dedup(RecordDedup::Sequence))
     }
 
     /// Deduplicate adjacent records with identical sequence and quality.
     #[must_use]
-    pub fn dedup_by_sequence_and_quality(mut self) -> Self {
-        self.dedup = RecordDedup::SequenceAndQuality;
-        self
+    pub fn dedup_by_sequence_and_quality(self) -> Self {
+        self.map_core(|core| core.dedup(RecordDedup::SequenceAndQuality))
     }
 }
 
@@ -1057,31 +1071,22 @@ impl<SK, C, L, CS, S, M> Builder<CoreBuilder<SK, L, CS>, C, S, M> {
 
 type NativeKeyedCodec<O, C> = KeyedDryIceCodec<
     <O as KeyedOrder>::StoredKey,
-    <C as sealed::ResolveCodec<<O as sealed::Sealed>::CodecPolicy>>::S,
-    <C as sealed::ResolveCodec<<O as sealed::Sealed>::CodecPolicy>>::Q,
-    <C as sealed::ResolveCodec<<O as sealed::Sealed>::CodecPolicy>>::N,
+    <C as sealed::ResolveCodec<<O as OrderCodecPolicy>::Policy>>::S,
+    <C as sealed::ResolveCodec<<O as OrderCodecPolicy>::Policy>>::Q,
+    <C as sealed::ResolveCodec<<O as OrderCodecPolicy>::Policy>>::N,
 >;
 type NativeRecord<C> = <<C as KeyedCodec>::KeyedCursor<BufReader<File>> as CodecCursor>::Record;
-type NativeCore<O, C, CS, L> =
-    spillover::sorter::Sorter<SeqRecord, O, C, (), Identity, CS, spillover::sorter::Keyed, L>;
-type NativeSorter<O, C, CS, L> = Sorter<
-    O,
-    C,
-    (),
-    CS,
-    spillover::sorter::Keyed,
-    OwnedBackend<O, C, (), CS, spillover::sorter::Keyed, NativeCore<O, C, CS, L>>,
->;
+type NativeSorter<O, C, CS, L> =
+    spillover::sorter::Sorter<SeqRecord, O, C, (), RecordDedup, CS, spillover::sorter::Keyed, L>;
 
 macro_rules! owned_keyed_builder {
     ($limit:ty; $($extra:tt)*) => {
         impl<O, C, CS> Builder<OrderedCore<O, $limit, CS>, C, OwnedStorage, CoreKeyed>
         where
-            O: SortOrder<Strategy = Keyed> + DeriveKey<SeqRecord>
+            O: OrderCodecPolicy + DeriveKey<SeqRecord>
                 + Compare<SeqRecord> + Compare<NativeRecord<NativeKeyedCodec<O, C>>>,
             O::StoredKey: RecordKey + Clone + 'static,
-            C: sealed::ResolveCodec<<O as sealed::Sealed>::CodecPolicy>,
-            CS: sealed::CompatibleChunkSorter<O>,
+            C: sealed::ResolveCodec<O::Policy>,
             for<'a> CS: ChunkSorter<spillover::key::Keyed<usize, O::StoredKey>, spillover::key::KeyedEntryCompare<'a, SeqRecord, O>>,
             $($extra)*
         {
@@ -1090,12 +1095,7 @@ macro_rules! owned_keyed_builder {
             pub fn build(self) -> NativeSorter<O, NativeKeyedCodec<O, C>, CS, $limit> {
                 let codec = self.codec.resolve();
                 let keyed_codec: NativeKeyedCodec<O, C> = codec.with_record_key();
-                let inner = self.core.keyed_codec(keyed_codec).build();
-                Sorter {
-                    inner: OwnedBackend { inner, _types: std::marker::PhantomData },
-                    dedup: self.dedup,
-                    _types: std::marker::PhantomData,
-                }
+                self.core.keyed_codec(keyed_codec).build()
             }
         }
     };
@@ -1109,15 +1109,14 @@ owned_keyed_builder!(ItemLimit;);
 
 impl<O, C, CS> Builder<OrderedCore<O, NeedsLimit, CS>, C, OwnedStorage, CoreKeyed>
 where
-    O: SortOrder<Strategy = Keyed>
+    O: OrderCodecPolicy
         + DeriveKey<SeqRecord>
         + spillover::key::EstimateKeyMemory<SeqRecord>
         + Compare<SeqRecord>
         + Compare<NativeRecord<NativeKeyedCodec<O, C>>>,
     O::StoredKey: RecordKey + Clone + 'static,
-    C: sealed::ResolveCodec<<O as sealed::Sealed>::CodecPolicy>,
-    CS: sealed::CompatibleChunkSorter<O>
-        + spillover::chunk::EstimateSortMemory<spillover::key::Keyed<usize, O::StoredKey>>,
+    C: sealed::ResolveCodec<O::Policy>,
+    CS: spillover::chunk::EstimateSortMemory<spillover::key::Keyed<usize, O::StoredKey>>,
     for<'a> CS: ChunkSorter<
             spillover::key::Keyed<usize, O::StoredKey>,
             spillover::key::KeyedEntryCompare<'a, SeqRecord, O>,
@@ -1133,57 +1132,34 @@ where
 // build() for unkeyed sort orders.
 
 type ResolvedCodec<O, C> = DryIceCodec<
-    <C as sealed::ResolveCodec<<O as sealed::Sealed>::CodecPolicy>>::S,
-    <C as sealed::ResolveCodec<<O as sealed::Sealed>::CodecPolicy>>::Q,
-    <C as sealed::ResolveCodec<<O as sealed::Sealed>::CodecPolicy>>::N,
+    <C as sealed::ResolveCodec<<O as OrderCodecPolicy>::Policy>>::S,
+    <C as sealed::ResolveCodec<<O as OrderCodecPolicy>::Policy>>::Q,
+    <C as sealed::ResolveCodec<<O as OrderCodecPolicy>::Policy>>::N,
 >;
 type NativeOrdinaryRecord<C> = <<C as Codec>::Cursor<BufReader<File>> as CodecCursor>::Record;
-type NativeUnkeyedCore<O, C, CS, L> =
-    spillover::sorter::Sorter<SeqRecord, O, C, (), Identity, CS, spillover::sorter::Unkeyed, L>;
-type NativeUnkeyedSorter<O, C, CS, L> = Sorter<
-    O,
-    C,
-    (),
-    CS,
-    spillover::sorter::Unkeyed,
-    OwnedBackend<O, C, (), CS, spillover::sorter::Unkeyed, NativeUnkeyedCore<O, C, CS, L>>,
->;
-type NativeUnkeyedOutput<C, O> = SortedRecordStream<spillover::Sorted<RunMerge<C, O>>>;
+type NativeUnkeyedSorter<O, C, CS, L> =
+    spillover::sorter::Sorter<SeqRecord, O, C, (), RecordDedup, CS, spillover::sorter::Unkeyed, L>;
 type NativeUnkeyedBuilt<O, C, CS, L> = NativeUnkeyedSorter<O, ResolvedCodec<O, C>, CS, L>;
 
 impl<O, C, CS> Builder<OrderedCore<O, ItemLimit, CS>, C, OwnedStorage, CoreUnkeyed>
 where
-    C: sealed::ResolveCodec<<O as sealed::Sealed>::CodecPolicy>,
-    O: SortOrder<Strategy = Unkeyed>
-        + Compare<SeqRecord>
-        + Compare<NativeOrdinaryRecord<ResolvedCodec<O, C>>>,
-    CS: ChunkSorter<SeqRecord, O> + sealed::CompatibleChunkSorter<O>,
+    C: sealed::ResolveCodec<O::Policy>,
+    O: OrderCodecPolicy + Compare<SeqRecord> + Compare<NativeOrdinaryRecord<ResolvedCodec<O, C>>>,
+    CS: ChunkSorter<SeqRecord, O>,
 {
     /// Build an item-limited sorter using the complete unkeyed order.
     #[must_use]
     pub fn build(self) -> NativeUnkeyedBuilt<O, C, CS, spillover::sorter::ItemLimit> {
         let codec = self.codec.resolve();
-        let inner = self.core.codec(codec).build();
-        Sorter {
-            inner: OwnedBackend {
-                inner,
-                _types: std::marker::PhantomData,
-            },
-            dedup: self.dedup,
-            _types: std::marker::PhantomData,
-        }
+        self.core.codec(codec).build()
     }
 }
 
 impl<O, C, CS> Builder<OrderedCore<O, NeedsLimit, CS>, C, OwnedStorage, CoreUnkeyed>
 where
-    C: sealed::ResolveCodec<<O as sealed::Sealed>::CodecPolicy>,
-    O: SortOrder<Strategy = Unkeyed>
-        + Compare<SeqRecord>
-        + Compare<NativeOrdinaryRecord<ResolvedCodec<O, C>>>,
-    CS: ChunkSorter<SeqRecord, O>
-        + spillover::chunk::EstimateSortMemory<SeqRecord>
-        + sealed::CompatibleChunkSorter<O>,
+    C: sealed::ResolveCodec<O::Policy>,
+    O: OrderCodecPolicy + Compare<SeqRecord> + Compare<NativeOrdinaryRecord<ResolvedCodec<O, C>>>,
+    CS: ChunkSorter<SeqRecord, O> + spillover::chunk::EstimateSortMemory<SeqRecord>,
 {
     /// Build with the default 1 GiB measured budget.
     #[must_use]
@@ -1194,100 +1170,35 @@ where
 
 impl<O, C, CS> Builder<OrderedCore<O, ByteLimit, CS>, C, OwnedStorage, CoreUnkeyed>
 where
-    C: sealed::ResolveCodec<<O as sealed::Sealed>::CodecPolicy>,
-    O: SortOrder<Strategy = Unkeyed>
-        + Compare<SeqRecord>
-        + Compare<NativeOrdinaryRecord<ResolvedCodec<O, C>>>,
-    CS: ChunkSorter<SeqRecord, O>
-        + spillover::chunk::EstimateSortMemory<SeqRecord>
-        + sealed::CompatibleChunkSorter<O>,
+    C: sealed::ResolveCodec<O::Policy>,
+    O: OrderCodecPolicy + Compare<SeqRecord> + Compare<NativeOrdinaryRecord<ResolvedCodec<O, C>>>,
+    CS: ChunkSorter<SeqRecord, O> + spillover::chunk::EstimateSortMemory<SeqRecord>,
 {
     /// Build an owned unkeyed sorter under a measured byte budget.
     #[must_use]
     pub fn build(self) -> NativeUnkeyedBuilt<O, C, CS, spillover::sorter::ByteLimit> {
         let codec = self.codec.resolve();
-        let inner = self.core.codec(codec).build();
-        Sorter {
-            inner: OwnedBackend {
-                inner,
-                _types: std::marker::PhantomData,
-            },
-            dedup: self.dedup,
-            _types: std::marker::PhantomData,
-        }
+        self.core.codec(codec).build()
     }
 }
 
-impl<O, C, CS> NativeUnkeyedSorter<O, C, CS, spillover::sorter::ByteLimit>
-where
-    C: Codec + EncodeRun<SeqRecord> + EncodeRun<NativeOrdinaryRecord<C>>,
-    O: Compare<SeqRecord> + Compare<NativeOrdinaryRecord<C>>,
-    CS: ChunkSorter<SeqRecord, O> + spillover::chunk::EstimateSortMemory<SeqRecord>,
-{
-    /// Add a record under the measured byte budget.
-    ///
-    /// # Errors
-    /// Returns an error if spilling fails.
-    pub fn push(&mut self, record: impl Into<SeqRecord>) -> Result<(), MergeError<C::Error>> {
-        self.inner.inner.push(record.into())
-    }
-
-    /// Finish sorting and return the finalized stream.
-    ///
-    /// # Errors
-    /// Returns an error if spilling or merging fails.
-    pub fn finish(self) -> Result<NativeUnkeyedOutput<C, O>, MergeError<C::Error>> {
-        let inner = self.inner.inner.finish()?;
-        let dedup = RecordDedupState::new(self.dedup);
-        Ok(SortedRecordStream::new(inner, dedup))
-    }
-}
-
-impl<O, C, CS> NativeUnkeyedSorter<O, C, CS, spillover::sorter::ItemLimit>
-where
-    C: Codec + EncodeRun<SeqRecord> + EncodeRun<NativeOrdinaryRecord<C>>,
-    O: Compare<SeqRecord> + Compare<NativeOrdinaryRecord<C>>,
-    CS: ChunkSorter<SeqRecord, O>,
-{
-    /// Add an unsorted record to the sorter.
-    ///
-    /// # Errors
-    /// Returns an error if spilling fails.
-    pub fn push(&mut self, record: impl Into<SeqRecord>) -> Result<(), MergeError<C::Error>> {
-        self.inner.inner.push(record.into())
-    }
-
-    /// Finish sorting and return the finalized sorted record stream.
-    ///
-    /// # Errors
-    /// Returns an error if spilling or merging fails.
-    pub fn finish(self) -> Result<NativeUnkeyedOutput<C, O>, MergeError<C::Error>> {
-        let inner = self.inner.inner.finish()?;
-        let dedup = RecordDedupState::new(self.dedup);
-        Ok(SortedRecordStream::new(inner, dedup))
-    }
-}
-
-type ArenaUnkeyedCore<'a, O, C, CS> = spillover::sorter::Sorter<
+type NativeArenaUnkeyed<'a, O, C, CS> = spillover::sorter::Sorter<
     (),
     O,
     C,
     (),
-    Identity,
+    RecordDedup,
     CS,
     spillover::sorter::Unkeyed,
     spillover::sorter::ArenaBuffer<'a, SeqRecordArena>,
 >;
-type NativeArenaUnkeyed<'a, O, C, CS> =
-    Sorter<O, C, (), CS, spillover::sorter::Unkeyed, ArenaUnkeyedCore<'a, O, C, CS>>;
 type NativeArenaBuilt<'a, O, C, CS> = NativeArenaUnkeyed<'a, O, ResolvedCodec<O, C>, CS>;
 
 impl<'a, O, C, CS> Builder<OrderedCore<O, ItemLimit, CS>, C, ArenaStorage<'a>, CoreUnkeyed>
 where
-    C: sealed::ResolveCodec<<O as sealed::Sealed>::CodecPolicy>,
-    O: SortOrder<Strategy = Unkeyed> + Compare<NativeOrdinaryRecord<ResolvedCodec<O, C>>>,
+    C: sealed::ResolveCodec<O::Policy>,
+    O: OrderCodecPolicy + Compare<NativeOrdinaryRecord<ResolvedCodec<O, C>>>,
     for<'v> O: Compare<SeqRecordView<'v>>,
-    CS: sealed::CompatibleChunkSorter<O>,
     for<'v> CS: ChunkSorter<SeqRecordView<'v>, O>,
 {
     /// Build an item-limited sorter over the selected arena.
@@ -1297,66 +1208,28 @@ where
         let storage = self.storage.arena;
         let builder = self.core.codec(codec);
         let build_in: fn(_, &'a mut SeqRecordArena) -> _ = spillover::sorter::Builder::build_in;
-        let inner = build_in(builder, storage);
-        Sorter {
-            inner,
-            dedup: self.dedup,
-            _types: std::marker::PhantomData,
-        }
+        build_in(builder, storage)
     }
 }
 
-impl<O, C, CS> NativeArenaUnkeyed<'_, O, C, CS>
-where
-    C: Codec + EncodeRun<NativeOrdinaryRecord<C>>,
-    for<'v> C: EncodeRun<SeqRecordView<'v>>,
-    O: Compare<NativeOrdinaryRecord<C>>,
-    for<'v> O: Compare<SeqRecordView<'v>>,
-    for<'v> CS: ChunkSorter<SeqRecordView<'v>, O>,
-{
-    /// Add a borrowed record to the arena-backed sorter.
-    ///
-    /// # Errors
-    /// Returns an error if spilling fails.
-    pub fn push<R: SeqRecordParts + ?Sized>(
-        &mut self,
-        record: &R,
-    ) -> Result<(), MergeError<C::Error>> {
-        self.inner.push(record)
-    }
-
-    /// Finish the sorter and return its sorted record stream.
-    ///
-    /// # Errors
-    /// Returns an error if spilling or merging fails.
-    pub fn finish(self) -> Result<NativeUnkeyedOutput<C, O>, MergeError<C::Error>> {
-        let inner = self.inner.finish()?;
-        let dedup = RecordDedupState::new(self.dedup);
-        Ok(SortedRecordStream::new(inner, dedup))
-    }
-}
-
-type MeasuredArenaUnkeyedCore<'a, O, C, CS> = spillover::sorter::Sorter<
+type NativeMeasuredArenaUnkeyed<'a, O, C, CS> = spillover::sorter::Sorter<
     (),
     O,
     C,
     (),
-    Identity,
+    RecordDedup,
     CS,
     spillover::sorter::Unkeyed,
     spillover::sorter::MeasuredArena<'a, SeqRecordArena>,
 >;
-type NativeMeasuredArenaUnkeyed<'a, O, C, CS> =
-    Sorter<O, C, (), CS, spillover::sorter::Unkeyed, MeasuredArenaUnkeyedCore<'a, O, C, CS>>;
 type NativeMeasuredArenaBuilt<'a, O, C, CS> =
     NativeMeasuredArenaUnkeyed<'a, O, ResolvedCodec<O, C>, CS>;
 
 impl<'a, O, C, CS> Builder<OrderedCore<O, ByteLimit, CS>, C, ArenaStorage<'a>, CoreUnkeyed>
 where
-    C: sealed::ResolveCodec<<O as sealed::Sealed>::CodecPolicy>,
-    O: SortOrder<Strategy = Unkeyed> + Compare<NativeOrdinaryRecord<ResolvedCodec<O, C>>>,
+    C: sealed::ResolveCodec<O::Policy>,
+    O: OrderCodecPolicy + Compare<NativeOrdinaryRecord<ResolvedCodec<O, C>>>,
     for<'v> O: Compare<SeqRecordView<'v>>,
-    CS: sealed::CompatibleChunkSorter<O>,
     for<'v> CS:
         ChunkSorter<SeqRecordView<'v>, O> + spillover::chunk::EstimateSortMemory<SeqRecordView<'v>>,
 {
@@ -1368,21 +1241,15 @@ where
         let builder = self.core.codec(codec);
         let build_measured_in: fn(_, &'a mut SeqRecordArena) -> _ =
             spillover::sorter::Builder::build_measured_in;
-        let inner = build_measured_in(builder, storage);
-        Sorter {
-            inner,
-            dedup: self.dedup,
-            _types: std::marker::PhantomData,
-        }
+        build_measured_in(builder, storage)
     }
 }
 
 impl<'a, O, C, CS> Builder<OrderedCore<O, NeedsLimit, CS>, C, ArenaStorage<'a>, CoreUnkeyed>
 where
-    C: sealed::ResolveCodec<<O as sealed::Sealed>::CodecPolicy>,
-    O: SortOrder<Strategy = Unkeyed> + Compare<NativeOrdinaryRecord<ResolvedCodec<O, C>>>,
+    C: sealed::ResolveCodec<O::Policy>,
+    O: OrderCodecPolicy + Compare<NativeOrdinaryRecord<ResolvedCodec<O, C>>>,
     for<'v> O: Compare<SeqRecordView<'v>>,
-    CS: sealed::CompatibleChunkSorter<O>,
     for<'v> CS:
         ChunkSorter<SeqRecordView<'v>, O> + spillover::chunk::EstimateSortMemory<SeqRecordView<'v>>,
 {
@@ -1393,56 +1260,22 @@ where
     }
 }
 
-impl<O, C, CS> NativeMeasuredArenaUnkeyed<'_, O, C, CS>
-where
-    C: Codec + EncodeRun<NativeOrdinaryRecord<C>>,
-    for<'v> C: EncodeRun<SeqRecordView<'v>>,
-    O: Compare<NativeOrdinaryRecord<C>>,
-    for<'v> O: Compare<SeqRecordView<'v>>,
-    for<'v> CS:
-        ChunkSorter<SeqRecordView<'v>, O> + spillover::chunk::EstimateSortMemory<SeqRecordView<'v>>,
-{
-    /// Add a borrowed record to the arena-backed sorter.
-    ///
-    /// # Errors
-    /// Returns an error if spilling fails.
-    pub fn push<R: SeqRecordParts + ?Sized>(
-        &mut self,
-        record: &R,
-    ) -> Result<(), MergeError<C::Error>> {
-        self.inner.push(record)
-    }
-
-    /// Finish the sorter and return its sorted record stream.
-    ///
-    /// # Errors
-    /// Returns an error if spilling or merging fails.
-    pub fn finish(self) -> Result<NativeUnkeyedOutput<C, O>, MergeError<C::Error>> {
-        let inner = self.inner.finish()?;
-        let dedup = RecordDedupState::new(self.dedup);
-        Ok(SortedRecordStream::new(inner, dedup))
-    }
-}
-
-type ArenaKeyedCore<'a, O, C, CS> = spillover::sorter::Sorter<
+type NativeArenaKeyed<'a, O, C, CS> = spillover::sorter::Sorter<
     (),
     O,
     C,
     (),
-    Identity,
+    RecordDedup,
     CS,
     spillover::sorter::Keyed,
     spillover::sorter::ArenaBuffer<'a, SeqRecordArena>,
 >;
-type NativeArenaKeyed<'a, O, C, CS> =
-    Sorter<O, C, (), CS, spillover::sorter::Keyed, ArenaKeyedCore<'a, O, C, CS>>;
 
 impl<'a, O, C, CS> Builder<OrderedCore<O, ItemLimit, CS>, C, ArenaStorage<'a>, CoreKeyed>
 where
-    O: SortOrder<Strategy = Keyed> + KeyedOrder + Compare<NativeRecord<NativeKeyedCodec<O, C>>>,
+    O: OrderCodecPolicy + KeyedOrder + Compare<NativeRecord<NativeKeyedCodec<O, C>>>,
     O::StoredKey: RecordKey + Clone + 'static,
-    C: sealed::ResolveCodec<<O as sealed::Sealed>::CodecPolicy>,
-    CS: sealed::CompatibleChunkSorter<O>,
+    C: sealed::ResolveCodec<O::Policy>,
     for<'v> O: DeriveKey<SeqRecordView<'v>> + Compare<SeqRecordView<'v>>,
     for<'v, 'order> CS: ChunkSorter<
             spillover::key::Keyed<usize, O::StoredKey>,
@@ -1458,35 +1291,27 @@ where
         let builder = self.core.keyed_codec(keyed_codec);
         let build_keyed_in: fn(_, &'a mut SeqRecordArena) -> _ =
             spillover::sorter::Builder::build_keyed_in;
-        let inner = build_keyed_in(builder, storage);
-        Sorter {
-            inner,
-            dedup: self.dedup,
-            _types: std::marker::PhantomData,
-        }
+        build_keyed_in(builder, storage)
     }
 }
 
-type MeasuredArenaKeyedCore<'a, O, C, CS> = spillover::sorter::Sorter<
+type NativeMeasuredArenaKeyed<'a, O, C, CS> = spillover::sorter::Sorter<
     (),
     O,
     C,
     (),
-    Identity,
+    RecordDedup,
     CS,
     spillover::sorter::Keyed,
     spillover::sorter::MeasuredArena<'a, SeqRecordArena>,
 >;
-type NativeMeasuredArenaKeyed<'a, O, C, CS> =
-    Sorter<O, C, (), CS, spillover::sorter::Keyed, MeasuredArenaKeyedCore<'a, O, C, CS>>;
 
 impl<'a, O, C, CS> Builder<OrderedCore<O, ByteLimit, CS>, C, ArenaStorage<'a>, CoreKeyed>
 where
-    O: SortOrder<Strategy = Keyed> + KeyedOrder + Compare<NativeRecord<NativeKeyedCodec<O, C>>>,
+    O: OrderCodecPolicy + KeyedOrder + Compare<NativeRecord<NativeKeyedCodec<O, C>>>,
     O::StoredKey: RecordKey + Clone + 'static,
-    C: sealed::ResolveCodec<<O as sealed::Sealed>::CodecPolicy>,
-    CS: sealed::CompatibleChunkSorter<O>
-        + spillover::chunk::EstimateSortMemory<spillover::key::Keyed<usize, O::StoredKey>>,
+    C: sealed::ResolveCodec<O::Policy>,
+    CS: spillover::chunk::EstimateSortMemory<spillover::key::Keyed<usize, O::StoredKey>>,
     for<'v> O: DeriveKey<SeqRecordView<'v>>
         + spillover::key::EstimateKeyMemory<SeqRecordView<'v>>
         + Compare<SeqRecordView<'v>>,
@@ -1504,22 +1329,16 @@ where
         let builder = self.core.keyed_codec(keyed_codec);
         let build_keyed_measured_in: fn(_, &'a mut SeqRecordArena) -> _ =
             spillover::sorter::Builder::build_keyed_measured_in;
-        let inner = build_keyed_measured_in(builder, storage);
-        Sorter {
-            inner,
-            dedup: self.dedup,
-            _types: std::marker::PhantomData,
-        }
+        build_keyed_measured_in(builder, storage)
     }
 }
 
 impl<'a, O, C, CS> Builder<OrderedCore<O, NeedsLimit, CS>, C, ArenaStorage<'a>, CoreKeyed>
 where
-    O: SortOrder<Strategy = Keyed> + KeyedOrder + Compare<NativeRecord<NativeKeyedCodec<O, C>>>,
+    O: OrderCodecPolicy + KeyedOrder + Compare<NativeRecord<NativeKeyedCodec<O, C>>>,
     O::StoredKey: RecordKey + Clone + 'static,
-    C: sealed::ResolveCodec<<O as sealed::Sealed>::CodecPolicy>,
-    CS: sealed::CompatibleChunkSorter<O>
-        + spillover::chunk::EstimateSortMemory<spillover::key::Keyed<usize, O::StoredKey>>,
+    C: sealed::ResolveCodec<O::Policy>,
+    CS: spillover::chunk::EstimateSortMemory<spillover::key::Keyed<usize, O::StoredKey>>,
     for<'v> O: DeriveKey<SeqRecordView<'v>>
         + spillover::key::EstimateKeyMemory<SeqRecordView<'v>>
         + Compare<SeqRecordView<'v>>,
@@ -1532,80 +1351,6 @@ where
     #[must_use]
     pub fn build(self) -> NativeMeasuredArenaKeyed<'a, O, NativeKeyedCodec<O, C>, CS> {
         self.measured_budget(DEFAULT_BUDGET).build()
-    }
-}
-
-impl<O, C, CS> NativeMeasuredArenaKeyed<'_, O, C, CS>
-where
-    C: KeyedCodec + EncodeKeyedRun<NativeRecord<C>>,
-    for<'v> C: EncodeKeyedRun<SeqRecordView<'v>>,
-    O: Compare<NativeRecord<C>>,
-    for<'v> O: spillover::key::DeriveKey<SeqRecordView<'v>, StoredKey = C::Key>
-        + spillover::key::EstimateKeyMemory<SeqRecordView<'v>>
-        + Compare<SeqRecordView<'v>>,
-    CS: spillover::chunk::EstimateSortMemory<spillover::key::Keyed<usize, C::Key>>,
-    for<'v, 'order> CS: ChunkSorter<
-            spillover::key::Keyed<usize, C::Key>,
-            spillover::key::KeyedEntryCompare<'order, SeqRecordView<'v>, O>,
-        >,
-{
-    /// Insert a borrowed record.
-    ///
-    /// # Errors
-    /// Returns an error if completing a run fails.
-    pub fn push<R: SeqRecordParts + ?Sized>(
-        &mut self,
-        record: &R,
-    ) -> Result<(), MergeError<C::Error>> {
-        let name = record.name();
-        let sequence = record.sequence();
-        let quality = record.quality();
-        let view = SeqRecordView::new(name, sequence, quality);
-        self.inner.push(&view)
-    }
-
-    /// Finish and return the sorted records.
-    ///
-    /// # Errors
-    /// Returns an error if spilling or merging fails.
-    pub fn finish(self) -> Result<NativeOutput<C, O>, MergeError<C::Error>> {
-        let inner = self.inner.finish()?;
-        let dedup = RecordDedupState::new(self.dedup);
-        Ok(SortedRecordStream::new(inner, dedup))
-    }
-}
-
-impl<O, C, CS> NativeArenaKeyed<'_, O, C, CS>
-where
-    C: KeyedCodec + EncodeKeyedRun<NativeRecord<C>>,
-    for<'v> C: EncodeKeyedRun<SeqRecordView<'v>>,
-    O: Compare<NativeRecord<C>>,
-    for<'v> O: spillover::key::DeriveKey<SeqRecordView<'v>, StoredKey = C::Key>
-        + Compare<SeqRecordView<'v>>,
-    for<'v, 'order> CS: ChunkSorter<
-            spillover::key::Keyed<usize, C::Key>,
-            spillover::key::KeyedEntryCompare<'order, SeqRecordView<'v>, O>,
-        >,
-{
-    /// Add a borrowed record.
-    ///
-    /// # Errors
-    /// Returns a spill error.
-    pub fn push<R: SeqRecordParts + ?Sized>(
-        &mut self,
-        record: &R,
-    ) -> Result<(), MergeError<C::Error>> {
-        self.inner.push(record)
-    }
-
-    /// Finish sorting.
-    ///
-    /// # Errors
-    /// Returns a spill or merge error.
-    pub fn finish(self) -> Result<NativeOutput<C, O>, MergeError<C::Error>> {
-        let inner = self.inner.finish()?;
-        let dedup = RecordDedupState::new(self.dedup);
-        Ok(SortedRecordStream::new(inner, dedup))
     }
 }
 
@@ -1924,15 +1669,18 @@ mod tests {
     }
 
     #[test]
-    fn unkeyed_sequence_order_has_unkeyed_strategy() {
-        fn assert_unkeyed<O: SortOrder<Strategy = Unkeyed>>() {}
-        assert_unkeyed::<UnkeyedSequenceOrder>();
+    fn exact_sequence_order_requires_raw_compared_fields() {
+        fn assert_exact<O: OrderCodecPolicy<Policy = sealed::ExactSequenceThenQuality>>() {}
+        assert_exact::<UnkeyedSequenceOrder>();
+        assert_exact::<Reverse<UnkeyedSequenceOrder>>();
+        assert_exact::<Reverse<Reverse<UnkeyedSequenceOrder>>>();
     }
 
     #[test]
-    fn keyed_sequence_order_has_keyed_strategy() {
-        fn assert_keyed<O: SortOrder<Strategy = Keyed>>() {}
-        assert_keyed::<SequenceOrder<38>>();
+    fn accelerated_sequence_order_retains_codec_choices() {
+        fn assert_choices<O: OrderCodecPolicy<Policy = sealed::ExistingCodecChoices>>() {}
+        assert_choices::<SequenceOrder<38>>();
+        assert_choices::<Reverse<SequenceOrder<38>>>();
     }
 
     #[test]
@@ -1951,15 +1699,8 @@ mod tests {
 
     #[test]
     fn unkeyed_from_keyed() {
-        fn assert_unkeyed<O: SortOrder<Strategy = Unkeyed>>() {}
-
-        let _unkeyed = ILLUMINA_ORDER.unkeyed();
-        assert_unkeyed::<UnkeyedSequenceOrder>();
-
-        let _unkeyed = NameOrder.unkeyed();
-        assert_unkeyed::<UnkeyedNameOrder>();
-
-        let _unkeyed = LengthOrder.unkeyed();
-        assert_unkeyed::<UnkeyedLengthOrder>();
+        let _: UnkeyedSequenceOrder = ILLUMINA_ORDER.unkeyed();
+        let _: UnkeyedNameOrder = NameOrder.unkeyed();
+        let _: UnkeyedLengthOrder = LengthOrder.unkeyed();
     }
 }
