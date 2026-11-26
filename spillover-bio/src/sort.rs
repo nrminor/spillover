@@ -17,15 +17,15 @@ use dryice::{
     SequenceCodec,
 };
 use spillover::{
-    SortedItemsError,
     chunk::{ChunkSorter, Sequential},
     codec::{Codec, CodecCursor, KeyedCodec},
     compare::Compare,
+    dedup::AdjacentDeduplicator,
     key::{DeriveKey, KeyedOrder, SortKey},
     merge::MergeConfig,
     sorter::{
         ByteLimit, HasOrder, ItemLimit, Keyed as CoreKeyed, NeedsOrder as CoreNeedsOrder,
-        Unkeyed as CoreUnkeyed, VisitSortedItems,
+        Unkeyed as CoreUnkeyed,
     },
 };
 
@@ -447,57 +447,67 @@ pub const LENGTH_ORDER: LengthOrder = LengthOrder;
 
 // ── Builder ──────────────────────────────────────────────
 
-/// Post-merge adjacent deduplication, applied through Core's [`spillover::dedup::Dedup`].
+/// Post-merge adjacent deduplication, applied through Core's [`AdjacentDeduplicator`].
 ///
 /// Each enabled mode keeps the first record in a consecutive group of matches.
 /// Global deduplication requires an order that makes all matching records
 /// contiguous. Owned iteration and borrowed visits share the same history.
-#[derive(Debug, Clone, Copy)]
-pub enum RecordDedup {
-    /// Retain every record.
-    None,
-    /// Match record names.
+/// This stateful algorithm is not `Copy`. Its retained packed record reuses
+/// allocated capacity when later accepted records replace it. The retained
+/// output history is outside the modeled initial-spill memory budget.
+#[derive(Debug)]
+pub struct RecordDedup {
+    mode: RecordDedupMode,
+    previous: Option<RecordRepresentative>,
+}
+
+#[derive(Debug)]
+enum RecordDedupMode {
     Name,
-    /// Match sequence bytes.
     Sequence,
-    /// Match both sequence and quality bytes.
     SequenceAndQuality,
 }
 
 impl RecordDedup {
-    #[inline]
-    fn is_enabled(self) -> bool {
-        !matches!(self, Self::None)
+    /// Match record names.
+    #[must_use]
+    pub fn by_name() -> Self {
+        Self {
+            mode: RecordDedupMode::Name,
+            previous: None,
+        }
     }
 
-    #[inline]
-    fn is_duplicate<R: SeqRecordParts + ?Sized>(
-        self,
-        previous: Option<&PreviousRecord>,
-        current: &R,
-    ) -> bool {
-        previous.is_some_and(|previous| self.matches(previous, current))
+    /// Match sequence bytes.
+    #[must_use]
+    pub fn by_sequence() -> Self {
+        Self {
+            mode: RecordDedupMode::Sequence,
+            previous: None,
+        }
     }
 
-    #[inline]
-    fn matches<R: SeqRecordParts + ?Sized>(self, previous: &PreviousRecord, current: &R) -> bool {
-        match self {
-            Self::None => false,
-            Self::Name => previous.has_same_name_as(current),
-            Self::Sequence => previous.has_same_sequence_as(current),
-            Self::SequenceAndQuality => previous.has_same_sequence_and_quality_as(current),
+    /// Match sequence and quality bytes.
+    #[must_use]
+    pub fn by_sequence_and_quality() -> Self {
+        Self {
+            mode: RecordDedupMode::SequenceAndQuality,
+            previous: None,
         }
     }
 }
 
+/// The associated representative of [`RecordDedup`], with private packed fields.
+///
+/// It implements [`SeqRecordParts`] to expose the captured record's fields.
 #[derive(Debug, Default)]
-struct PreviousRecord {
+pub struct RecordRepresentative {
     bytes: Vec<u8>,
     name_len: usize,
     sequence_len: usize,
 }
 
-impl PreviousRecord {
+impl RecordRepresentative {
     fn copy_from<R: SeqRecordParts + ?Sized>(&mut self, record: &R) {
         let total_len = record.name().len() + record.sequence().len() + record.quality().len();
 
@@ -519,7 +529,7 @@ impl PreviousRecord {
     }
 }
 
-impl SeqRecordParts for PreviousRecord {
+impl SeqRecordParts for RecordRepresentative {
     fn name(&self) -> &[u8] {
         &self.bytes[..self.name_len]
     }
@@ -533,33 +543,36 @@ impl SeqRecordParts for PreviousRecord {
     }
 }
 
-struct RecordDedupState {
-    mode: RecordDedup,
-    previous: Option<PreviousRecord>,
-}
+impl<R: SeqRecordParts + ?Sized> AdjacentDeduplicator<R> for RecordDedup {
+    type Representative = RecordRepresentative;
 
-impl RecordDedupState {
-    fn new(mode: RecordDedup) -> Self {
-        Self {
-            mode,
-            previous: None,
-        }
+    fn matches(&self, current: &R) -> bool {
+        self.previous
+            .as_ref()
+            .is_some_and(|previous| match self.mode {
+                RecordDedupMode::Name => previous.has_same_name_as(current),
+                RecordDedupMode::Sequence => previous.has_same_sequence_as(current),
+                RecordDedupMode::SequenceAndQuality => {
+                    previous.has_same_sequence_and_quality_as(current)
+                }
+            })
     }
 
-    fn is_enabled(&self) -> bool {
-        self.mode.is_enabled()
+    fn capture(&self, record: &R) -> RecordRepresentative {
+        let mut representative = RecordRepresentative::default();
+        representative.copy_from(record);
+        representative
     }
 
-    fn accept<R: SeqRecordParts + ?Sized>(&mut self, record: &R) -> bool {
-        if !self.is_enabled() {
-            return true;
-        }
-        if self.mode.is_duplicate(self.previous.as_ref(), record) {
-            return false;
-        }
-        let previous = self.previous.get_or_insert_with(PreviousRecord::default);
+    fn replace(&mut self, representative: RecordRepresentative) {
+        self.previous = Some(representative);
+    }
+
+    fn update(&mut self, record: &R) {
+        let previous = self
+            .previous
+            .get_or_insert_with(RecordRepresentative::default);
         previous.copy_from(record);
-        true
     }
 }
 
@@ -701,30 +714,7 @@ type InitialCore = CoreBuilder<CoreNeedsOrder, ByteLimit, Sequential>;
 /// ordinary `.collect()` callsites continue to work.
 /// Core wraps this adapter in [`spillover::Sorted`]. Its borrowed traversal uses
 /// the same deduplication history as owned iteration.
-pub struct SortedRecordStream<I> {
-    inner: I,
-    dedup: RecordDedupState,
-    fused: bool,
-}
-
-impl<I> SortedRecordStream<I> {
-    fn new(inner: I, dedup: RecordDedupState) -> Self {
-        Self {
-            inner,
-            dedup,
-            fused: false,
-        }
-    }
-}
-
-impl<S> spillover::dedup::Dedup<S> for RecordDedup {
-    type Deduped = SortedRecordStream<S>;
-
-    fn dedup(self, source: S) -> Self::Deduped {
-        let state = RecordDedupState::new(self);
-        SortedRecordStream::new(source, state)
-    }
-}
+pub type SortedRecordStream<I> = spillover::dedup::Deduplicated<I, RecordDedup>;
 
 /// Destination for sequence records produced by a sorted stream.
 ///
@@ -758,70 +748,6 @@ where
     }
 }
 
-impl<I, E> Iterator for SortedRecordStream<I>
-where
-    I: Iterator<Item = Result<SeqRecord, E>>,
-{
-    type Item = Result<SeqRecord, E>;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        if !self.dedup.is_enabled() {
-            return self.inner.next();
-        }
-
-        if self.fused {
-            return None;
-        }
-
-        loop {
-            match self.inner.next() {
-                Some(Ok(record)) => {
-                    if self.dedup.accept(&record) {
-                        return Some(Ok(record));
-                    }
-                }
-                Some(Err(err)) => {
-                    self.fused = true;
-                    return Some(Err(err));
-                }
-                None => return None,
-            }
-        }
-    }
-}
-
-impl<S> VisitSortedItems for SortedRecordStream<S>
-where
-    S: VisitSortedItems,
-    S::Record: SeqRecordParts,
-{
-    type Record = S::Record;
-    type Error = S::Error;
-
-    fn visit_items<F, FE>(self, mut f: F) -> Result<(), SortedItemsError<Self::Error, FE>>
-    where
-        F: FnMut(&Self::Record) -> Result<(), FE>,
-    {
-        let Self {
-            inner,
-            mut dedup,
-            fused,
-        } = self;
-
-        if fused {
-            return Ok(());
-        }
-
-        inner.visit_items(|record| {
-            if dedup.accept(record) {
-                f(record)
-            } else {
-                Ok(())
-            }
-        })
-    }
-}
-
 impl Builder {
     /// Start building a sorter with a default 1 GiB measured byte budget.
     ///
@@ -831,7 +757,7 @@ impl Builder {
         let limit = ByteLimit::new(DEFAULT_BUDGET);
         let core = spillover::sorter::Builder::for_order()
             .byte_limit(limit)
-            .dedup(RecordDedup::None);
+            .dedup(None);
         Builder {
             core,
             codec: NeedsCodec,
@@ -1035,19 +961,19 @@ impl<SK, C, L, CS, S, M> Builder<CoreBuilder<SK, L, CS>, C, S, M> {
     /// Deduplicate adjacent records with identical names.
     #[must_use]
     pub fn dedup_by_name(self) -> Self {
-        self.map_core(|core| core.dedup(RecordDedup::Name))
+        self.map_core(|core| core.dedup(RecordDedup::by_name()))
     }
 
     /// Deduplicate adjacent records with identical sequences.
     #[must_use]
     pub fn dedup_by_sequence(self) -> Self {
-        self.map_core(|core| core.dedup(RecordDedup::Sequence))
+        self.map_core(|core| core.dedup(RecordDedup::by_sequence()))
     }
 
     /// Deduplicate adjacent records with identical sequence and quality.
     #[must_use]
     pub fn dedup_by_sequence_and_quality(self) -> Self {
-        self.map_core(|core| core.dedup(RecordDedup::SequenceAndQuality))
+        self.map_core(|core| core.dedup(RecordDedup::by_sequence_and_quality()))
     }
 }
 
@@ -1326,6 +1252,63 @@ mod tests {
 
     fn make_record(name: &[u8], seq: &[u8], qual: &[u8]) -> SeqRecord {
         SeqRecord::new(name, seq, qual)
+    }
+
+    #[test]
+    fn record_dedup_reuses_representative_capacity_on_update() {
+        let first = make_record(b"long-name", b"ACGTACGT", b"!!!!!!!!");
+        let second = make_record(b"x", b"C", b"#");
+        let mut algorithm = RecordDedup::by_sequence();
+        let representative = algorithm.capture(&first);
+        <RecordDedup as AdjacentDeduplicator<SeqRecord>>::replace(&mut algorithm, representative);
+        let original = algorithm.previous.as_ref().expect("representative");
+        let capacity = original.bytes.capacity();
+        let pointer = original.bytes.as_ptr();
+
+        algorithm.update(&second);
+        let updated = algorithm.previous.as_ref().expect("representative");
+        assert_eq!(updated.bytes.capacity(), capacity);
+        assert_eq!(updated.bytes.as_ptr(), pointer);
+        assert_eq!(updated.name(), b"x");
+        assert_eq!(updated.sequence(), b"C");
+        assert_eq!(updated.quality(), b"#");
+    }
+
+    #[test]
+    fn record_dedup_updates_empty_state_in_every_mode() {
+        let record = make_record(b"name", b"AC", b"!#");
+        for mut algorithm in [
+            RecordDedup::by_name(),
+            RecordDedup::by_sequence(),
+            RecordDedup::by_sequence_and_quality(),
+        ] {
+            algorithm.update(&record);
+            assert!(algorithm.matches(&record));
+            let previous = algorithm.previous.as_ref().expect("representative");
+            assert_eq!(previous.name(), record.name());
+            assert_eq!(previous.sequence(), record.sequence());
+            assert_eq!(previous.quality(), record.quality());
+        }
+    }
+
+    #[test]
+    fn record_representative_updates_long_short_long_and_empty_fields() {
+        let records = [
+            make_record(b"long-name", b"ACGTACGT", b"!!!!!!!!"),
+            make_record(b"", b"C", b"#"),
+            make_record(b"another-long-name", b"TTTTTTTTTT", b"##########"),
+            make_record(b"", b"", b""),
+            make_record(b"last", b"G", b"!"),
+        ];
+        let mut algorithm = RecordDedup::by_sequence();
+        for record in &records {
+            algorithm.update(record);
+            let previous = algorithm.previous.as_ref().expect("representative");
+            assert_eq!(previous.name(), record.name());
+            assert_eq!(previous.sequence(), record.sequence());
+            assert_eq!(previous.quality(), record.quality());
+            assert!(algorithm.matches(record));
+        }
     }
 
     // ── Sort key tests ───────────────────────────────────

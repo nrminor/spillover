@@ -19,7 +19,7 @@ use spillover::codec::{
     KeyedCodecCursor, KeyedCodecWriter, TakeOwned,
 };
 use spillover::compare::{Compare, Natural};
-use spillover::dedup::Dedup;
+use spillover::dedup::Deduplicated;
 use spillover::key::{Owned, SortKey};
 use spillover::merge::{MergeConfig, MergeError, RunMerger};
 use spillover::sorter::{ByteLimit, VisitSortedItems};
@@ -762,19 +762,9 @@ fn keyed_builder_uses_distinct_keyed_record_projection_across_spills() {
     assert_eq!(observed, [11, 12, 22, 31]);
 }
 
-struct ForwardTraversal;
-
 struct ForwardedSource<S>(S);
 
 struct Stop(u8);
-
-impl<S> Dedup<S> for ForwardTraversal {
-    type Deduped = ForwardedSource<S>;
-
-    fn dedup(self, source: S) -> Self::Deduped {
-        ForwardedSource(source)
-    }
-}
 
 impl<S: VisitSortedItems> VisitSortedItems for ForwardedSource<S> {
     type Record = S::Record;
@@ -789,12 +779,11 @@ impl<S: VisitSortedItems> VisitSortedItems for ForwardedSource<S> {
 }
 
 #[test]
-fn downstream_dedup_adapter_forwards_typed_sink_error() {
+fn post_finish_adapter_forwards_typed_sink_error() {
     let sort_key = Owned(|record: &Number| record.0);
     let mut sorter = spillover::sorter::Builder::new()
         .key(sort_key)
         .codec(NumberCodec)
-        .dedup(ForwardTraversal)
         .max_buffer_items(1)
         .build();
 
@@ -803,9 +792,9 @@ fn downstream_dedup_adapter_forwards_typed_sink_error() {
         sorter.push(record).expect("push");
     }
 
-    let output_stream = sorter.finish().expect("finish");
+    let output_stream = sorter.finish().map(ForwardedSource).expect("finish");
     let mut visited = Vec::new();
-    let result = output_stream.items().try_for_each(|record| {
+    let result = output_stream.visit_items(|record| {
         visited.push(record.0);
         if record.0 == 2 {
             return Err(Stop(42));
@@ -818,12 +807,11 @@ fn downstream_dedup_adapter_forwards_typed_sink_error() {
 }
 
 #[test]
-fn downstream_dedup_adapter_forwards_typed_source_error() {
+fn post_finish_adapter_forwards_typed_source_error() {
     let sort_key = Owned(|record: &Number| record.0);
     let mut sorter = spillover::sorter::Builder::new()
         .key(sort_key)
         .codec(RejectTwoCodec)
-        .dedup(ForwardTraversal)
         .max_buffer_items(3)
         .build();
 
@@ -832,14 +820,12 @@ fn downstream_dedup_adapter_forwards_typed_source_error() {
         sorter.push(record).expect("push");
     }
 
-    let output_stream = sorter.finish().expect("finish");
+    let output_stream = sorter.finish().map(ForwardedSource).expect("finish");
     let mut visited = Vec::new();
-    let result = output_stream
-        .items()
-        .try_for_each(|record| -> Result<(), Infallible> {
-            visited.push(record.0);
-            Ok(())
-        });
+    let result = output_stream.visit_items(|record| -> Result<(), Infallible> {
+        visited.push(record.0);
+        Ok(())
+    });
 
     assert_eq!(visited, [1]);
     assert!(matches!(
@@ -2093,6 +2079,100 @@ fn mixed_output_preserves_adjacent_sequence_history_without_global_dedup() {
 
 struct BioEvents(std::vec::IntoIter<Result<SeqRecord, &'static str>>);
 
+#[test]
+fn bio_dedup_modes_share_history_between_owned_and_borrowed_traversal() {
+    let first = make_record(b"a", b"AA", b"!!");
+    let cases = [
+        (
+            RecordDedup::by_name(),
+            vec![
+                first.clone(),
+                make_record(b"a", b"CC", b"##"),
+                make_record(b"b", b"AA", b"!!"),
+            ],
+            vec![make_record(b"b", b"AA", b"!!")],
+        ),
+        (
+            RecordDedup::by_sequence(),
+            vec![
+                first.clone(),
+                make_record(b"b", b"AA", b"##"),
+                make_record(b"c", b"CC", b"!!"),
+            ],
+            vec![make_record(b"c", b"CC", b"!!")],
+        ),
+        (
+            RecordDedup::by_sequence_and_quality(),
+            vec![
+                first.clone(),
+                make_record(b"b", b"AA", b"!!"),
+                make_record(b"c", b"AA", b"##"),
+                make_record(b"d", b"AA", b"##"),
+                make_record(b"e", b"CC", b"##"),
+            ],
+            vec![
+                make_record(b"c", b"AA", b"##"),
+                make_record(b"e", b"CC", b"##"),
+            ],
+        ),
+    ];
+
+    for (algorithm, records, expected) in cases {
+        let events = records.into_iter().map(Ok).collect::<Vec<_>>();
+        let source = BioEvents(events.into_iter());
+        let mut output = Deduplicated::new(source, Some(algorithm));
+        assert_eq!(output.next().expect("first").expect("record"), first);
+        let mut observed = Vec::new();
+        output
+            .visit_items(|record| -> Result<(), Infallible> {
+                observed.push(record.clone());
+                Ok(())
+            })
+            .expect("borrowed traversal");
+        assert_eq!(observed, expected);
+    }
+}
+
+#[test]
+fn bio_builder_default_and_each_dedup_mode_across_spills() {
+    let records = [
+        make_record(b"a", b"A", b"!"),
+        make_record(b"a", b"A", b"!"),
+        make_record(b"b", b"A", b"#"),
+        make_record(b"c", b"C", b"!"),
+    ];
+
+    for mode in 0..4 {
+        let builder = Builder::new().sort_by_name().max_buffer_items(1);
+        let builder = match mode {
+            1 => builder.dedup_by_name(),
+            2 => builder.dedup_by_sequence(),
+            3 => builder.dedup_by_sequence_and_quality(),
+            _ => builder,
+        };
+        let mut sorter = builder.build();
+        for record in &records {
+            sorter.push(record.clone()).expect("push");
+        }
+        let output: Vec<_> = sorter
+            .finish()
+            .expect("finish")
+            .collect::<Result<_, _>>()
+            .expect("decode");
+        let expected = match mode {
+            0 => vec![
+                records[0].clone(),
+                records[1].clone(),
+                records[2].clone(),
+                records[3].clone(),
+            ],
+            1 | 3 => vec![records[0].clone(), records[2].clone(), records[3].clone()],
+            _ => vec![records[0].clone(), records[3].clone()],
+        };
+        assert_eq!(output, expected, "mode {mode}");
+    }
+}
+
 impl Iterator for BioEvents {
     type Item = Result<SeqRecord, &'static str>;
 
@@ -2125,7 +2205,7 @@ fn bio_dedup_source_error_fuses_owned_and_borrowed_delivery() {
         Ok(make_record(b"c", b"C", b"!")),
     ];
     let source = BioEvents(events.into_iter());
-    let mut output = RecordDedup::Sequence.dedup(source);
+    let mut output = Deduplicated::new(source, Some(RecordDedup::by_sequence()));
     assert_eq!(
         output.next().expect("first event").expect("record"),
         make_record(b"a", b"A", b"!")
@@ -2144,6 +2224,20 @@ fn bio_dedup_source_error_fuses_owned_and_borrowed_delivery() {
 }
 
 #[test]
+fn disabled_bio_dedup_forwards_events_after_source_error() {
+    let events = vec![
+        Ok(make_record(b"a", b"A", b"!")),
+        Err("source failed"),
+        Ok(make_record(b"c", b"C", b"!")),
+    ];
+    let source = BioEvents(events.into_iter());
+    let mut output = Deduplicated::new(source, None::<RecordDedup>);
+    assert_eq!(output.next().expect("first").expect("record").name(), b"a");
+    assert!(matches!(output.next(), Some(Err("source failed"))));
+    assert_eq!(output.next().expect("third").expect("record").name(), b"c");
+}
+
+#[test]
 fn bio_dedup_borrowed_delivery_preserves_source_and_sink_errors() {
     let events = vec![
         Ok(make_record(b"a", b"A", b"!")),
@@ -2151,7 +2245,7 @@ fn bio_dedup_borrowed_delivery_preserves_source_and_sink_errors() {
         Ok(make_record(b"c", b"C", b"!")),
     ];
     let source = BioEvents(events.into_iter());
-    let output = RecordDedup::Sequence.dedup(source);
+    let output = Deduplicated::new(source, Some(RecordDedup::by_sequence()));
     let mut visited = Vec::new();
     let result = output.visit_items(|record| -> Result<(), Infallible> {
         visited.push(record.sequence().to_vec());
@@ -2168,7 +2262,7 @@ fn bio_dedup_borrowed_delivery_preserves_source_and_sink_errors() {
         Ok(make_record(b"c", b"C", b"!")),
     ];
     let source = BioEvents(events.into_iter());
-    let output = RecordDedup::Sequence.dedup(source);
+    let output = Deduplicated::new(source, Some(RecordDedup::by_sequence()));
     let mut visited = 0;
     let result = output.visit_items(|_| {
         visited += 1;

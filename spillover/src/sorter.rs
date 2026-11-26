@@ -2,7 +2,7 @@
 //! larger-than-memory datasets.
 //!
 //! [`Sorter`] ties together all the trait axes ([`SortKey`],
-//! [`Compare`], [`Codec`], [`Dedup`], [`ChunkSorter`]) and the
+//! [`Compare`], [`Codec`], [`AdjacentDeduplicator`], [`ChunkSorter`]) and the
 //! merge engine into a single, configurable pipeline. Construct
 //! one via the type-state [`Builder`], push items into it, and
 //! call [`finish`](Sorter::finish) to get a finalized sorted output
@@ -11,7 +11,7 @@
 //! [`SortKey`]: crate::key::SortKey
 //! [`Compare`]: crate::compare::Compare
 //! [`Codec`]: crate::codec::Codec
-//! [`Dedup`]: crate::dedup::Dedup
+//! [`AdjacentDeduplicator`]: crate::dedup::AdjacentDeduplicator
 //! [`ChunkSorter`]: crate::chunk::ChunkSorter
 
 use std::{alloc::Layout, fs::File, io::BufReader};
@@ -23,7 +23,7 @@ use crate::{
     chunk::{ChunkSorter, EstimateSortMemory, Sequential, SortMemorySummary, SummarizeSortInput},
     codec::{Codec, CodecCursor, EncodeKeyedRun, EncodeRun, KeyedCodec},
     compare::{Compare, Natural},
-    dedup::{Dedup, Identity},
+    dedup::{Deduplicated, NoDedup},
     key::{DeriveKey, EstimateKeyMemory, KeyCompare, KeyMemory, KeyedEntryCompare, SortKey},
     merge::{KeyedRunMerge, MergeConfig, MergeError, RunMerge, RunMerger, RunWriter, SortedRun},
 };
@@ -148,12 +148,12 @@ pub struct Unkeyed;
 pub struct Keyed;
 
 /// Type-state builder for [`Sorter`].
-pub struct Builder<SK, Cod, Flush, Cmp = Natural, D = Identity, CS = Sequential> {
+pub struct Builder<SK, Cod, Flush, Cmp = Natural, D = NoDedup, CS = Sequential> {
     sort_key: SK,
     codec: Cod,
     flush: Flush,
     compare: Cmp,
-    dedup: D,
+    dedup: Option<D>,
     chunk_sort: CS,
     config: SorterConfig,
 }
@@ -167,7 +167,7 @@ impl Builder<NeedsSortKey, NeedsCodec, NeedsFlushStrategy> {
             codec: NeedsCodec,
             flush: NeedsFlushStrategy,
             compare: Natural,
-            dedup: Identity,
+            dedup: None,
             chunk_sort: Sequential,
             config: SorterConfig::default(),
         }
@@ -190,7 +190,7 @@ impl Builder<NeedsOrder, NeedsCodec, NeedsLimit, ()> {
             codec: NeedsCodec,
             flush: NeedsLimit,
             compare: (),
-            dedup: Identity,
+            dedup: None,
             chunk_sort: Sequential,
             config: SorterConfig::default(),
         }
@@ -312,15 +312,42 @@ impl<SK, Cod, Flush, Cmp, D, CS> Builder<SK, Cod, Flush, Cmp, D, CS> {
         }
     }
 
-    /// Set the dedup strategy. Defaults to [`Identity`].
+    /// Set the optional adjacent deduplication algorithm.
+    ///
+    /// Pass an algorithm implementing [`AdjacentDeduplicator`] for the output
+    /// record representation. Owned and borrowed traversal check their respective
+    /// implementations when consumed, not when the sorter is built or finished.
+    /// `None` needs an inferred or explicit algorithm type; use
+    /// [`without_dedup`](Self::without_dedup) to disable without retaining that type.
+    ///
+    /// Whole-source transformations are composed after `finish`, rather than
+    /// configured here. They receive [`Sorted`] output, not the underlying merge
+    /// source; a custom borrowed adapter exposes its own [`VisitSortedItems`]
+    /// implementation rather than automatically inheriting [`Sorted::items`].
+    ///
+    /// [`AdjacentDeduplicator`]: crate::dedup::AdjacentDeduplicator
     #[must_use]
-    pub fn dedup<D2>(self, dedup: D2) -> Builder<SK, Cod, Flush, Cmp, D2, CS> {
+    pub fn dedup<D2>(self, dedup: impl Into<Option<D2>>) -> Builder<SK, Cod, Flush, Cmp, D2, CS> {
         Builder {
             sort_key: self.sort_key,
             codec: self.codec,
             flush: self.flush,
             compare: self.compare,
-            dedup,
+            dedup: dedup.into(),
+            chunk_sort: self.chunk_sort,
+            config: self.config,
+        }
+    }
+
+    /// Disable deduplication and remove the algorithm's type requirements.
+    #[must_use]
+    pub fn without_dedup(self) -> Builder<SK, Cod, Flush, Cmp, NoDedup, CS> {
+        Builder {
+            sort_key: self.sort_key,
+            codec: self.codec,
+            flush: self.flush,
+            compare: self.compare,
+            dedup: None,
             chunk_sort: self.chunk_sort,
             config: self.config,
         }
@@ -888,7 +915,7 @@ type KeyedRecord<C> = <<C as KeyedCodec>::KeyedCursor<BufReader<File>> as CodecC
 ///
 /// Push items via [`push`](Self::push), then call
 /// [`finish`](Self::finish) to spill residual items, perform required intermediate
-/// merges, and return lazy sorted output with the selected dedup transform.
+/// merges, and return lazy sorted output with optional adjacent deduplication.
 ///
 /// Buffered inputs and decoded records may have different representations.
 /// The key extractor or complete order must support both representations.
@@ -902,7 +929,7 @@ type KeyedRecord<C> = <<C as KeyedCodec>::KeyedCursor<BufReader<File>> as CodecC
 ///   [`EncodeKeyedRun`] supply writing
 /// - `Cmp`: [`Compare`] on the key-extractor path, supporting extracted
 ///   keys and, for keyed merging, stored keys; unused for complete orders
-/// - `D`: [`Dedup`] — post-merge deduplication
+/// - `D`: adjacent post-merge deduplication
 /// - `CS`: [`ChunkSorter`] — in-memory sort algorithm and
 ///   threading model
 /// - `M`: merge strategy marker ([`Unkeyed`] or [`Keyed`])
@@ -911,7 +938,7 @@ where
     L: binding::Binding<T, SK, Cod, Cmp, CS, M>,
 {
     session: <L as binding::Binding<T, SK, Cod, Cmp, CS, M>>::Session,
-    dedup: D,
+    dedup: Option<D>,
     flush: FlushStrategy,
     _marker: std::marker::PhantomData<M>,
 }
@@ -1488,12 +1515,9 @@ where
     ///
     /// # Errors
     /// Returns an error if spilling or initializing the merge fails.
-    pub fn finish(self) -> Result<UnkeyedOutput<C, O, D>, MergeError<C::Error>>
-    where
-        D: Dedup<RunMerge<C, O>>,
-    {
+    pub fn finish(self) -> Result<UnkeyedOutput<C, O, D>, MergeError<C::Error>> {
         let merged = self.session.finish()?;
-        Ok(Sorted::new(self.dedup.dedup(merged)))
+        Ok(Sorted::new(Deduplicated::new(merged, self.dedup)))
     }
 }
 
@@ -1825,12 +1849,9 @@ where
     ///
     /// # Errors
     /// Returns an error if spilling or initializing the merge fails.
-    pub fn finish(self) -> Result<UnkeyedOutput<C, O, D>, MergeError<C::Error>>
-    where
-        D: Dedup<RunMerge<C, O>>,
-    {
+    pub fn finish(self) -> Result<UnkeyedOutput<C, O, D>, MergeError<C::Error>> {
         let merged = self.session.finish()?;
-        Ok(Sorted::new(self.dedup.dedup(merged)))
+        Ok(Sorted::new(Deduplicated::new(merged, self.dedup)))
     }
 }
 
@@ -1908,12 +1929,9 @@ where
     ///
     /// # Errors
     /// Returns an error if spilling or initializing the merge fails.
-    pub fn finish(self) -> Result<UnkeyedOutput<C, O, D>, MergeError<C::Error>>
-    where
-        D: Dedup<RunMerge<C, O>>,
-    {
+    pub fn finish(self) -> Result<UnkeyedOutput<C, O, D>, MergeError<C::Error>> {
         let merged = self.session.finish()?;
-        Ok(Sorted::new(self.dedup.dedup(merged)))
+        Ok(Sorted::new(Deduplicated::new(merged, self.dedup)))
     }
 }
 
@@ -1949,12 +1967,9 @@ where
     ///
     /// # Errors
     /// Returns a spill or merge error.
-    pub fn finish(self) -> Result<OrderedOutput<C, O, D>, MergeError<C::Error>>
-    where
-        D: Dedup<KeyedRunMerge<C, O, (), Keyed>>,
-    {
+    pub fn finish(self) -> Result<OrderedOutput<C, O, D>, MergeError<C::Error>> {
         let merged = self.session.finish()?;
-        Ok(Sorted::new(self.dedup.dedup(merged)))
+        Ok(Sorted::new(Deduplicated::new(merged, self.dedup)))
     }
 }
 
@@ -1986,12 +2001,9 @@ where
     }
 
     #[doc(hidden)]
-    pub fn finish(self) -> Result<OrderedOutput<C, O, D>, MergeError<C::Error>>
-    where
-        D: Dedup<KeyedRunMerge<C, O, (), Keyed>>,
-    {
+    pub fn finish(self) -> Result<OrderedOutput<C, O, D>, MergeError<C::Error>> {
         let merged = self.session.finish()?;
-        Ok(Sorted::new(self.dedup.dedup(merged)))
+        Ok(Sorted::new(Deduplicated::new(merged, self.dedup)))
     }
 }
 
@@ -2411,7 +2423,7 @@ where
     }
 
     /// Spill remaining items, perform required intermediate merges,
-    /// and return lazy sorted output with the selected dedup transform.
+    /// and return lazy sorted output with optional adjacent deduplication.
     ///
     /// # Errors
     ///
@@ -2421,17 +2433,12 @@ where
     #[allow(clippy::type_complexity)]
     pub fn finish(
         self,
-    ) -> Result<
-        Sorted<<D as Dedup<RunMerge<Cod, KeyCompare<SK, Cmp>>>>::Deduped>,
-        MergeError<Cod::Error>,
-    >
-    where
-        D: Dedup<RunMerge<Cod, KeyCompare<SK, Cmp>>>,
+    ) -> Result<Sorted<Deduplicated<RunMerge<Cod, KeyCompare<SK, Cmp>>, D>>, MergeError<Cod::Error>>
     {
         let dedup = self.dedup;
         let merged = self.session.finish()?;
 
-        Ok(Sorted::new(dedup.dedup(merged)))
+        Ok(Sorted::new(Deduplicated::new(merged, dedup)))
     }
 }
 
@@ -2462,7 +2469,7 @@ where
     }
 
     /// Spill remaining items, perform required intermediate merges,
-    /// and return lazy sorted output with the selected dedup transform.
+    /// and return lazy sorted output with optional adjacent deduplication.
     ///
     /// # Errors
     ///
@@ -2473,16 +2480,13 @@ where
     pub fn finish(
         self,
     ) -> Result<
-        Sorted<<D as Dedup<KeyedRunMerge<Cod, Cmp, KeyCompare<SK, Cmp>>>>::Deduped>,
+        Sorted<Deduplicated<KeyedRunMerge<Cod, Cmp, KeyCompare<SK, Cmp>>, D>>,
         MergeError<Cod::Error>,
-    >
-    where
-        D: Dedup<KeyedRunMerge<Cod, Cmp, KeyCompare<SK, Cmp>>>,
-    {
+    > {
         let dedup = self.dedup;
         let merged = self.session.finish()?;
 
-        Ok(Sorted::new(dedup.dedup(merged)))
+        Ok(Sorted::new(Deduplicated::new(merged, dedup)))
     }
 }
 
@@ -2676,8 +2680,8 @@ where
     }
 }
 
-type UnkeyedOutput<C, O, D> = Sorted<<D as Dedup<RunMerge<C, O>>>::Deduped>;
-type OrderedOutput<C, O, D> = Sorted<<D as Dedup<KeyedRunMerge<C, O, (), Keyed>>>::Deduped>;
+type UnkeyedOutput<C, O, D> = Sorted<Deduplicated<RunMerge<C, O>, D>>;
+type OrderedOutput<C, O, D> = Sorted<Deduplicated<KeyedRunMerge<C, O, (), Keyed>, D>>;
 
 impl<T, O, C, D, CS> Sorter<T, O, C, (), D, CS, Unkeyed, ItemLimit>
 where
@@ -2697,13 +2701,10 @@ where
     ///
     /// # Errors
     /// Returns an error if spilling or merging fails.
-    pub fn finish(self) -> Result<UnkeyedOutput<C, O, D>, MergeError<C::Error>>
-    where
-        D: Dedup<RunMerge<C, O>>,
-    {
+    pub fn finish(self) -> Result<UnkeyedOutput<C, O, D>, MergeError<C::Error>> {
         let dedup = self.dedup;
         let merged = self.session.finish()?;
-        Ok(Sorted::new(dedup.dedup(merged)))
+        Ok(Sorted::new(Deduplicated::new(merged, dedup)))
     }
 }
 
@@ -2767,12 +2768,9 @@ where
     ///
     /// # Errors
     /// Returns an error if spilling or merging fails.
-    pub fn finish(self) -> Result<UnkeyedOutput<C, O, D>, MergeError<C::Error>>
-    where
-        D: Dedup<RunMerge<C, O>>,
-    {
+    pub fn finish(self) -> Result<UnkeyedOutput<C, O, D>, MergeError<C::Error>> {
         let merged = self.session.finish()?;
-        Ok(Sorted::new(self.dedup.dedup(merged)))
+        Ok(Sorted::new(Deduplicated::new(merged, self.dedup)))
     }
 }
 
@@ -2798,13 +2796,10 @@ where
     ///
     /// # Errors
     /// Returns an error if spilling or merging fails.
-    pub fn finish(self) -> Result<OrderedOutput<C, O, D>, MergeError<C::Error>>
-    where
-        D: Dedup<KeyedRunMerge<C, O, (), Keyed>>,
-    {
+    pub fn finish(self) -> Result<OrderedOutput<C, O, D>, MergeError<C::Error>> {
         let dedup = self.dedup;
         let merged = self.session.finish()?;
-        Ok(Sorted::new(dedup.dedup(merged)))
+        Ok(Sorted::new(Deduplicated::new(merged, dedup)))
     }
 }
 
@@ -2834,13 +2829,10 @@ where
     ///
     /// # Errors
     /// Returns an error if spilling or merging fails.
-    pub fn finish(self) -> Result<OrderedOutput<C, O, D>, MergeError<C::Error>>
-    where
-        D: Dedup<KeyedRunMerge<C, O, (), Keyed>>,
-    {
+    pub fn finish(self) -> Result<OrderedOutput<C, O, D>, MergeError<C::Error>> {
         let dedup = self.dedup;
         let merged = self.session.finish()?;
-        Ok(Sorted::new(dedup.dedup(merged)))
+        Ok(Sorted::new(Deduplicated::new(merged, dedup)))
     }
 }
 
@@ -2871,12 +2863,9 @@ where
     ///
     /// # Errors
     /// Returns an error if spilling or initializing the merge fails.
-    pub fn finish(self) -> Result<OrderedOutput<C, O, D>, MergeError<C::Error>>
-    where
-        D: Dedup<KeyedRunMerge<C, O, (), Keyed>>,
-    {
+    pub fn finish(self) -> Result<OrderedOutput<C, O, D>, MergeError<C::Error>> {
         let merged = self.session.finish()?;
-        Ok(Sorted::new(self.dedup.dedup(merged)))
+        Ok(Sorted::new(Deduplicated::new(merged, self.dedup)))
     }
 }
 
@@ -2897,6 +2886,23 @@ mod tests {
 
     #[derive(Clone, Copy)]
     struct U64Codec;
+
+    struct DoubleVisits<S>(S);
+
+    impl<S: VisitSortedItems> VisitSortedItems for DoubleVisits<S> {
+        type Record = S::Record;
+        type Error = S::Error;
+
+        fn visit_items<F, E>(self, mut sink: F) -> Result<(), SortedItemsError<S::Error, E>>
+        where
+            F: FnMut(&S::Record) -> Result<(), E>,
+        {
+            self.0.visit_items(|record| {
+                sink(record)?;
+                sink(record)
+            })
+        }
+    }
 
     #[derive(Clone, Copy)]
     struct U64KeyedCodec;
@@ -3100,11 +3106,11 @@ mod tests {
         }
     }
 
-    type U64Sorter = Sorter<u64, Owned<fn(&u64) -> u64>, U64Codec, Natural, Identity, Sequential>;
+    type U64Sorter = Sorter<u64, Owned<fn(&u64) -> u64>, U64Codec, Natural, NoDedup, Sequential>;
 
     #[allow(clippy::type_complexity)]
     type U64KeyedSorter =
-        Sorter<u64, Owned<fn(&u64) -> u64>, U64KeyedCodec, Natural, Identity, Sequential, Keyed>;
+        Sorter<u64, Owned<fn(&u64) -> u64>, U64KeyedCodec, Natural, NoDedup, Sequential, Keyed>;
 
     fn u64_sorter(max_items: usize) -> U64Sorter {
         Builder::new()
@@ -3614,6 +3620,55 @@ mod tests {
             .map(|r: Result<u64, _>| r.expect("read"))
             .collect();
         assert_eq!(results, vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn disabling_dedup_removes_algorithm_requirements_for_both_traversals() {
+        struct NotAnAlgorithm;
+
+        let mut sorter = Builder::new()
+            .order(Natural)
+            .codec(U64Codec)
+            .dedup(NotAnAlgorithm)
+            .without_dedup()
+            .max_buffer_items(1)
+            .build();
+        for value in [1, 1, 2] {
+            sorter.push(value).expect("push");
+        }
+
+        let mut output = sorter.finish().expect("finish");
+        assert_eq!(output.next().transpose().expect("decode"), Some(1));
+
+        let mut remaining = Vec::new();
+        output
+            .visit_items(|record| {
+                remaining.push(*record);
+                Ok::<_, std::convert::Infallible>(())
+            })
+            .expect("visit");
+        assert_eq!(remaining, [1, 2]);
+    }
+
+    #[test]
+    fn compose_custom_borrowed_transform_after_finish() {
+        let mut sorter = Builder::new()
+            .order(Natural)
+            .codec(U64Codec)
+            .max_buffer_items(2)
+            .build();
+        for value in [2, 1] {
+            sorter.push(value).expect("push");
+        }
+        let output = sorter.finish().map(DoubleVisits).expect("finish");
+        let mut visited = Vec::new();
+        output
+            .visit_items(|record| {
+                visited.push(*record);
+                Ok::<_, std::convert::Infallible>(())
+            })
+            .expect("visit");
+        assert_eq!(visited, [1, 1, 2, 2]);
     }
 
     #[test]

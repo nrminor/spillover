@@ -36,6 +36,8 @@
 !/spillover/src/dedup.rs
 !/spillover/src/merge.rs
 !/spillover/src/sorter.rs
+!/spillover/tests
+!/spillover/tests/dedup_controls.rs
 !/spillover/examples
 !/spillover/examples/README.md
 !/spillover/examples/01_basic_u64_sort.rs

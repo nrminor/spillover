@@ -15,7 +15,7 @@ The core crate is intentionally unopinionated: it knows how to spill sorted runs
 1. sort key extraction (`SortKey`) or complete record ordering
 2. comparison (`Compare`)
 3. run reading (`DecodeRun` or `Codec` / `KeyedCodec`) and writing (`EncodeRun` / `EncodeKeyedRun`)
-4. post-merge deduplication (`Dedup`)
+4. post-merge adjacent deduplication (`AdjacentDeduplicator`)
 5. in-memory chunk sorting strategy (`ChunkSorter`)
 6. flush strategy (byte-based or item-count based budgets)
 
@@ -114,7 +114,7 @@ Put another way, in `spillover`, sorting is an engine with interchangeable parts
 
 - Define ordering with a `SortKey`/`Compare` pair or a complete record order; keyed complete orders also implement `KeyedOrder` for stored-key comparison. `ChunkSorter` selects the in-memory sorting algorithm.
 - Define temporary-run reading with `DecodeRun` for ordinary owned-record iterators, or `Codec` / `KeyedCodec` for lower-level control; define writing with `EncodeRun` / `EncodeKeyedRun`.
-- Define what "duplicate" means in your domain with `Dedup`. Custom deduplication logic can be introduced with this interface.
+- Define adjacent duplicate matching with `AdjacentDeduplicator`.
 - Control spilling with byte budgets (`measured_budget`) or item limits (`max_buffer_items`); these are not hard limits on total process memory.
 
 Three practical mental models help when designing a pipeline:
