@@ -19,7 +19,7 @@ use spillover::codec::{
     KeyedCodecCursor, KeyedCodecWriter, TakeOwned,
 };
 use spillover::compare::{Compare, Natural};
-use spillover::dedup::Deduplicated;
+use spillover::dedup::{Deduplicated, NoDedup};
 use spillover::key::{Owned, SortKey};
 use spillover::merge::{MergeConfig, MergeError, RunMerger};
 use spillover::sorter::{ByteLimit, VisitSortedItems};
@@ -2134,7 +2134,32 @@ fn bio_dedup_modes_share_history_between_owned_and_borrowed_traversal() {
 }
 
 #[test]
-fn bio_builder_default_and_each_dedup_mode_across_spills() {
+fn bio_default_output_uses_no_dedup_and_preserves_duplicates_across_traversals() {
+    let mut sorter = Builder::new().sort_by_name().max_buffer_items(1).build();
+    let records = [
+        make_record(b"a", b"A", b"!"),
+        make_record(b"a", b"A", b"!"),
+        make_record(b"b", b"A", b"#"),
+        make_record(b"c", b"C", b"!"),
+    ];
+    for record in &records {
+        sorter.push(record.clone()).expect("push");
+    }
+
+    let mut output: spillover::Sorted<Deduplicated<_, NoDedup>> = sorter.finish().expect("finish");
+    let first = output.next().expect("first record").expect("decode");
+    assert_eq!(first, records[0]);
+
+    let mut sink = VecSink::default();
+    output
+        .items()
+        .try_for_each(|record| sink.write_record(record))
+        .expect("borrowed traversal");
+    assert_eq!(sink.records, records[1..]);
+}
+
+#[test]
+fn bio_builder_each_dedup_mode_across_spills() {
     let records = [
         make_record(b"a", b"A", b"!"),
         make_record(b"a", b"A", b"!"),
@@ -2142,13 +2167,12 @@ fn bio_builder_default_and_each_dedup_mode_across_spills() {
         make_record(b"c", b"C", b"!"),
     ];
 
-    for mode in 0..4 {
+    for mode in 0..3 {
         let builder = Builder::new().sort_by_name().max_buffer_items(1);
         let builder = match mode {
-            1 => builder.dedup_by_name(),
-            2 => builder.dedup_by_sequence(),
-            3 => builder.dedup_by_sequence_and_quality(),
-            _ => builder,
+            0 => builder.dedup_by_name(),
+            1 => builder.dedup_by_sequence(),
+            _ => builder.dedup_by_sequence_and_quality(),
         };
         let mut sorter = builder.build();
         for record in &records {
@@ -2160,17 +2184,122 @@ fn bio_builder_default_and_each_dedup_mode_across_spills() {
             .collect::<Result<_, _>>()
             .expect("decode");
         let expected = match mode {
-            0 => vec![
-                records[0].clone(),
-                records[1].clone(),
-                records[2].clone(),
-                records[3].clone(),
-            ],
-            1 | 3 => vec![records[0].clone(), records[2].clone(), records[3].clone()],
-            _ => vec![records[0].clone(), records[3].clone()],
+            1 => vec![records[0].clone(), records[3].clone()],
+            _ => vec![records[0].clone(), records[2].clone(), records[3].clone()],
         };
         assert_eq!(output, expected, "mode {mode}");
     }
+}
+
+macro_rules! check_bio_dedup_output {
+    ($builder:expr, $record:ident => $input:expr) => {{
+        let mut sorter = $builder.build();
+        let records = [
+            make_record(b"a", b"A", b"!"),
+            make_record(b"a", b"A", b"!"),
+            make_record(b"a", b"A", b"#"),
+            make_record(b"c", b"C", b"!"),
+        ];
+        for $record in &records {
+            let input = $input;
+            sorter.push(input).expect("push");
+        }
+
+        let mut output: spillover::Sorted<Deduplicated<_, RecordDedup>> =
+            sorter.finish().expect("finish");
+        let first = output.next().expect("first record").expect("decode");
+        assert_eq!(first, records[0]);
+        let mut sink = VecSink::default();
+        output
+            .items()
+            .try_for_each(|record| sink.write_record(record))
+            .expect("borrowed traversal");
+        assert_eq!(sink.records, records[2..]);
+    }};
+}
+
+#[test]
+fn dedup_survives_owned_configuration_in_all_build_modes() {
+    check_bio_dedup_output!(
+        Builder::new()
+            .dedup_by_sequence_and_quality()
+            .sort_by_illumina()
+            .max_buffer_items(1),
+        record => record.clone()
+    );
+    check_bio_dedup_output!(
+        Builder::new()
+            .dedup_by_sequence_and_quality()
+            .sort_by_illumina()
+            .measured_budget(1)
+            .sort_with_sequential(),
+        record => record.clone()
+    );
+    check_bio_dedup_output!(
+        Builder::new()
+            .dedup_by_sequence_and_quality()
+            .sort_by_sequence_exact()
+            .max_buffer_items(1),
+        record => record.clone()
+    );
+    check_bio_dedup_output!(
+        Builder::new()
+            .dedup_by_sequence_and_quality()
+            .sort_by_sequence_exact()
+            .measured_budget(1),
+        record => record.clone()
+    );
+}
+
+#[test]
+fn dedup_survives_arena_configuration_in_all_build_modes() {
+    let mut arena = SeqRecordArena::new();
+    check_bio_dedup_output!(
+        Builder::new()
+            .dedup_by_sequence_and_quality()
+            .arena(&mut arena)
+            .sort_by_illumina()
+            .max_buffer_items(1),
+        record => &record.as_view()
+    );
+    check_bio_dedup_output!(
+        Builder::new()
+            .arena(&mut arena)
+            .dedup_by_sequence_and_quality()
+            .sort_by_illumina()
+            .measured_budget(1)
+            .sort_with_sequential(),
+        record => &record.as_view()
+    );
+    check_bio_dedup_output!(
+        Builder::new()
+            .dedup_by_sequence_and_quality()
+            .sort_by_sequence_exact()
+            .arena(&mut arena)
+            .max_buffer_items(1),
+        record => &record.as_view()
+    );
+    check_bio_dedup_output!(
+        Builder::new()
+            .sort_by_sequence_exact()
+            .dedup_by_sequence_and_quality()
+            .arena(&mut arena)
+            .measured_budget(1),
+        record => &record.as_view()
+    );
+}
+
+#[test]
+fn repeated_dedup_selection_uses_the_last_mode() {
+    check_bio_dedup_output!(
+        Builder::new()
+            .dedup_by_sequence()
+            .sort_by_illumina()
+            .dedup_by_name()
+            .max_buffer_items(1)
+            .dedup_by_sequence_and_quality(),
+        record => record.clone()
+    );
 }
 
 impl Iterator for BioEvents {

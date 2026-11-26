@@ -20,7 +20,7 @@ use spillover::{
     chunk::{ChunkSorter, Sequential},
     codec::{Codec, CodecCursor, KeyedCodec},
     compare::Compare,
-    dedup::AdjacentDeduplicator,
+    dedup::{AdjacentDeduplicator, NoDedup},
     key::{DeriveKey, KeyedOrder, SortKey},
     merge::MergeConfig,
     sorter::{
@@ -667,6 +667,12 @@ where
 /// and long-read convenience methods select radix chunk sorting for
 /// their compatible accelerated sequence orders.
 ///
+/// Deduplication is disabled by default. Selecting a `dedup_by_*` method
+/// changes the builder's concrete type to carry [`RecordDedup`]; selecting
+/// another dedup mode replaces the previous choice. Conditional configuration
+/// must therefore branch before building rather than reassign an enabled
+/// builder into a variable holding the default type.
+///
 /// Override any default with the corresponding builder method:
 ///
 /// ```ignore
@@ -702,18 +708,19 @@ pub struct Builder<Core = InitialCore, C = NeedsCodec, S = OwnedStorage, M = ()>
     mode: PhantomData<fn() -> M>,
 }
 
-type CoreBuilder<SK, L, CS> =
-    spillover::sorter::Builder<SK, spillover::sorter::NeedsCodec, L, (), RecordDedup, CS>;
-type OrderedCore<O, L, CS> = CoreBuilder<HasOrder<O>, L, CS>;
-type InitialCore = CoreBuilder<CoreNeedsOrder, ByteLimit, Sequential>;
+type CoreBuilder<SK, L, CS, D> =
+    spillover::sorter::Builder<SK, spillover::sorter::NeedsCodec, L, (), D, CS>;
+type OrderedCore<O, L, CS, D> = CoreBuilder<HasOrder<O>, L, CS, D>;
+type InitialCore = CoreBuilder<CoreNeedsOrder, ByteLimit, Sequential, NoDedup>;
 
-/// Finalized stream of sorted sequence records.
+/// Finalized stream of sorted sequence records with explicit deduplication.
 ///
 /// `SortedRecordStream` owns the sorted output source after a sorter has
 /// been finished. It implements [`Iterator`] for owned materialization, so
 /// ordinary `.collect()` callsites continue to work.
 /// Core wraps this adapter in [`spillover::Sorted`]. Its borrowed traversal uses
 /// the same deduplication history as owned iteration.
+/// Default builder output instead uses [`NoDedup`] and preserves all records.
 pub type SortedRecordStream<I> = spillover::dedup::Deduplicated<I, RecordDedup>;
 
 /// Destination for sequence records produced by a sorted stream.
@@ -755,9 +762,7 @@ impl Builder {
     #[must_use]
     pub fn new() -> Self {
         let limit = ByteLimit::new(DEFAULT_BUDGET);
-        let core = spillover::sorter::Builder::for_order()
-            .byte_limit(limit)
-            .dedup(None);
+        let core = spillover::sorter::Builder::for_order().byte_limit(limit);
         Builder {
             core,
             codec: NeedsCodec,
@@ -788,13 +793,13 @@ impl<Core, C, M> Builder<Core, C, OwnedStorage, M> {
     }
 }
 
-impl<C, L, CS, S> Builder<CoreBuilder<CoreNeedsOrder, L, CS>, C, S> {
+impl<C, L, CS, D, S> Builder<CoreBuilder<CoreNeedsOrder, L, CS, D>, C, S> {
     /// Set a keyed sort order (merge compares record keys).
     #[must_use]
     pub fn sort_by<O: OrderCodecPolicy + KeyedOrder>(
         self,
         order: O,
-    ) -> Builder<OrderedCore<O, L, CS>, C, S, CoreKeyed> {
+    ) -> Builder<OrderedCore<O, L, CS, D>, C, S, CoreKeyed> {
         self.map_core(|core| core.select_order(order))
     }
 
@@ -803,7 +808,7 @@ impl<C, L, CS, S> Builder<CoreBuilder<CoreNeedsOrder, L, CS>, C, S> {
     pub fn sort_by_unkeyed<O: OrderCodecPolicy>(
         self,
         order: O,
-    ) -> Builder<OrderedCore<O, L, CS>, C, S, CoreUnkeyed> {
+    ) -> Builder<OrderedCore<O, L, CS, D>, C, S, CoreUnkeyed> {
         self.map_core(|core| core.select_order(order))
     }
 
@@ -812,7 +817,7 @@ impl<C, L, CS, S> Builder<CoreBuilder<CoreNeedsOrder, L, CS>, C, S> {
     #[must_use]
     pub fn sort_by_illumina(
         self,
-    ) -> Builder<OrderedCore<SequenceOrder<38>, L, RadixThenRefine<38>>, C, S, CoreKeyed> {
+    ) -> Builder<OrderedCore<SequenceOrder<38>, L, RadixThenRefine<38>, D>, C, S, CoreKeyed> {
         self.sort_by(ILLUMINA_ORDER)
             .chunk_sort(RadixThenRefine::<38>)
     }
@@ -835,7 +840,7 @@ impl<C, L, CS, S> Builder<CoreBuilder<CoreNeedsOrder, L, CS>, C, S> {
     #[must_use]
     pub fn sort_by_sequence_exact(
         self,
-    ) -> Builder<OrderedCore<UnkeyedSequenceOrder, L, Sequential>, C, S, CoreUnkeyed> {
+    ) -> Builder<OrderedCore<UnkeyedSequenceOrder, L, Sequential, D>, C, S, CoreUnkeyed> {
         self.sort_by_unkeyed(UnkeyedSequenceOrder)
             .sort_with_sequential()
     }
@@ -845,7 +850,7 @@ impl<C, L, CS, S> Builder<CoreBuilder<CoreNeedsOrder, L, CS>, C, S> {
     #[must_use]
     pub fn sort_by_paired_end(
         self,
-    ) -> Builder<OrderedCore<SequenceOrder<64>, L, RadixThenRefine<64>>, C, S, CoreKeyed> {
+    ) -> Builder<OrderedCore<SequenceOrder<64>, L, RadixThenRefine<64>, D>, C, S, CoreKeyed> {
         self.sort_by(PAIRED_END_ORDER)
             .chunk_sort(RadixThenRefine::<64>)
     }
@@ -855,20 +860,20 @@ impl<C, L, CS, S> Builder<CoreBuilder<CoreNeedsOrder, L, CS>, C, S> {
     #[must_use]
     pub fn sort_by_long_read(
         self,
-    ) -> Builder<OrderedCore<SequenceOrder<128>, L, RadixThenRefine<128>>, C, S, CoreKeyed> {
+    ) -> Builder<OrderedCore<SequenceOrder<128>, L, RadixThenRefine<128>, D>, C, S, CoreKeyed> {
         self.sort_by(LONG_READ_ORDER)
             .chunk_sort(RadixThenRefine::<128>)
     }
 
     /// Sort by record name.
     #[must_use]
-    pub fn sort_by_name(self) -> Builder<OrderedCore<NameOrder, L, CS>, C, S, CoreKeyed> {
+    pub fn sort_by_name(self) -> Builder<OrderedCore<NameOrder, L, CS, D>, C, S, CoreKeyed> {
         self.sort_by(NAME_ORDER)
     }
 
     /// Sort by sequence length.
     #[must_use]
-    pub fn sort_by_length(self) -> Builder<OrderedCore<LengthOrder, L, CS>, C, S, CoreKeyed> {
+    pub fn sort_by_length(self) -> Builder<OrderedCore<LengthOrder, L, CS, D>, C, S, CoreKeyed> {
         self.sort_by(LENGTH_ORDER)
     }
 }
@@ -893,7 +898,7 @@ impl<Core, St, M> Builder<Core, NeedsCodec, St, M> {
 
 // Flush strategy selection.
 
-impl<SK, C, L, CS, S, M> Builder<CoreBuilder<SK, L, CS>, C, S, M> {
+impl<SK, C, L, CS, D, S, M> Builder<CoreBuilder<SK, L, CS, D>, C, S, M> {
     /// Set a byte budget for modeled active-window and initial-spill memory.
     ///
     /// Replaces any previous item or byte limit. The final configuration must
@@ -923,7 +928,7 @@ impl<SK, C, L, CS, S, M> Builder<CoreBuilder<SK, L, CS>, C, S, M> {
     pub fn measured_budget(
         self,
         budget: usize,
-    ) -> Builder<CoreBuilder<SK, ByteLimit, CS>, C, S, M> {
+    ) -> Builder<CoreBuilder<SK, ByteLimit, CS, D>, C, S, M> {
         let limit = ByteLimit::new(budget);
         self.map_core(|core| core.byte_limit(limit))
     }
@@ -936,7 +941,7 @@ impl<SK, C, L, CS, S, M> Builder<CoreBuilder<SK, L, CS>, C, S, M> {
     pub fn max_buffer_items(
         self,
         max_items: usize,
-    ) -> Builder<CoreBuilder<SK, ItemLimit, CS>, C, S, M> {
+    ) -> Builder<CoreBuilder<SK, ItemLimit, CS, D>, C, S, M> {
         let limit = ItemLimit::new(max_items);
         self.map_core(|core| core.item_limit(limit))
     }
@@ -957,29 +962,31 @@ impl<Core, C, S, M> Builder<Core, C, S, M> {
     }
 }
 
-impl<SK, C, L, CS, S, M> Builder<CoreBuilder<SK, L, CS>, C, S, M> {
+impl<SK, C, L, CS, D, S, M> Builder<CoreBuilder<SK, L, CS, D>, C, S, M> {
     /// Deduplicate adjacent records with identical names.
     #[must_use]
-    pub fn dedup_by_name(self) -> Self {
+    pub fn dedup_by_name(self) -> Builder<CoreBuilder<SK, L, CS, RecordDedup>, C, S, M> {
         self.map_core(|core| core.dedup(RecordDedup::by_name()))
     }
 
     /// Deduplicate adjacent records with identical sequences.
     #[must_use]
-    pub fn dedup_by_sequence(self) -> Self {
+    pub fn dedup_by_sequence(self) -> Builder<CoreBuilder<SK, L, CS, RecordDedup>, C, S, M> {
         self.map_core(|core| core.dedup(RecordDedup::by_sequence()))
     }
 
     /// Deduplicate adjacent records with identical sequence and quality.
     #[must_use]
-    pub fn dedup_by_sequence_and_quality(self) -> Self {
+    pub fn dedup_by_sequence_and_quality(
+        self,
+    ) -> Builder<CoreBuilder<SK, L, CS, RecordDedup>, C, S, M> {
         self.map_core(|core| core.dedup(RecordDedup::by_sequence_and_quality()))
     }
 }
 
 // Optional core configuration.
 
-impl<SK, C, L, CS, S, M> Builder<CoreBuilder<SK, L, CS>, C, S, M> {
+impl<SK, C, L, CS, D, S, M> Builder<CoreBuilder<SK, L, CS, D>, C, S, M> {
     /// Set a custom chunk sorting strategy. Defaults to
     /// [`Sequential`].
     ///
@@ -989,7 +996,7 @@ impl<SK, C, L, CS, S, M> Builder<CoreBuilder<SK, L, CS>, C, S, M> {
     /// sorters such as [`RadixThenRefine`] are accepted only for the matching
     /// accelerated sequence order.
     #[must_use]
-    pub fn chunk_sort<CS2>(self, chunk_sort: CS2) -> Builder<CoreBuilder<SK, L, CS2>, C, S, M> {
+    pub fn chunk_sort<CS2>(self, chunk_sort: CS2) -> Builder<CoreBuilder<SK, L, CS2, D>, C, S, M> {
         self.map_core(|core| core.chunk_sort(chunk_sort))
     }
 
@@ -1008,7 +1015,7 @@ impl<SK, C, L, CS, S, M> Builder<CoreBuilder<SK, L, CS>, C, S, M> {
     /// sequential comparison sorter unless [`Self::chunk_sort`] is
     /// called explicitly.
     #[must_use]
-    pub fn sort_with_sequential(self) -> Builder<CoreBuilder<SK, L, Sequential>, C, S, M> {
+    pub fn sort_with_sequential(self) -> Builder<CoreBuilder<SK, L, Sequential, D>, C, S, M> {
         self.chunk_sort(Sequential)
     }
 
@@ -1020,7 +1027,7 @@ impl<SK, C, L, CS, S, M> Builder<CoreBuilder<SK, L, CS>, C, S, M> {
     #[must_use]
     pub fn sort_with_parallel(
         self,
-    ) -> Builder<CoreBuilder<SK, L, spillover::chunk::Parallel>, C, S, M> {
+    ) -> Builder<CoreBuilder<SK, L, spillover::chunk::Parallel, D>, C, S, M> {
         self.chunk_sort(spillover::chunk::Parallel)
     }
 }
@@ -1034,12 +1041,12 @@ type NativeKeyedCodec<O, C> = KeyedDryIceCodec<
     <C as sealed::ResolveCodec<<O as OrderCodecPolicy>::Policy>>::N,
 >;
 type NativeRecord<C> = <<C as KeyedCodec>::KeyedCursor<BufReader<File>> as CodecCursor>::Record;
-type NativeSorter<O, C, CS, L> =
-    spillover::sorter::Sorter<SeqRecord, O, C, (), RecordDedup, CS, spillover::sorter::Keyed, L>;
+type NativeSorter<O, C, CS, L, D> =
+    spillover::sorter::Sorter<SeqRecord, O, C, (), D, CS, spillover::sorter::Keyed, L>;
 
 macro_rules! owned_keyed_builder {
     ($limit:ty; $($extra:tt)*) => {
-        impl<O, C, CS> Builder<OrderedCore<O, $limit, CS>, C, OwnedStorage, CoreKeyed>
+        impl<O, C, CS, D> Builder<OrderedCore<O, $limit, CS, D>, C, OwnedStorage, CoreKeyed>
         where
             O: OrderCodecPolicy + DeriveKey<SeqRecord>
                 + Compare<SeqRecord> + Compare<NativeRecord<NativeKeyedCodec<O, C>>>,
@@ -1050,7 +1057,7 @@ macro_rules! owned_keyed_builder {
         {
             /// Build the configured owned keyed sorter.
             #[must_use]
-            pub fn build(self) -> NativeSorter<O, NativeKeyedCodec<O, C>, CS, $limit> {
+            pub fn build(self) -> NativeSorter<O, NativeKeyedCodec<O, C>, CS, $limit, D> {
                 let codec = self.codec.resolve();
                 let keyed_codec: NativeKeyedCodec<O, C> = codec.with_record_key();
                 self.core.keyed_codec(keyed_codec).build()
@@ -1073,11 +1080,11 @@ type ResolvedCodec<O, C> = DryIceCodec<
     <C as sealed::ResolveCodec<<O as OrderCodecPolicy>::Policy>>::N,
 >;
 type NativeOrdinaryRecord<C> = <<C as Codec>::Cursor<BufReader<File>> as CodecCursor>::Record;
-type NativeUnkeyedSorter<O, C, CS, L> =
-    spillover::sorter::Sorter<SeqRecord, O, C, (), RecordDedup, CS, spillover::sorter::Unkeyed, L>;
-type NativeUnkeyedBuilt<O, C, CS, L> = NativeUnkeyedSorter<O, ResolvedCodec<O, C>, CS, L>;
+type NativeUnkeyedSorter<O, C, CS, L, D> =
+    spillover::sorter::Sorter<SeqRecord, O, C, (), D, CS, spillover::sorter::Unkeyed, L>;
+type NativeUnkeyedBuilt<O, C, CS, L, D> = NativeUnkeyedSorter<O, ResolvedCodec<O, C>, CS, L, D>;
 
-impl<O, C, CS> Builder<OrderedCore<O, ItemLimit, CS>, C, OwnedStorage, CoreUnkeyed>
+impl<O, C, CS, D> Builder<OrderedCore<O, ItemLimit, CS, D>, C, OwnedStorage, CoreUnkeyed>
 where
     C: sealed::ResolveCodec<O::Policy>,
     O: OrderCodecPolicy + Compare<SeqRecord> + Compare<NativeOrdinaryRecord<ResolvedCodec<O, C>>>,
@@ -1085,13 +1092,13 @@ where
 {
     /// Build an item-limited sorter using the complete unkeyed order.
     #[must_use]
-    pub fn build(self) -> NativeUnkeyedBuilt<O, C, CS, spillover::sorter::ItemLimit> {
+    pub fn build(self) -> NativeUnkeyedBuilt<O, C, CS, spillover::sorter::ItemLimit, D> {
         let codec = self.codec.resolve();
         self.core.codec(codec).build()
     }
 }
 
-impl<O, C, CS> Builder<OrderedCore<O, ByteLimit, CS>, C, OwnedStorage, CoreUnkeyed>
+impl<O, C, CS, D> Builder<OrderedCore<O, ByteLimit, CS, D>, C, OwnedStorage, CoreUnkeyed>
 where
     C: sealed::ResolveCodec<O::Policy>,
     O: OrderCodecPolicy + Compare<SeqRecord> + Compare<NativeOrdinaryRecord<ResolvedCodec<O, C>>>,
@@ -1099,25 +1106,25 @@ where
 {
     /// Build an owned unkeyed sorter under a measured byte budget.
     #[must_use]
-    pub fn build(self) -> NativeUnkeyedBuilt<O, C, CS, spillover::sorter::ByteLimit> {
+    pub fn build(self) -> NativeUnkeyedBuilt<O, C, CS, spillover::sorter::ByteLimit, D> {
         let codec = self.codec.resolve();
         self.core.codec(codec).build()
     }
 }
 
-type NativeArenaUnkeyed<'a, O, C, CS> = spillover::sorter::Sorter<
+type NativeArenaUnkeyed<'a, O, C, CS, D> = spillover::sorter::Sorter<
     (),
     O,
     C,
     (),
-    RecordDedup,
+    D,
     CS,
     spillover::sorter::Unkeyed,
     spillover::sorter::ArenaBuffer<'a, SeqRecordArena>,
 >;
-type NativeArenaBuilt<'a, O, C, CS> = NativeArenaUnkeyed<'a, O, ResolvedCodec<O, C>, CS>;
+type NativeArenaBuilt<'a, O, C, CS, D> = NativeArenaUnkeyed<'a, O, ResolvedCodec<O, C>, CS, D>;
 
-impl<'a, O, C, CS> Builder<OrderedCore<O, ItemLimit, CS>, C, ArenaStorage<'a>, CoreUnkeyed>
+impl<'a, O, C, CS, D> Builder<OrderedCore<O, ItemLimit, CS, D>, C, ArenaStorage<'a>, CoreUnkeyed>
 where
     C: sealed::ResolveCodec<O::Policy>,
     O: OrderCodecPolicy + Compare<NativeOrdinaryRecord<ResolvedCodec<O, C>>>,
@@ -1126,7 +1133,7 @@ where
 {
     /// Build an item-limited sorter over the selected arena.
     #[must_use]
-    pub fn build(self) -> NativeArenaBuilt<'a, O, C, CS> {
+    pub fn build(self) -> NativeArenaBuilt<'a, O, C, CS, D> {
         let codec = self.codec.resolve();
         let storage = self.storage.arena;
         let builder = self.core.codec(codec);
@@ -1135,20 +1142,20 @@ where
     }
 }
 
-type NativeMeasuredArenaUnkeyed<'a, O, C, CS> = spillover::sorter::Sorter<
+type NativeMeasuredArenaUnkeyed<'a, O, C, CS, D> = spillover::sorter::Sorter<
     (),
     O,
     C,
     (),
-    RecordDedup,
+    D,
     CS,
     spillover::sorter::Unkeyed,
     spillover::sorter::MeasuredArena<'a, SeqRecordArena>,
 >;
-type NativeMeasuredArenaBuilt<'a, O, C, CS> =
-    NativeMeasuredArenaUnkeyed<'a, O, ResolvedCodec<O, C>, CS>;
+type NativeMeasuredArenaBuilt<'a, O, C, CS, D> =
+    NativeMeasuredArenaUnkeyed<'a, O, ResolvedCodec<O, C>, CS, D>;
 
-impl<'a, O, C, CS> Builder<OrderedCore<O, ByteLimit, CS>, C, ArenaStorage<'a>, CoreUnkeyed>
+impl<'a, O, C, CS, D> Builder<OrderedCore<O, ByteLimit, CS, D>, C, ArenaStorage<'a>, CoreUnkeyed>
 where
     C: sealed::ResolveCodec<O::Policy>,
     O: OrderCodecPolicy + Compare<NativeOrdinaryRecord<ResolvedCodec<O, C>>>,
@@ -1158,7 +1165,7 @@ where
 {
     /// Build a measured sorter over the selected arena.
     #[must_use]
-    pub fn build(self) -> NativeMeasuredArenaBuilt<'a, O, C, CS> {
+    pub fn build(self) -> NativeMeasuredArenaBuilt<'a, O, C, CS, D> {
         let codec = self.codec.resolve();
         let storage = self.storage.arena;
         let builder = self.core.codec(codec);
@@ -1168,18 +1175,18 @@ where
     }
 }
 
-type NativeArenaKeyed<'a, O, C, CS> = spillover::sorter::Sorter<
+type NativeArenaKeyed<'a, O, C, CS, D> = spillover::sorter::Sorter<
     (),
     O,
     C,
     (),
-    RecordDedup,
+    D,
     CS,
     spillover::sorter::Keyed,
     spillover::sorter::ArenaBuffer<'a, SeqRecordArena>,
 >;
 
-impl<'a, O, C, CS> Builder<OrderedCore<O, ItemLimit, CS>, C, ArenaStorage<'a>, CoreKeyed>
+impl<'a, O, C, CS, D> Builder<OrderedCore<O, ItemLimit, CS, D>, C, ArenaStorage<'a>, CoreKeyed>
 where
     O: OrderCodecPolicy + KeyedOrder + Compare<NativeRecord<NativeKeyedCodec<O, C>>>,
     O::StoredKey: RecordKey + Clone + 'static,
@@ -1192,7 +1199,7 @@ where
 {
     /// Build an item-limited keyed sorter over the selected arena.
     #[must_use]
-    pub fn build(self) -> NativeArenaKeyed<'a, O, NativeKeyedCodec<O, C>, CS> {
+    pub fn build(self) -> NativeArenaKeyed<'a, O, NativeKeyedCodec<O, C>, CS, D> {
         let codec = self.codec.resolve();
         let keyed_codec: NativeKeyedCodec<O, C> = codec.with_record_key();
         let storage = self.storage.arena;
@@ -1203,18 +1210,18 @@ where
     }
 }
 
-type NativeMeasuredArenaKeyed<'a, O, C, CS> = spillover::sorter::Sorter<
+type NativeMeasuredArenaKeyed<'a, O, C, CS, D> = spillover::sorter::Sorter<
     (),
     O,
     C,
     (),
-    RecordDedup,
+    D,
     CS,
     spillover::sorter::Keyed,
     spillover::sorter::MeasuredArena<'a, SeqRecordArena>,
 >;
 
-impl<'a, O, C, CS> Builder<OrderedCore<O, ByteLimit, CS>, C, ArenaStorage<'a>, CoreKeyed>
+impl<'a, O, C, CS, D> Builder<OrderedCore<O, ByteLimit, CS, D>, C, ArenaStorage<'a>, CoreKeyed>
 where
     O: OrderCodecPolicy + KeyedOrder + Compare<NativeRecord<NativeKeyedCodec<O, C>>>,
     O::StoredKey: RecordKey + Clone + 'static,
@@ -1230,7 +1237,7 @@ where
 {
     /// Build a measured keyed sorter using the arena.
     #[must_use]
-    pub fn build(self) -> NativeMeasuredArenaKeyed<'a, O, NativeKeyedCodec<O, C>, CS> {
+    pub fn build(self) -> NativeMeasuredArenaKeyed<'a, O, NativeKeyedCodec<O, C>, CS, D> {
         let codec = self.codec.resolve();
         let keyed_codec: NativeKeyedCodec<O, C> = codec.with_record_key();
         let storage = self.storage.arena;
@@ -1468,7 +1475,7 @@ mod tests {
 
         assert_builder_type::<
             Builder<
-                OrderedCore<UnkeyedSequenceOrder, ByteLimit, Sequential>,
+                OrderedCore<UnkeyedSequenceOrder, ByteLimit, Sequential, NoDedup>,
                 NeedsCodec,
                 OwnedStorage,
                 CoreUnkeyed,
@@ -1486,7 +1493,7 @@ mod tests {
 
         assert_builder_type::<
             Builder<
-                OrderedCore<UnkeyedSequenceOrder, ByteLimit, Sequential>,
+                OrderedCore<UnkeyedSequenceOrder, ByteLimit, Sequential, NoDedup>,
                 NeedsCodec,
                 OwnedStorage,
                 CoreUnkeyed,
@@ -1502,7 +1509,7 @@ mod tests {
 
         assert_builder_type::<
             Builder<
-                OrderedCore<Reverse<SequenceOrder<38>>, ByteLimit, Sequential>,
+                OrderedCore<Reverse<SequenceOrder<38>>, ByteLimit, Sequential, NoDedup>,
                 NeedsCodec,
                 OwnedStorage,
                 CoreKeyed,
