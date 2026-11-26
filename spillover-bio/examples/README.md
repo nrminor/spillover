@@ -9,6 +9,7 @@ These examples focus on `spillover-bio`'s ready-to-use sorting pipeline for sequ
 - [`05_codec_compaction.rs`](./05_codec_compaction.rs): dryice codec options (`two_bit_exact`, `binned_quality`, `split_names`).
 - [`06_alternate_orders.rs`](./06_alternate_orders.rs): name sorting, length sorting, and reversed sequence order.
 - [`07_arena_backed_ingest.rs`](./07_arena_backed_ingest.rs): borrowed input views, arena loan release before output consumption, and borrowed output through `SeqRecordSink`.
+- [`08_sort_read_pairs.rs`](./08_sort_read_pairs.rs): assemble whole pairs, spill with a one-pair limit, and consume sorted pairs without exchanging R1/R2 roles.
 
 Run against the local workspace code, rather than the crates.io release:
 

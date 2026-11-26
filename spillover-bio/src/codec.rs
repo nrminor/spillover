@@ -30,6 +30,11 @@ use spillover::codec::{
 
 use crate::record::{SeqRecord, SeqRecordParts};
 
+mod pair;
+pub use pair::{
+    KeyedPairCursor, KeyedPairWriter, PairCodec, PairCodecError, PairCursor, PairWriter,
+};
+
 /// Compile-time marker for dryice codec type parameters.
 /// Uses the fn pointer pattern so the params don't impose
 /// Copy/Send/etc bounds on the containing struct.
@@ -252,6 +257,19 @@ impl<W: Write, S: SequenceCodec, Q: QualityCodec, N: NameCodec, K> WriterAdapter
     }
 }
 
+impl<W: Write, S: SequenceCodec, Q: QualityCodec, N: NameCodec, K: RecordKey>
+    WriterAdapter<W, S, Q, N, K>
+{
+    fn write_record_with_key<R: SeqRecordParts + ?Sized>(
+        &mut self,
+        item: &R,
+        key: &K,
+    ) -> Result<(), DryIceError> {
+        self.0
+            .write_record_with_key(&SeqRecordPartsAdapter(item), key)
+    }
+}
+
 impl<W: Write, S: SequenceCodec, Q: QualityCodec, N: NameCodec, R: SeqRecordParts + ?Sized>
     CodecWriter<R> for WriterAdapter<W, S, Q, N, dryice::NoRecordKey>
 {
@@ -280,8 +298,7 @@ impl<
     fn write_keyed(&mut self, record: spillover::key::Keyed<&R, &K>) -> Result<(), DryIceError> {
         let item = *record.item();
         let key = *record.stored_key();
-        self.0
-            .write_record_with_key(&SeqRecordPartsAdapter(item), key)
+        self.write_record_with_key(item, key)
     }
 
     fn finish(self) -> Result<(), DryIceError> {

@@ -16,9 +16,10 @@ use dryice::{
     DryIceWriter, NameCodec, QualityCodec, RawAsciiCodec, RawNameCodec, RawQualityCodec, RecordKey,
     SequenceCodec,
 };
+use get_size2::GetSize;
 use spillover::{
     chunk::{ChunkSorter, Sequential},
-    codec::{Codec, CodecCursor, KeyedCodec},
+    codec::{Codec, CodecCursor, EncodeKeyedRun, EncodeRun, KeyedCodec},
     compare::Compare,
     dedup::{AdjacentDeduplicator, NoDedup},
     key::{DeriveKey, KeyedOrder, SortKey},
@@ -30,11 +31,19 @@ use spillover::{
 };
 
 use crate::{
-    codec::{DryIceCodec, KeyedDryIceCodec, SeqRecordPartsAdapter},
+    codec::{DryIceCodec, KeyedDryIceCodec, PairCodec, SeqRecordPartsAdapter},
     key::PackedSequenceKey,
     radix::RadixThenRefine,
-    record::{SeqRecord, SeqRecordArena, SeqRecordParts, SeqRecordView},
+    record::{ReadPair, SeqRecord, SeqRecordArena, SeqRecordParts, SeqRecordView},
 };
+
+mod pair;
+pub use pair::{
+    ILLUMINA_250_PAIR_ORDER, ILLUMINA_PAIR_ORDER, PAIR_LENGTHS_ORDER, PAIR_NAME_ORDER,
+    PAIR_QUALITY_ORDER, PAIR_SEQUENCE_EXACT_ORDER, PairLengthsOrder, PairNameOrder,
+    PairQualityOrder, PairSequenceExactOrder, PairSequenceOrder,
+};
+use sealed::RunShape;
 
 /// Sort key that extracts sequence and quality as a tuple.
 ///
@@ -86,33 +95,36 @@ impl<R: SeqRecordParts> SortKey<R> for LengthKey {
     }
 }
 
-// ── Order-owned codec policy ─────────────────────────────
+// ── Owned input and codec compatibility ──────────────────
 
 mod sealed {
-    pub struct ExistingCodecChoices;
-    pub struct ExactSequenceThenQuality;
-
     /// Resolves codec type-state to a concrete [`crate::codec::DryIceCodec`].
     /// `NeedsCodec` yields the raw (no-encoding) default;
-    /// `HasCodec` passes through a choice accepted by the order's policy.
-    pub trait ResolveCodec<P> {
+    /// `HasCodec` passes through the configured choice.
+    pub trait ResolveCodec {
         type S: dryice::SequenceCodec + Copy + 'static;
         type Q: dryice::QualityCodec + Copy + 'static;
         type N: dryice::NameCodec + Copy + 'static;
 
         fn resolve(self) -> crate::codec::DryIceCodec<Self::S, Self::Q, Self::N>;
     }
+
+    /// Selects framing for supported owned inputs and dedup configurations.
+    pub trait RunShape<C, D> {
+        type Codec;
+        fn frame(codec: C) -> Self::Codec;
+    }
 }
 
-/// Declares which codec policy Bio applies to an order.
+/// Designates the owned input accepted by a Bio order.
 ///
-/// Comparison and key derivation use core's [`Compare`], [`KeyedOrder`],
-/// and [`DeriveKey`] traits. Builder methods select the merge mode.
+/// Bio supports [`SeqRecord`] and [`ReadPair<SeqRecord>`] as owned inputs.
+/// The input is independent of codec selection. Comparison can remain generic
+/// over borrowed record representations using core's [`Compare`] and
+/// [`DeriveKey`] traits. Other owned shapes can use core's builder directly.
 ///
-/// External orders can select [`RawRecords`] to retain every record field.
-/// A policy declaration is not a proof of codec/order coherence: extension
-/// authors are responsible for preserving their ordering through codec round
-/// trips. Reusing a builtin order's policy does not establish those laws.
+/// Declare the input once, then grant [`CompatibleWith`] for each supported
+/// codec configuration:
 ///
 /// ```
 /// use std::cmp::Ordering;
@@ -120,7 +132,7 @@ mod sealed {
 /// use spillover_bio::{
 ///     codec::DryIceCodec,
 ///     record::{SeqRecord, SeqRecordParts},
-///     sort::{Builder, OrderCodecPolicy, RawRecords},
+///     sort::{BioOrder, Builder, CompatibleWith},
 /// };
 ///
 /// struct QualityThenName;
@@ -132,9 +144,10 @@ mod sealed {
 ///     }
 /// }
 ///
-/// impl OrderCodecPolicy for QualityThenName {
-///     type Policy = RawRecords;
+/// impl BioOrder for QualityThenName {
+///     type Input = SeqRecord;
 /// }
+/// impl CompatibleWith<DryIceCodec> for QualityThenName {}
 ///
 /// let mut sorter = Builder::new()
 ///     .sort_by_unkeyed(QualityThenName)
@@ -146,25 +159,28 @@ mod sealed {
 /// assert_eq!(collected?.len(), 1);
 /// # Ok::<(), Box<dyn std::error::Error>>(())
 /// ```
-pub trait OrderCodecPolicy {
-    /// Codec eligibility applied by Bio's private resolver.
-    type Policy;
+pub trait BioOrder {
+    /// Owned sort item, independent of encoding and comparison representation.
+    type Input;
 }
 
-/// Accept only raw sequence, quality, and name codecs.
+/// Declares that an order accepts a concrete base codec configuration.
 ///
-/// This conservative policy excludes even non-raw encodings that might be
-/// lossless. No codec/order law is inferred from a comparator implementation.
+/// A grant is not proof of ordering coherence. Extension authors must preserve
+/// comparisons through encoding, decoding, and intermediate merges. Delegating
+/// to a built-in order's grants does not establish those laws for another order.
+/// Granting just [`DryIceCodec`] conservatively accepts only raw sequence,
+/// quality, and name codecs. No universal raw-codec grant is implicit.
 ///
-/// Name encoding is restricted too, since an external order may compare names:
+/// Changing an ungranted component is rejected at build:
 ///
 /// ```compile_fail
 /// use std::cmp::Ordering;
 /// use spillover::compare::Compare;
 /// use spillover_bio::{
 ///     codec::DryIceCodec,
-///     record::SeqRecordParts,
-///     sort::{Builder, OrderCodecPolicy, RawRecords},
+///     record::{SeqRecord, SeqRecordParts},
+///     sort::{BioOrder, Builder, CompatibleWith},
 /// };
 ///
 /// struct ByName;
@@ -173,9 +189,10 @@ pub trait OrderCodecPolicy {
 ///         left.name().cmp(right.name())
 ///     }
 /// }
-/// impl OrderCodecPolicy for ByName {
-///     type Policy = RawRecords;
+/// impl BioOrder for ByName {
+///     type Input = SeqRecord;
 /// }
+/// impl CompatibleWith<DryIceCodec> for ByName {}
 /// let codec = DryIceCodec::new().omit_names();
 /// let _sorter = Builder::new()
 ///     .sort_by_unkeyed(ByName)
@@ -189,12 +206,13 @@ pub trait OrderCodecPolicy {
 /// ```compile_fail
 /// # use std::cmp::Ordering;
 /// # use spillover::compare::Compare;
-/// # use spillover_bio::{codec::DryIceCodec, record::SeqRecordParts, sort::{Builder, OrderCodecPolicy, RawRecords}};
+/// # use spillover_bio::{codec::DryIceCodec, record::{SeqRecord, SeqRecordParts}, sort::{BioOrder, Builder, CompatibleWith}};
 /// # struct ByName;
 /// # impl<R: SeqRecordParts + ?Sized> Compare<R> for ByName {
 /// #     fn compare(&self, left: &R, right: &R) -> Ordering { left.name().cmp(right.name()) }
 /// # }
-/// # impl OrderCodecPolicy for ByName { type Policy = RawRecords; }
+/// # impl BioOrder for ByName { type Input = SeqRecord; }
+/// # impl CompatibleWith<DryIceCodec> for ByName {}
 /// let codec = DryIceCodec::new().two_bit_lossy_n();
 /// let _sorter = Builder::new()
 ///     .sort_by_unkeyed(ByName)
@@ -206,12 +224,13 @@ pub trait OrderCodecPolicy {
 /// ```compile_fail
 /// # use std::cmp::Ordering;
 /// # use spillover::compare::Compare;
-/// # use spillover_bio::{codec::DryIceCodec, record::SeqRecordParts, sort::{Builder, OrderCodecPolicy, RawRecords}};
+/// # use spillover_bio::{codec::DryIceCodec, record::{SeqRecord, SeqRecordParts}, sort::{BioOrder, Builder, CompatibleWith}};
 /// # struct ByName;
 /// # impl<R: SeqRecordParts + ?Sized> Compare<R> for ByName {
 /// #     fn compare(&self, left: &R, right: &R) -> Ordering { left.name().cmp(right.name()) }
 /// # }
-/// # impl OrderCodecPolicy for ByName { type Policy = RawRecords; }
+/// # impl BioOrder for ByName { type Input = SeqRecord; }
+/// # impl CompatibleWith<DryIceCodec> for ByName {}
 /// let codec = DryIceCodec::new().binned_quality();
 /// let _sorter = Builder::new()
 ///     .sort_by_unkeyed(ByName)
@@ -219,7 +238,7 @@ pub trait OrderCodecPolicy {
 ///     .max_buffer_items(1)
 ///     .build();
 /// ```
-pub struct RawRecords;
+pub trait CompatibleWith<C>: BioOrder {}
 
 // ── Keyed sort orders ────────────────────────────────────
 
@@ -231,8 +250,8 @@ pub struct RawRecords;
 #[derive(Debug, Clone, Copy)]
 pub struct SequenceOrder<const N: usize>;
 
-impl<const N: usize> OrderCodecPolicy for SequenceOrder<N> {
-    type Policy = sealed::ExistingCodecChoices;
+impl<const N: usize> BioOrder for SequenceOrder<N> {
+    type Input = SeqRecord;
 }
 
 impl<const N: usize, R: SeqRecordParts + ?Sized> Compare<R> for SequenceOrder<N> {
@@ -258,8 +277,8 @@ impl<const N: usize> SequenceOrder<N> {
 #[derive(Debug, Clone, Copy)]
 pub struct NameOrder;
 
-impl OrderCodecPolicy for NameOrder {
-    type Policy = sealed::ExistingCodecChoices;
+impl BioOrder for NameOrder {
+    type Input = SeqRecord;
 }
 
 impl<R: SeqRecordParts + ?Sized> Compare<R> for NameOrder {
@@ -291,8 +310,8 @@ impl NameOrder {
 #[derive(Debug, Clone, Copy)]
 pub struct LengthOrder;
 
-impl OrderCodecPolicy for LengthOrder {
-    type Policy = sealed::ExistingCodecChoices;
+impl BioOrder for LengthOrder {
+    type Input = SeqRecord;
 }
 
 impl<R: SeqRecordParts + ?Sized> Compare<R> for LengthOrder {
@@ -373,8 +392,8 @@ impl<R: SeqRecordParts + ?Sized> spillover::key::EstimateKeyMemory<R> for Length
 #[derive(Debug, Clone, Copy)]
 pub struct UnkeyedSequenceOrder;
 
-impl OrderCodecPolicy for UnkeyedSequenceOrder {
-    type Policy = sealed::ExactSequenceThenQuality;
+impl BioOrder for UnkeyedSequenceOrder {
+    type Input = SeqRecord;
 }
 
 impl<R: SeqRecordParts + ?Sized> Compare<R> for UnkeyedSequenceOrder {
@@ -389,8 +408,8 @@ impl<R: SeqRecordParts + ?Sized> Compare<R> for UnkeyedSequenceOrder {
 #[derive(Debug, Clone, Copy)]
 pub struct UnkeyedNameOrder;
 
-impl OrderCodecPolicy for UnkeyedNameOrder {
-    type Policy = sealed::ExistingCodecChoices;
+impl BioOrder for UnkeyedNameOrder {
+    type Input = SeqRecord;
 }
 
 impl<R: SeqRecordParts + ?Sized> Compare<R> for UnkeyedNameOrder {
@@ -403,8 +422,8 @@ impl<R: SeqRecordParts + ?Sized> Compare<R> for UnkeyedNameOrder {
 #[derive(Debug, Clone, Copy)]
 pub struct UnkeyedLengthOrder;
 
-impl OrderCodecPolicy for UnkeyedLengthOrder {
-    type Policy = sealed::ExistingCodecChoices;
+impl BioOrder for UnkeyedLengthOrder {
+    type Input = SeqRecord;
 }
 
 impl<R: SeqRecordParts + ?Sized> Compare<R> for UnkeyedLengthOrder {
@@ -424,9 +443,59 @@ impl<R: SeqRecordParts + ?Sized> Compare<R> for UnkeyedLengthOrder {
 /// ```
 pub use spillover::compare::Reverse;
 
-impl<O: OrderCodecPolicy> OrderCodecPolicy for Reverse<O> {
-    type Policy = O::Policy;
+impl<O: BioOrder> BioOrder for Reverse<O> {
+    type Input = O::Input;
 }
+
+impl<O: CompatibleWith<C>, C> CompatibleWith<C> for Reverse<O> {}
+
+macro_rules! existing_codec_choices {
+    ($($order:ty),+ $(,)?) => {$(
+        impl<S, Q, N> CompatibleWith<DryIceCodec<S, Q, N>> for $order
+        where
+            S: SequenceCodec + Copy + 'static,
+            Q: QualityCodec + Copy + 'static,
+            N: NameCodec + Copy + 'static,
+        {}
+    )+};
+}
+
+existing_codec_choices!(NameOrder, LengthOrder, UnkeyedNameOrder, UnkeyedLengthOrder);
+
+impl<const WIDTH: usize, S, Q, N> CompatibleWith<DryIceCodec<S, Q, N>> for SequenceOrder<WIDTH>
+where
+    S: SequenceCodec + Copy + 'static,
+    Q: QualityCodec + Copy + 'static,
+    N: NameCodec + Copy + 'static,
+{
+}
+
+impl<N: NameCodec + Copy + 'static> CompatibleWith<DryIceCodec<RawAsciiCodec, RawQualityCodec, N>>
+    for UnkeyedSequenceOrder
+{
+}
+
+macro_rules! raw_pair_orders {
+    ($($order:ty),+ $(,)?) => {$(
+        impl BioOrder for $order {
+            type Input = ReadPair<SeqRecord>;
+        }
+        impl CompatibleWith<DryIceCodec> for $order {}
+    )+};
+}
+
+raw_pair_orders!(
+    PairSequenceExactOrder,
+    PairNameOrder,
+    PairQualityOrder,
+    PairLengthsOrder
+);
+
+impl<const N: usize> BioOrder for PairSequenceOrder<N> {
+    type Input = ReadPair<SeqRecord>;
+}
+
+impl<const N: usize> CompatibleWith<DryIceCodec> for PairSequenceOrder<N> {}
 
 // ── Convenience aliases ──────────────────────────────────
 
@@ -595,7 +664,7 @@ const DEFAULT_BUDGET: usize = 1 << 30;
 
 // ── Sealed trait impls for default resolution ────────────
 
-impl<P> sealed::ResolveCodec<P> for NeedsCodec {
+impl sealed::ResolveCodec for NeedsCodec {
     type S = RawAsciiCodec;
     type Q = RawQualityCodec;
     type N = RawNameCodec;
@@ -605,17 +674,7 @@ impl<P> sealed::ResolveCodec<P> for NeedsCodec {
     }
 }
 
-impl sealed::ResolveCodec<RawRecords> for HasCodec<RawAsciiCodec, RawQualityCodec, RawNameCodec> {
-    type S = RawAsciiCodec;
-    type Q = RawQualityCodec;
-    type N = RawNameCodec;
-
-    fn resolve(self) -> DryIceCodec {
-        self.0
-    }
-}
-
-impl<S, Q, N> sealed::ResolveCodec<sealed::ExistingCodecChoices> for HasCodec<S, Q, N>
+impl<S, Q, N> sealed::ResolveCodec for HasCodec<S, Q, N>
 where
     S: SequenceCodec + Copy + 'static,
     Q: QualityCodec + Copy + 'static,
@@ -630,27 +689,38 @@ where
     }
 }
 
-impl<N> sealed::ResolveCodec<sealed::ExactSequenceThenQuality>
-    for HasCodec<RawAsciiCodec, RawQualityCodec, N>
-where
-    N: NameCodec + Copy + 'static,
-{
-    type S = RawAsciiCodec;
-    type Q = RawQualityCodec;
-    type N = N;
+impl<C, D> RunShape<C, D> for SeqRecord {
+    type Codec = C;
 
-    fn resolve(self) -> DryIceCodec<Self::S, Self::Q, Self::N> {
-        self.0
+    fn frame(codec: C) -> C {
+        codec
+    }
+}
+
+impl<S, Q, N> RunShape<DryIceCodec<S, Q, N>, NoDedup> for ReadPair<SeqRecord> {
+    type Codec = PairCodec<DryIceCodec<S, Q, N>>;
+
+    fn frame(codec: DryIceCodec<S, Q, N>) -> Self::Codec {
+        PairCodec::new(codec)
+    }
+}
+
+impl<K, S, Q, N> RunShape<KeyedDryIceCodec<K, S, Q, N>, NoDedup> for ReadPair<SeqRecord> {
+    type Codec = PairCodec<KeyedDryIceCodec<K, S, Q, N>>;
+
+    fn frame(codec: KeyedDryIceCodec<K, S, Q, N>) -> Self::Codec {
+        PairCodec::new(codec)
     }
 }
 
 /// Builder for configuring a genomics-oriented external sorter.
 ///
-/// Built sorters are Core sorters: owned ingress accepts [`SeqRecord`], and
+/// Built sorters are Core sorters: owned ingress accepts the order's
+/// [`BioOrder::Input`] (`SeqRecord` or `ReadPair<SeqRecord>`), and
 /// arena ingress can use [`SeqRecordView`]. Convert other owned inputs explicitly
 /// before pushing; normalize parser records to views for measured keyed arenas.
 /// Final output supports owned iteration or Core's `items().try_for_each(...)`
-/// borrowed traversal. Bio supplies codec policy and deduplication, not another
+/// borrowed traversal. Bio supplies codec compatibility and deduplication, not another
 /// sorter lifecycle.
 ///
 /// Only a sort order is required — everything else has sensible
@@ -672,6 +742,58 @@ where
 /// another dedup mode replaces the previous choice. Conditional configuration
 /// must therefore branch before building rather than reassign an enabled
 /// builder into a variable holding the default type.
+///
+/// Pair sorting preserves whole pairs and duplicates. The single-record dedup
+/// selectors and arena storage are not supported for pairs, regardless of
+/// configuration order:
+///
+/// ```compile_fail
+/// use spillover_bio::sort::Builder;
+/// let _sorter = Builder::new().dedup_by_name().sort_by_pair_name().build();
+/// ```
+///
+/// ```compile_fail
+/// use spillover_bio::sort::Builder;
+/// let _sorter = Builder::new().sort_by_pair_name().dedup_by_name().build();
+/// ```
+///
+/// ```compile_fail
+/// use spillover_bio::sort::Builder;
+/// let _sorter = Builder::new().dedup_by_sequence().sort_by_illumina_pairs().build();
+/// ```
+///
+/// ```compile_fail
+/// use spillover_bio::sort::Builder;
+/// let _sorter = Builder::new().sort_by_illumina_pairs().dedup_by_sequence_and_quality().build();
+/// ```
+///
+/// ```compile_fail
+/// use spillover_bio::{record::SeqRecordArena, sort::Builder};
+/// let mut arena = SeqRecordArena::new();
+/// let _sorter = Builder::new().arena(&mut arena).sort_by_pair_name().build();
+/// ```
+///
+/// ```compile_fail
+/// use spillover_bio::{record::SeqRecordArena, sort::Builder};
+/// let mut arena = SeqRecordArena::new();
+/// let _sorter = Builder::new().sort_by_illumina_pairs().arena(&mut arena).build();
+/// ```
+///
+/// Pair input cannot be replaced by a single read:
+///
+/// ```compile_fail
+/// use spillover_bio::{record::SeqRecord, sort::Builder};
+/// let mut sorter = Builder::new().sort_by_pair_name().build();
+/// sorter.push(SeqRecord::new(b"r1", b"A", b"!")).unwrap();
+/// ```
+///
+/// Built-in pair orders initially require raw encodings for all fields:
+///
+/// ```compile_fail
+/// use spillover_bio::{codec::DryIceCodec, sort::Builder};
+/// let codec = DryIceCodec::new().omit_quality();
+/// let _sorter = Builder::new().sort_by_pair_sequence_exact().codec(codec).build();
+/// ```
 ///
 /// Override any default with the corresponding builder method:
 ///
@@ -796,7 +918,7 @@ impl<Core, C, M> Builder<Core, C, OwnedStorage, M> {
 impl<C, L, CS, D, S> Builder<CoreBuilder<CoreNeedsOrder, L, CS, D>, C, S> {
     /// Set a keyed sort order (merge compares record keys).
     #[must_use]
-    pub fn sort_by<O: OrderCodecPolicy + KeyedOrder>(
+    pub fn sort_by<O: BioOrder + KeyedOrder>(
         self,
         order: O,
     ) -> Builder<OrderedCore<O, L, CS, D>, C, S, CoreKeyed> {
@@ -805,7 +927,7 @@ impl<C, L, CS, D, S> Builder<CoreBuilder<CoreNeedsOrder, L, CS, D>, C, S> {
 
     /// Set an unkeyed sort order (merge deserializes full records).
     #[must_use]
-    pub fn sort_by_unkeyed<O: OrderCodecPolicy>(
+    pub fn sort_by_unkeyed<O: BioOrder>(
         self,
         order: O,
     ) -> Builder<OrderedCore<O, L, CS, D>, C, S, CoreUnkeyed> {
@@ -875,6 +997,36 @@ impl<C, L, CS, D, S> Builder<CoreBuilder<CoreNeedsOrder, L, CS, D>, C, S> {
     #[must_use]
     pub fn sort_by_length(self) -> Builder<OrderedCore<LengthOrder, L, CS, D>, C, S, CoreKeyed> {
         self.sort_by(LENGTH_ORDER)
+    }
+
+    /// Sort whole read pairs using a 38-byte R1 key, then exact pair refinement.
+    ///
+    /// Selects [`Sequential`] chunk sorting. Unlike [`Self::sort_by_paired_end`],
+    /// each item is a complete [`ReadPair`], not an individual read.
+    #[must_use]
+    pub fn sort_by_illumina_pairs(
+        self,
+    ) -> Builder<OrderedCore<PairSequenceOrder<38>, L, Sequential, D>, C, S, CoreKeyed> {
+        self.sort_by(ILLUMINA_PAIR_ORDER).sort_with_sequential()
+    }
+
+    /// Sort whole pairs by both sequences, both qualities, then both names.
+    ///
+    /// Selects [`Sequential`] chunk sorting and requires raw encoding.
+    #[must_use]
+    pub fn sort_by_pair_sequence_exact(
+        self,
+    ) -> Builder<OrderedCore<PairSequenceExactOrder, L, Sequential, D>, C, S, CoreUnkeyed> {
+        self.sort_by_unkeyed(PAIR_SEQUENCE_EXACT_ORDER)
+            .sort_with_sequential()
+    }
+
+    /// Sort whole pairs by R1 name, then R2 name, without deriving keys.
+    #[must_use]
+    pub fn sort_by_pair_name(
+        self,
+    ) -> Builder<OrderedCore<PairNameOrder, L, CS, D>, C, S, CoreUnkeyed> {
+        self.sort_by_unkeyed(PAIR_NAME_ORDER)
     }
 }
 
@@ -1036,79 +1188,110 @@ impl<SK, C, L, CS, D, S, M> Builder<CoreBuilder<SK, L, CS, D>, C, S, M> {
 
 type NativeKeyedCodec<O, C> = KeyedDryIceCodec<
     <O as KeyedOrder>::StoredKey,
-    <C as sealed::ResolveCodec<<O as OrderCodecPolicy>::Policy>>::S,
-    <C as sealed::ResolveCodec<<O as OrderCodecPolicy>::Policy>>::Q,
-    <C as sealed::ResolveCodec<<O as OrderCodecPolicy>::Policy>>::N,
+    <C as sealed::ResolveCodec>::S,
+    <C as sealed::ResolveCodec>::Q,
+    <C as sealed::ResolveCodec>::N,
 >;
+type KeyedRunCodec<O, C, D> =
+    <<O as BioOrder>::Input as RunShape<NativeKeyedCodec<O, C>, D>>::Codec;
 type NativeRecord<C> = <<C as KeyedCodec>::KeyedCursor<BufReader<File>> as CodecCursor>::Record;
 type NativeSorter<O, C, CS, L, D> =
-    spillover::sorter::Sorter<SeqRecord, O, C, (), D, CS, spillover::sorter::Keyed, L>;
+    spillover::sorter::Sorter<<O as BioOrder>::Input, O, C, (), D, CS, spillover::sorter::Keyed, L>;
 
 macro_rules! owned_keyed_builder {
     ($limit:ty; $($extra:tt)*) => {
         impl<O, C, CS, D> Builder<OrderedCore<O, $limit, CS, D>, C, OwnedStorage, CoreKeyed>
         where
-            O: OrderCodecPolicy + DeriveKey<SeqRecord>
-                + Compare<SeqRecord> + Compare<NativeRecord<NativeKeyedCodec<O, C>>>,
+            O: BioOrder + CompatibleWith<ResolvedCodec<C>> + DeriveKey<O::Input>
+                + Compare<O::Input> + Compare<NativeRecord<KeyedRunCodec<O, C, D>>>,
             O::StoredKey: RecordKey + Clone + 'static,
-            C: sealed::ResolveCodec<O::Policy>,
-            for<'a> CS: ChunkSorter<spillover::key::Keyed<usize, O::StoredKey>, spillover::key::KeyedEntryCompare<'a, SeqRecord, O>>,
+            C: sealed::ResolveCodec,
+            O::Input: RunShape<NativeKeyedCodec<O, C>, D>,
+            KeyedRunCodec<O, C, D>: KeyedCodec<Key = O::StoredKey>
+                + EncodeKeyedRun<O::Input>
+                + EncodeKeyedRun<NativeRecord<KeyedRunCodec<O, C, D>>>,
+            for<'a> CS: ChunkSorter<spillover::key::Keyed<usize, O::StoredKey>, spillover::key::KeyedEntryCompare<'a, O::Input, O>>,
             $($extra)*
         {
             /// Build the configured owned keyed sorter.
             #[must_use]
-            pub fn build(self) -> NativeSorter<O, NativeKeyedCodec<O, C>, CS, $limit, D> {
+            pub fn build(self) -> NativeSorter<O, KeyedRunCodec<O, C, D>, CS, $limit, D> {
                 let codec = self.codec.resolve();
                 let keyed_codec: NativeKeyedCodec<O, C> = codec.with_record_key();
-                self.core.keyed_codec(keyed_codec).build()
+                let framed = O::Input::frame(keyed_codec);
+                self.core.keyed_codec(framed).build()
             }
         }
     };
 }
 
 owned_keyed_builder!(ByteLimit;
-    O: spillover::key::EstimateKeyMemory<SeqRecord>,
+    O::Input: GetSize,
+    O: spillover::key::EstimateKeyMemory<O::Input>,
     CS: spillover::chunk::EstimateSortMemory<spillover::key::Keyed<usize, O::StoredKey>>,
 );
 owned_keyed_builder!(ItemLimit;);
 
 // build() for unkeyed sort orders.
 
-type ResolvedCodec<O, C> = DryIceCodec<
-    <C as sealed::ResolveCodec<<O as OrderCodecPolicy>::Policy>>::S,
-    <C as sealed::ResolveCodec<<O as OrderCodecPolicy>::Policy>>::Q,
-    <C as sealed::ResolveCodec<<O as OrderCodecPolicy>::Policy>>::N,
+type ResolvedCodec<C> = DryIceCodec<
+    <C as sealed::ResolveCodec>::S,
+    <C as sealed::ResolveCodec>::Q,
+    <C as sealed::ResolveCodec>::N,
 >;
+type RunCodec<O, C, D> = <<O as BioOrder>::Input as RunShape<ResolvedCodec<C>, D>>::Codec;
 type NativeOrdinaryRecord<C> = <<C as Codec>::Cursor<BufReader<File>> as CodecCursor>::Record;
-type NativeUnkeyedSorter<O, C, CS, L, D> =
-    spillover::sorter::Sorter<SeqRecord, O, C, (), D, CS, spillover::sorter::Unkeyed, L>;
-type NativeUnkeyedBuilt<O, C, CS, L, D> = NativeUnkeyedSorter<O, ResolvedCodec<O, C>, CS, L, D>;
+type NativeUnkeyedSorter<O, C, CS, L, D> = spillover::sorter::Sorter<
+    <O as BioOrder>::Input,
+    O,
+    C,
+    (),
+    D,
+    CS,
+    spillover::sorter::Unkeyed,
+    L,
+>;
+type NativeUnkeyedBuilt<O, C, CS, L, D> = NativeUnkeyedSorter<O, RunCodec<O, C, D>, CS, L, D>;
 
 impl<O, C, CS, D> Builder<OrderedCore<O, ItemLimit, CS, D>, C, OwnedStorage, CoreUnkeyed>
 where
-    C: sealed::ResolveCodec<O::Policy>,
-    O: OrderCodecPolicy + Compare<SeqRecord> + Compare<NativeOrdinaryRecord<ResolvedCodec<O, C>>>,
-    CS: ChunkSorter<SeqRecord, O>,
+    C: sealed::ResolveCodec,
+    O: BioOrder
+        + CompatibleWith<ResolvedCodec<C>>
+        + Compare<O::Input>
+        + Compare<NativeOrdinaryRecord<RunCodec<O, C, D>>>,
+    O::Input: RunShape<ResolvedCodec<C>, D>,
+    RunCodec<O, C, D>:
+        Codec + EncodeRun<O::Input> + EncodeRun<NativeOrdinaryRecord<RunCodec<O, C, D>>>,
+    CS: ChunkSorter<O::Input, O>,
 {
     /// Build an item-limited sorter using the complete unkeyed order.
     #[must_use]
     pub fn build(self) -> NativeUnkeyedBuilt<O, C, CS, spillover::sorter::ItemLimit, D> {
         let codec = self.codec.resolve();
-        self.core.codec(codec).build()
+        let framed = O::Input::frame(codec);
+        self.core.codec(framed).build()
     }
 }
 
 impl<O, C, CS, D> Builder<OrderedCore<O, ByteLimit, CS, D>, C, OwnedStorage, CoreUnkeyed>
 where
-    C: sealed::ResolveCodec<O::Policy>,
-    O: OrderCodecPolicy + Compare<SeqRecord> + Compare<NativeOrdinaryRecord<ResolvedCodec<O, C>>>,
-    CS: ChunkSorter<SeqRecord, O> + spillover::chunk::EstimateSortMemory<SeqRecord>,
+    C: sealed::ResolveCodec,
+    O: BioOrder
+        + CompatibleWith<ResolvedCodec<C>>
+        + Compare<O::Input>
+        + Compare<NativeOrdinaryRecord<RunCodec<O, C, D>>>,
+    O::Input: RunShape<ResolvedCodec<C>, D> + GetSize,
+    RunCodec<O, C, D>:
+        Codec + EncodeRun<O::Input> + EncodeRun<NativeOrdinaryRecord<RunCodec<O, C, D>>>,
+    CS: ChunkSorter<O::Input, O> + spillover::chunk::EstimateSortMemory<O::Input>,
 {
     /// Build an owned unkeyed sorter under a measured byte budget.
     #[must_use]
     pub fn build(self) -> NativeUnkeyedBuilt<O, C, CS, spillover::sorter::ByteLimit, D> {
         let codec = self.codec.resolve();
-        self.core.codec(codec).build()
+        let framed = O::Input::frame(codec);
+        self.core.codec(framed).build()
     }
 }
 
@@ -1122,12 +1305,14 @@ type NativeArenaUnkeyed<'a, O, C, CS, D> = spillover::sorter::Sorter<
     spillover::sorter::Unkeyed,
     spillover::sorter::ArenaBuffer<'a, SeqRecordArena>,
 >;
-type NativeArenaBuilt<'a, O, C, CS, D> = NativeArenaUnkeyed<'a, O, ResolvedCodec<O, C>, CS, D>;
+type NativeArenaBuilt<'a, O, C, CS, D> = NativeArenaUnkeyed<'a, O, ResolvedCodec<C>, CS, D>;
 
 impl<'a, O, C, CS, D> Builder<OrderedCore<O, ItemLimit, CS, D>, C, ArenaStorage<'a>, CoreUnkeyed>
 where
-    C: sealed::ResolveCodec<O::Policy>,
-    O: OrderCodecPolicy + Compare<NativeOrdinaryRecord<ResolvedCodec<O, C>>>,
+    C: sealed::ResolveCodec,
+    O: BioOrder<Input = SeqRecord>
+        + CompatibleWith<ResolvedCodec<C>>
+        + Compare<NativeOrdinaryRecord<ResolvedCodec<C>>>,
     for<'v> O: Compare<SeqRecordView<'v>>,
     for<'v> CS: ChunkSorter<SeqRecordView<'v>, O>,
 {
@@ -1153,12 +1338,14 @@ type NativeMeasuredArenaUnkeyed<'a, O, C, CS, D> = spillover::sorter::Sorter<
     spillover::sorter::MeasuredArena<'a, SeqRecordArena>,
 >;
 type NativeMeasuredArenaBuilt<'a, O, C, CS, D> =
-    NativeMeasuredArenaUnkeyed<'a, O, ResolvedCodec<O, C>, CS, D>;
+    NativeMeasuredArenaUnkeyed<'a, O, ResolvedCodec<C>, CS, D>;
 
 impl<'a, O, C, CS, D> Builder<OrderedCore<O, ByteLimit, CS, D>, C, ArenaStorage<'a>, CoreUnkeyed>
 where
-    C: sealed::ResolveCodec<O::Policy>,
-    O: OrderCodecPolicy + Compare<NativeOrdinaryRecord<ResolvedCodec<O, C>>>,
+    C: sealed::ResolveCodec,
+    O: BioOrder<Input = SeqRecord>
+        + CompatibleWith<ResolvedCodec<C>>
+        + Compare<NativeOrdinaryRecord<ResolvedCodec<C>>>,
     for<'v> O: Compare<SeqRecordView<'v>>,
     for<'v> CS:
         ChunkSorter<SeqRecordView<'v>, O> + spillover::chunk::EstimateSortMemory<SeqRecordView<'v>>,
@@ -1188,9 +1375,12 @@ type NativeArenaKeyed<'a, O, C, CS, D> = spillover::sorter::Sorter<
 
 impl<'a, O, C, CS, D> Builder<OrderedCore<O, ItemLimit, CS, D>, C, ArenaStorage<'a>, CoreKeyed>
 where
-    O: OrderCodecPolicy + KeyedOrder + Compare<NativeRecord<NativeKeyedCodec<O, C>>>,
+    O: BioOrder<Input = SeqRecord>
+        + CompatibleWith<ResolvedCodec<C>>
+        + KeyedOrder
+        + Compare<NativeRecord<NativeKeyedCodec<O, C>>>,
     O::StoredKey: RecordKey + Clone + 'static,
-    C: sealed::ResolveCodec<O::Policy>,
+    C: sealed::ResolveCodec,
     for<'v> O: DeriveKey<SeqRecordView<'v>> + Compare<SeqRecordView<'v>>,
     for<'v, 'order> CS: ChunkSorter<
             spillover::key::Keyed<usize, O::StoredKey>,
@@ -1223,9 +1413,12 @@ type NativeMeasuredArenaKeyed<'a, O, C, CS, D> = spillover::sorter::Sorter<
 
 impl<'a, O, C, CS, D> Builder<OrderedCore<O, ByteLimit, CS, D>, C, ArenaStorage<'a>, CoreKeyed>
 where
-    O: OrderCodecPolicy + KeyedOrder + Compare<NativeRecord<NativeKeyedCodec<O, C>>>,
+    O: BioOrder<Input = SeqRecord>
+        + CompatibleWith<ResolvedCodec<C>>
+        + KeyedOrder
+        + Compare<NativeRecord<NativeKeyedCodec<O, C>>>,
     O::StoredKey: RecordKey + Clone + 'static,
-    C: sealed::ResolveCodec<O::Policy>,
+    C: sealed::ResolveCodec,
     CS: spillover::chunk::EstimateSortMemory<spillover::key::Keyed<usize, O::StoredKey>>,
     for<'v> O: DeriveKey<SeqRecordView<'v>>
         + spillover::key::EstimateKeyMemory<SeqRecordView<'v>>
@@ -1621,17 +1814,32 @@ mod tests {
 
     #[test]
     fn exact_sequence_order_requires_raw_compared_fields() {
-        fn assert_exact<O: OrderCodecPolicy<Policy = sealed::ExactSequenceThenQuality>>() {}
-        assert_exact::<UnkeyedSequenceOrder>();
-        assert_exact::<Reverse<UnkeyedSequenceOrder>>();
-        assert_exact::<Reverse<Reverse<UnkeyedSequenceOrder>>>();
+        let codec = DryIceCodec::new().omit_names();
+        let _forward = Builder::new()
+            .sort_by_unkeyed(UnkeyedSequenceOrder)
+            .codec(codec)
+            .build();
+        let _reverse = Builder::new()
+            .sort_by_unkeyed(Reverse(UnkeyedSequenceOrder))
+            .codec(codec)
+            .build();
+        let _nested_reverse = Builder::new()
+            .sort_by_unkeyed(Reverse(Reverse(UnkeyedSequenceOrder)))
+            .codec(codec)
+            .build();
     }
 
     #[test]
     fn accelerated_sequence_order_retains_codec_choices() {
-        fn assert_choices<O: OrderCodecPolicy<Policy = sealed::ExistingCodecChoices>>() {}
-        assert_choices::<SequenceOrder<38>>();
-        assert_choices::<Reverse<SequenceOrder<38>>>();
+        let codec = DryIceCodec::new()
+            .two_bit_lossy_n()
+            .binned_quality()
+            .omit_names();
+        let _forward = Builder::new().sort_by(ILLUMINA_ORDER).codec(codec).build();
+        let _reverse = Builder::new()
+            .sort_by(Reverse(ILLUMINA_ORDER))
+            .codec(codec)
+            .build();
     }
 
     #[test]

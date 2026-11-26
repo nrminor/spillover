@@ -28,8 +28,8 @@ use spillover_bio::{
     radix::RadixThenRefine,
     record::{SeqRecord, SeqRecordArena, SeqRecordParts, SeqRecordView},
     sort::{
-        Builder, ILLUMINA_ORDER, LENGTH_ORDER, NAME_ORDER, OrderCodecPolicy, RawRecords,
-        RecordDedup, Reverse, SeqRecordSink, SequenceOrder,
+        BioOrder, Builder, CompatibleWith, ILLUMINA_ORDER, LENGTH_ORDER, NAME_ORDER, RecordDedup,
+        Reverse, SeqRecordSink, SequenceOrder,
     },
 };
 use thiserror::Error;
@@ -1280,9 +1280,11 @@ impl<R: SeqRecordParts> Compare<R> for DownstreamNameOrder {
     }
 }
 
-impl OrderCodecPolicy for DownstreamNameOrder {
-    type Policy = RawRecords;
+impl BioOrder for DownstreamNameOrder {
+    type Input = SeqRecord;
 }
+
+impl CompatibleWith<DryIceCodec> for DownstreamNameOrder {}
 
 #[test]
 fn downstream_non_copy_order_and_chunk_sorter_work_with_owned_and_arena_storage() {

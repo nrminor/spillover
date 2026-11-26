@@ -20,6 +20,50 @@ use spillover::sorter::{
     Buffer, BufferMemory, ChunkBuffer, EstimateBufferMemory, ProjectBufferMemory,
 };
 
+/// Two caller-supplied mates kept together in R1, R2 order.
+///
+/// Construction does not check biological identity or discover missing mates.
+#[derive(Debug, Clone, PartialEq, Eq, GetSize)]
+pub struct ReadPair<R> {
+    r1: R,
+    r2: R,
+}
+
+impl<R> ReadPair<R> {
+    /// Assemble two mates without validation.
+    #[must_use]
+    pub fn from_mates(r1: R, r2: R) -> Self {
+        Self { r1, r2 }
+    }
+
+    /// Borrow the first mate.
+    #[must_use]
+    pub fn r1(&self) -> &R {
+        &self.r1
+    }
+
+    /// Borrow the second mate.
+    #[must_use]
+    pub fn r2(&self) -> &R {
+        &self.r2
+    }
+
+    /// Recover both mates in their original order.
+    #[must_use]
+    pub fn into_mates(self) -> (R, R) {
+        (self.r1, self.r2)
+    }
+
+    /// Validate this pair using application-defined rules.
+    ///
+    /// # Errors
+    ///
+    /// Returns the error produced by the supplied validator.
+    pub fn validate_with<E>(&self, validate: impl FnOnce(&Self) -> Result<(), E>) -> Result<(), E> {
+        validate(self)
+    }
+}
+
 /// Read-only access to sequence record fields.
 ///
 /// This trait lets generic code work with both owned records and
