@@ -21,8 +21,9 @@ buffers.
 
 Finished output supports owned iteration or borrowed
 `output.items().try_for_each(...)` traversal. Both share adjacent deduplication
-history. Custom orders implement Core's comparison/key traits, designate one owned
-input with `BioOrder`, and grant `CompatibleWith<C>` for supported base codecs.
+history. Custom orders implement Core's comparison/key traits and grant
+`CompatibleWith<C>` with an owned input for each supported base codec or
+`sort::in_memory::InMemory` configuration.
 Custom chunk sorters implement Core's algorithm traits directly.
 
 Whole read pairs use the same builder and sorting lifecycle:
@@ -73,17 +74,16 @@ both owned mates plus block buffers; the measured active-window budget is not a
 process-RSS limit.
 
 For custom orders migrating from `OrderCodecPolicy`, replace the policy declaration
-with an owned-input declaration and explicit codec grants:
+with explicit configuration grants:
 
 ```rust
-impl BioOrder for MyOrder {
+impl CompatibleWith<DryIceCodec> for MyOrder {
     type Input = SeqRecord; // or ReadPair<SeqRecord>
 }
-impl CompatibleWith<DryIceCodec> for MyOrder {}
 ```
 
 The default `DryIceCodec` grant accepts raw encodings only. Changing encodings
-does not change the owned input. Extensions must establish ordering coherence
+may use a separately declared owned input. Extensions must establish ordering coherence
 through encoding and repeated merges; a grant does not prove it.
 Default output now carries core `NoDedup`; selecting a dedup method changes the
 builder/output type to `RecordDedup`. Ordinary method chains retain their

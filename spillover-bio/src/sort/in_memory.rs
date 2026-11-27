@@ -115,10 +115,10 @@
 //! ```
 
 use super::{
-    ArenaStorage, BioOrder, ILLUMINA_ORDER, ILLUMINA_PAIR_ORDER, LENGTH_ORDER, LONG_READ_ORDER,
-    LengthOrder, NAME_ORDER, NameOrder, OwnedStorage, PAIR_NAME_ORDER, PAIR_SEQUENCE_EXACT_ORDER,
-    PAIRED_END_ORDER, PairNameOrder, PairSequenceExactOrder, PairSequenceOrder, RecordDedup,
-    SequenceOrder, UnkeyedSequenceOrder,
+    ArenaStorage, CompatibleWith, ILLUMINA_ORDER, ILLUMINA_PAIR_ORDER, LENGTH_ORDER,
+    LONG_READ_ORDER, LengthOrder, NAME_ORDER, NameOrder, OwnedStorage, PAIR_NAME_ORDER,
+    PAIR_SEQUENCE_EXACT_ORDER, PAIRED_END_ORDER, PairNameOrder, PairSequenceExactOrder,
+    PairSequenceOrder, RecordDedup, SequenceOrder, UnkeyedSequenceOrder,
 };
 use crate::{
     radix::RadixThenRefine,
@@ -130,6 +130,10 @@ use spillover::{
     dedup::{AdjacentDeduplicator, NoDedup},
     sorter::in_memory as core,
 };
+
+/// Configuration marker for empty memory-only sorter construction.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct InMemory;
 
 /// Configure a memory-only sorter or sort an existing collection.
 pub struct Builder<O = (), D = NoDedup, CS = Sequential, S = OwnedStorage> {
@@ -156,7 +160,7 @@ impl Default for Builder {
 
 impl<D, CS, S> Builder<(), D, CS, S> {
     /// Select an order. Collections only require [`Compare`]; `build` also
-    /// uses [`BioOrder`] to infer the owned input.
+    /// uses [`CompatibleWith<InMemory>`] to infer the owned input.
     #[must_use]
     pub fn sort_by<O>(self, order: O) -> Builder<O, D, CS, S> {
         Builder {
@@ -322,7 +326,7 @@ impl<O, CS> Builder<O, NoDedup, CS> {
 
 impl<O, D, CS> Builder<O, D, CS>
 where
-    O: BioOrder + Compare<O::Input>,
+    O: CompatibleWith<InMemory> + Compare<O::Input>,
     D: AdjacentDeduplicator<O::Input>,
     CS: ChunkSorter<O::Input, O>,
 {
@@ -335,7 +339,7 @@ where
 
 impl<'a, O, D, CS> Builder<O, D, CS, ArenaStorage<'a>>
 where
-    O: BioOrder<Input = SeqRecord> + Compare<SeqRecordView<'a>>,
+    O: CompatibleWith<InMemory, Input = SeqRecord> + Compare<SeqRecordView<'a>>,
     CS: ChunkSorter<SeqRecordView<'a>, O>,
     D: AdjacentDeduplicator<SeqRecordView<'a>>,
 {

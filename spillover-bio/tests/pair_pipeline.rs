@@ -8,9 +8,8 @@ use spillover_bio::{
     codec::DryIceCodec,
     record::{ReadPair, SeqRecord, SeqRecordParts},
     sort::{
-        BioOrder, Builder, CompatibleWith, ILLUMINA_250_PAIR_ORDER, ILLUMINA_PAIR_ORDER,
-        PAIR_LENGTHS_ORDER, PAIR_NAME_ORDER, PAIR_QUALITY_ORDER, PAIR_SEQUENCE_EXACT_ORDER,
-        Reverse,
+        Builder, CompatibleWith, ILLUMINA_250_PAIR_ORDER, ILLUMINA_PAIR_ORDER, PAIR_LENGTHS_ORDER,
+        PAIR_NAME_ORDER, PAIR_QUALITY_ORDER, PAIR_SEQUENCE_EXACT_ORDER, Reverse,
     },
 };
 
@@ -93,11 +92,9 @@ impl<R: SeqRecordParts> Compare<ReadPair<R>> for PairTotalLength {
     }
 }
 
-impl BioOrder for PairTotalLength {
+impl CompatibleWith<DryIceCodec> for PairTotalLength {
     type Input = ReadPair<SeqRecord>;
 }
-
-impl CompatibleWith<DryIceCodec> for PairTotalLength {}
 
 #[test]
 fn built_in_orders_survive_multi_pass_merge() -> TestResult {
@@ -303,18 +300,14 @@ impl<R: SeqRecordParts + ?Sized> Compare<R> for ExactEncodedLength {
     }
 }
 
-impl BioOrder for ExactEncodedLength {
+// Deliberately no raw-codec grant: explicit configuration must stand alone.
+impl CompatibleWith<DryIceCodec<dryice::TwoBitExactCodec>> for ExactEncodedLength {
     type Input = SeqRecord;
 }
 
-// Deliberately no raw-codec grant: explicit configuration must stand alone.
-impl CompatibleWith<DryIceCodec<dryice::TwoBitExactCodec>> for ExactEncodedLength {}
-
 fn build_generic_pair_order<O>(order: O)
 where
-    O: BioOrder<Input = ReadPair<SeqRecord>>
-        + CompatibleWith<DryIceCodec>
-        + Compare<ReadPair<SeqRecord>>,
+    O: CompatibleWith<DryIceCodec, Input = ReadPair<SeqRecord>> + Compare<ReadPair<SeqRecord>>,
 {
     let _sorter = Builder::new()
         .sort_by_unkeyed(order)
@@ -333,6 +326,9 @@ fn standalone_build_infers_input_without_push_or_output_annotations() {
     let _reverse_custom = Builder::new()
         .sort_by_unkeyed(Reverse(PairTotalLength))
         .build();
+    let _nested_reverse = Builder::new()
+        .sort_by_unkeyed(Reverse(Reverse(PairTotalLength)))
+        .build();
     let _explicit_only = Builder::new()
         .sort_by_unkeyed(ExactEncodedLength)
         .codec(DryIceCodec::new().two_bit_exact())
@@ -343,4 +339,5 @@ fn standalone_build_infers_input_without_push_or_output_annotations() {
         .build();
     build_generic_pair_order(PairTotalLength);
     build_generic_pair_order(Reverse(PairTotalLength));
+    build_generic_pair_order(Reverse(Reverse(PairTotalLength)));
 }

@@ -1,12 +1,15 @@
-use std::{cmp::Ordering, convert::Infallible};
+use std::{cmp::Ordering, convert::Infallible, io::Read};
 
+use dryice::{NameCodec, QualityCodec, SequenceCodec};
 use spillover::{SortedItemsError, compare::Compare};
 use spillover_bio::{
+    codec::{DecodedRecord, DryIceCodec},
     record::{ReadPair, SeqRecord, SeqRecordArena, SeqRecordParts},
     sort::{
-        BioOrder, ILLUMINA_ORDER, ILLUMINA_PAIR_ORDER, LENGTH_ORDER, LONG_READ_ORDER, NAME_ORDER,
-        PAIR_NAME_ORDER, PAIR_SEQUENCE_EXACT_ORDER, PAIRED_END_ORDER, UnkeyedSequenceOrder,
-        in_memory::Builder,
+        Builder as ExternalBuilder, CompatibleWith, ILLUMINA_ORDER, ILLUMINA_PAIR_ORDER,
+        LENGTH_ORDER, LONG_READ_ORDER, NAME_ORDER, PAIR_NAME_ORDER, PAIR_SEQUENCE_EXACT_ORDER,
+        PAIRED_END_ORDER, Reverse, UnkeyedSequenceOrder,
+        in_memory::{Builder, InMemory},
     },
 };
 
@@ -178,8 +181,95 @@ impl<R: SeqRecordParts> Compare<R> for ByLength {
         a.sequence().len().cmp(&b.sequence().len())
     }
 }
-impl BioOrder for ByLength {
+impl CompatibleWith<InMemory> for ByLength {
     type Input = SeqRecord;
+}
+
+struct ConfigurationNameOrder;
+
+impl Compare<SeqRecord> for ConfigurationNameOrder {
+    fn compare(&self, left: &SeqRecord, right: &SeqRecord) -> Ordering {
+        NAME_ORDER.compare(left, right)
+    }
+}
+
+impl<R: Read, S: SequenceCodec, Q: QualityCodec, N: NameCodec, K>
+    Compare<DecodedRecord<R, S, Q, N, K>> for ConfigurationNameOrder
+{
+    fn compare(
+        &self,
+        left: &DecodedRecord<R, S, Q, N, K>,
+        right: &DecodedRecord<R, S, Q, N, K>,
+    ) -> Ordering {
+        NAME_ORDER.compare(left, right)
+    }
+}
+
+impl Compare<ReadPair<SeqRecord>> for ConfigurationNameOrder {
+    fn compare(&self, left: &ReadPair<SeqRecord>, right: &ReadPair<SeqRecord>) -> Ordering {
+        PAIR_NAME_ORDER.compare(left, right)
+    }
+}
+
+impl CompatibleWith<DryIceCodec> for ConfigurationNameOrder {
+    type Input = SeqRecord;
+}
+
+impl CompatibleWith<InMemory> for ConfigurationNameOrder {
+    type Input = ReadPair<SeqRecord>;
+}
+
+#[test]
+fn same_order_infers_single_external_reads_and_intact_memory_pairs() {
+    // These independent builds have no later pushes to supply an input type.
+    let _external = ExternalBuilder::new()
+        .sort_by_unkeyed(ConfigurationNameOrder)
+        .codec(DryIceCodec::new())
+        .max_buffer_items(1)
+        .build();
+    let _memory = Builder::new().sort_by(ConfigurationNameOrder).build();
+
+    let mut external = ExternalBuilder::new()
+        .sort_by_unkeyed(ConfigurationNameOrder)
+        .codec(DryIceCodec::new())
+        .max_buffer_items(1)
+        .build();
+    external.push(read("c", "G")).expect("push c");
+    external.push(read("a", "T")).expect("push a");
+    external.push(read("b", "A")).expect("push b");
+    let reads: Vec<_> = external
+        .finish()
+        .expect("finish external sort")
+        .collect::<Result<_, _>>()
+        .expect("decode reads");
+    assert_eq!(reads, [read("a", "T"), read("b", "A"), read("c", "G")]);
+
+    let mut memory = Builder::new().sort_by(ConfigurationNameOrder).build();
+    memory.push(ReadPair::from_mates(
+        SeqRecord::new("b/1", "AC", "!#"),
+        SeqRecord::new("b/2", "TG", "$%"),
+    ));
+    memory.push(ReadPair::from_mates(
+        SeqRecord::new("a/1", "GT", "&'"),
+        SeqRecord::new("a/2", "CA", "()"),
+    ));
+    let pairs: Vec<_> = memory
+        .finish()
+        .collect::<Result<_, _>>()
+        .expect("infallible memory sort");
+    assert_eq!(
+        pairs,
+        [
+            ReadPair::from_mates(
+                SeqRecord::new("a/1", "GT", "&'"),
+                SeqRecord::new("a/2", "CA", "()"),
+            ),
+            ReadPair::from_mates(
+                SeqRecord::new("b/1", "AC", "!#"),
+                SeqRecord::new("b/2", "TG", "$%"),
+            ),
+        ]
+    );
 }
 
 struct Tagged {
@@ -191,6 +281,25 @@ impl Compare<Tagged> for ByTag {
     fn compare(&self, a: &Tagged, b: &Tagged) -> Ordering {
         a.annotation.cmp(&b.annotation)
     }
+}
+
+fn build_generic_memory_order<O>(order: O)
+where
+    O: CompatibleWith<InMemory, Input = SeqRecord> + Compare<SeqRecord>,
+{
+    let _sorter = Builder::new().sort_by(order).build();
+}
+
+#[test]
+fn empty_builds_infer_inputs_for_custom_and_wrapped_orders() {
+    let _single = Builder::new().sort_by_name().build();
+    let _pair = Builder::new().sort_by_illumina_pairs().build();
+    let _custom = Builder::new().sort_by(ByLength).build();
+    let _nested_reverse = Builder::new().sort_by(Reverse(Reverse(ByLength))).build();
+    build_generic_memory_order(ByLength);
+    build_generic_memory_order(Reverse(Reverse(ByLength)));
+    let mut arena = SeqRecordArena::new();
+    let _arena = Builder::new().sort_by(ByLength).arena(&mut arena).build();
 }
 
 #[test]
@@ -220,6 +329,8 @@ fn extensions_and_non_clone_metadata_need_no_codec() {
     Builder::new().sort_by(ByTag).sort_vec(&mut items);
     assert_eq!(items[0].record.name(), b"a");
     assert_eq!(items[1].annotation, "z");
+    Builder::new().sort_by(ByTag).sort_slice(&mut items);
+    let _sorter = Builder::new().sort_by(ByTag).build_from(items);
 }
 
 #[test]
