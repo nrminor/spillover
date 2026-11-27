@@ -1,4 +1,4 @@
-use spillover_bio::{codec::DryIceCodec, record::SeqRecord, sort::Builder};
+use spillover_bio::{Builder, DryIceCodec, SeqRecord};
 
 fn rec(name: &str, seq: &str, qual: &str) -> SeqRecord {
     SeqRecord::new(name.as_bytes(), seq.as_bytes(), qual.as_bytes())

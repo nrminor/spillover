@@ -1,6 +1,8 @@
 # spillover
 
 `spillover` is a generic Rust crate for building disk-spilling (external) sort pipelines for datasets that do not fit in memory.
+Start with root `Builder` for disk-spilling sorting, or `InMemoryBuilder` when the
+entire input fits in memory. Extension protocols remain in their modules.
 
 It provides reusable sorting primitives and lets you plug in your own:
 

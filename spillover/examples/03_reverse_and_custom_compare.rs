@@ -5,9 +5,9 @@ use std::{
 };
 
 use spillover::{
+    Builder, Reverse,
     codec::{CodecWriter, DecodeRun, EncodeRun},
-    compare::{Compare, Reverse},
-    sorter::Builder,
+    compare::Compare,
 };
 
 #[derive(Clone, Copy)]

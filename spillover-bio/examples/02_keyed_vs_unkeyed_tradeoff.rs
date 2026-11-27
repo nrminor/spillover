@@ -1,6 +1,6 @@
 use std::time::Instant;
 
-use spillover_bio::{codec::DryIceCodec, record::SeqRecord, sort::Builder};
+use spillover_bio::{Builder, DryIceCodec, SeqRecord};
 
 fn generate_records(count: usize, len: usize) -> Vec<SeqRecord> {
     let mut seed: u64 = 0xD0E5_F17E_CAFE_BABE;

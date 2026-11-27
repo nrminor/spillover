@@ -1,7 +1,6 @@
 use spillover_bio::{
-    codec::DryIceCodec,
-    record::SeqRecord,
-    sort::{Builder, ILLUMINA_ORDER, Reverse},
+    Builder, DryIceCodec, SeqRecord,
+    sort::{ILLUMINA_ORDER, Reverse},
 };
 
 fn rec(name: &str, seq: &str, qual: &str) -> SeqRecord {

@@ -99,7 +99,7 @@ impl<R: ?Sized> AdjacentDeduplicator<R> for NoDedup {
 /// order. For direct use, pass this algorithm to [`Deduplicated::new`]:
 ///
 /// ```
-/// use spillover::dedup::{AdjacentDedup, Deduplicated};
+/// use spillover::{dedup::Deduplicated, AdjacentDedup};
 /// let source = [Ok::<_, std::convert::Infallible>(1), Ok(1), Ok(2)].into_iter();
 /// let algorithm = AdjacentDedup::new(|a: &i32, b: &i32| a == b);
 /// let output: Vec<_> = Deduplicated::new(source, Some(algorithm))

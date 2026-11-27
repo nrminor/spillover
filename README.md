@@ -6,7 +6,7 @@
 
 ## Overview
 
-`spillover` is a generic Rust library for building external (disk-spilling) sort pipelines.
+`spillover` is a generic Rust library for building external (disk-spilling) sort pipelines, with an explicit in-memory alternative for inputs that fit.
 
 The core crate is intentionally unopinionated: it knows how to spill sorted runs to disk and merge them back, but leaves domain behavior to user-provided traits. You can plug in your own implementations for:
 
@@ -24,7 +24,7 @@ That said, `spillover-bio` is still extensible: users can configure dryice encod
 Here is a small `spillover-bio` quickstart:
 
 ```rust
-use spillover_bio::{codec::DryIceCodec, record::SeqRecord, sort::Builder};
+use spillover_bio::{Builder, DryIceCodec, SeqRecord};
 
 fn rec(name: &str, seq: &str, qual: &str) -> SeqRecord {
     SeqRecord::new(
@@ -100,7 +100,7 @@ mise run check
 
 ## Concepts & Architecture
 
-At a high level, both crates follow the same pipeline:
+At a high level, the disk-spilling pipeline in both crates follows these steps:
 
 1. collect records into an in-memory buffer
 2. sort the buffer using the selected key/comparator/chunk sorter

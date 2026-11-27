@@ -1,9 +1,9 @@
 use std::io::{BufRead, BufReader, BufWriter, Write};
 
 use spillover::{
+    Builder,
     codec::{CodecWriter, DecodeRun, EncodeRun},
     key::Owned,
-    sorter::Builder,
 };
 
 #[derive(Debug, Clone)]

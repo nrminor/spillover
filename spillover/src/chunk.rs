@@ -31,7 +31,7 @@ use rayon::prelude::*;
 /// equal-key groups, `cmp` must be used to refine those groups.
 ///
 /// ```
-/// use spillover::chunk::{ChunkSorter, Sequential};
+/// use spillover::{chunk::ChunkSorter, Sequential};
 ///
 /// let mut data = vec![3, 1, 4, 1, 5];
 /// Sequential.sort(&mut data, &spillover::compare::Natural);
@@ -144,7 +144,7 @@ pub trait SummarizeSortInput<T: ?Sized>: SortMemorySummary {
 /// pushes memory limits.
 ///
 /// ```
-/// use spillover::chunk::{ChunkSorter, Sequential};
+/// use spillover::{chunk::ChunkSorter, Sequential};
 ///
 /// let mut data = vec!["banana", "apple", "cherry"];
 /// Sequential.sort(&mut data, &spillover::compare::Natural);

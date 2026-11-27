@@ -1,9 +1,7 @@
 use std::io::{self, Write};
 
 use spillover_bio::{
-    codec::DryIceCodec,
-    record::{SeqRecordArena, SeqRecordParts, SeqRecordView},
-    sort::{Builder, SeqRecordSink},
+    Builder, DryIceCodec, SeqRecordArena, SeqRecordParts, SeqRecordSink, SeqRecordView,
 };
 
 struct ParserRecord<'a> {

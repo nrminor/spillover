@@ -10,9 +10,9 @@
 //!   stored alongside records, key-first merge comparison with
 //!   full-record fallback when keys tie).
 //!
-//! Both are `Copy` configuration markers — stateful writers and
-//! cursors are created by the merge engine as needed. Thin newtype
-//! adapters bridge dryice's types to spillover's traits.
+//! These base codecs are `Copy` configuration markers. Pair sorting wraps
+//! them with pair framing: the adapters encode and decode both mates together.
+//! Stateful writers and cursors are created by the merge engine as needed.
 
 use std::{
     io::{Read, Write},
@@ -52,7 +52,7 @@ type KeyedCodecMarker<S, Q, N, K> = PhantomData<fn() -> (S, Q, N, K)>;
 /// (uncompressed) codecs.
 ///
 /// ```ignore
-/// use spillover_bio::codec::DryIceCodec;
+/// use spillover_bio::DryIceCodec;
 /// use dryice::{TwoBitExactCodec, BinnedQualityCodec, SplitNameCodec};
 ///
 /// let codec = DryIceCodec::new()

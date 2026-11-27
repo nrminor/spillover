@@ -6,8 +6,7 @@
 use std::{convert::Infallible, error::Error};
 
 use spillover_bio::{
-    record::{ReadPair, SeqRecord, SeqRecordArena, SeqRecordParts},
-    sort::in_memory::Builder,
+    InMemoryBuilder as Builder, ReadPair, SeqRecord, SeqRecordArena, SeqRecordParts,
 };
 
 fn show(record: &impl SeqRecordParts) {

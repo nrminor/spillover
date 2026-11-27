@@ -131,9 +131,8 @@ mod sealed {
 /// use std::cmp::Ordering;
 /// use spillover::compare::Compare;
 /// use spillover_bio::{
-///     codec::DryIceCodec,
-///     record::{SeqRecord, SeqRecordParts},
-///     sort::{Builder, CompatibleWith},
+///     sort::CompatibleWith,
+///     Builder, DryIceCodec, SeqRecord, SeqRecordParts,
 /// };
 ///
 /// struct QualityThenName;
@@ -171,9 +170,8 @@ mod sealed {
 /// use std::cmp::Ordering;
 /// use spillover::compare::Compare;
 /// use spillover_bio::{
-///     codec::DryIceCodec,
-///     record::{SeqRecord, SeqRecordParts},
-///     sort::{Builder, CompatibleWith},
+///     sort::CompatibleWith,
+///     Builder, DryIceCodec, SeqRecord, SeqRecordParts,
 /// };
 ///
 /// struct ByName;
@@ -198,7 +196,7 @@ mod sealed {
 /// ```compile_fail
 /// # use std::cmp::Ordering;
 /// # use spillover::compare::Compare;
-/// # use spillover_bio::{codec::DryIceCodec, record::{SeqRecord, SeqRecordParts}, sort::{Builder, CompatibleWith}};
+/// # use spillover_bio::{sort::CompatibleWith, Builder, DryIceCodec, SeqRecord, SeqRecordParts};
 /// # struct ByName;
 /// # impl<R: SeqRecordParts + ?Sized> Compare<R> for ByName {
 /// #     fn compare(&self, left: &R, right: &R) -> Ordering { left.name().cmp(right.name()) }
@@ -215,7 +213,7 @@ mod sealed {
 /// ```compile_fail
 /// # use std::cmp::Ordering;
 /// # use spillover::compare::Compare;
-/// # use spillover_bio::{codec::DryIceCodec, record::{SeqRecord, SeqRecordParts}, sort::{Builder, CompatibleWith}};
+/// # use spillover_bio::{sort::CompatibleWith, Builder, DryIceCodec, SeqRecord, SeqRecordParts};
 /// # struct ByName;
 /// # impl<R: SeqRecordParts + ?Sized> Compare<R> for ByName {
 /// #     fn compare(&self, left: &R, right: &R) -> Ordering { left.name().cmp(right.name()) }
@@ -743,33 +741,33 @@ impl<K, S, Q, N> RunShape<KeyedDryIceCodec<K, S, Q, N>, NoDedup> for ReadPair<Se
 /// configuration order:
 ///
 /// ```compile_fail
-/// use spillover_bio::sort::Builder;
+/// use spillover_bio::Builder;
 /// let _sorter = Builder::new().dedup_by_name().sort_by_pair_name().build();
 /// ```
 ///
 /// ```compile_fail
-/// use spillover_bio::sort::Builder;
+/// use spillover_bio::Builder;
 /// let _sorter = Builder::new().sort_by_pair_name().dedup_by_name().build();
 /// ```
 ///
 /// ```compile_fail
-/// use spillover_bio::sort::Builder;
+/// use spillover_bio::Builder;
 /// let _sorter = Builder::new().dedup_by_sequence().sort_by_illumina_pairs().build();
 /// ```
 ///
 /// ```compile_fail
-/// use spillover_bio::sort::Builder;
+/// use spillover_bio::Builder;
 /// let _sorter = Builder::new().sort_by_illumina_pairs().dedup_by_sequence_and_quality().build();
 /// ```
 ///
 /// ```compile_fail
-/// use spillover_bio::{record::SeqRecordArena, sort::Builder};
+/// use spillover_bio::{Builder, SeqRecordArena};
 /// let mut arena = SeqRecordArena::new();
 /// let _sorter = Builder::new().arena(&mut arena).sort_by_pair_name().build();
 /// ```
 ///
 /// ```compile_fail
-/// use spillover_bio::{record::SeqRecordArena, sort::Builder};
+/// use spillover_bio::{Builder, SeqRecordArena};
 /// let mut arena = SeqRecordArena::new();
 /// let _sorter = Builder::new().sort_by_illumina_pairs().arena(&mut arena).build();
 /// ```
@@ -777,7 +775,7 @@ impl<K, S, Q, N> RunShape<KeyedDryIceCodec<K, S, Q, N>, NoDedup> for ReadPair<Se
 /// Pair input cannot be replaced by a single read:
 ///
 /// ```compile_fail
-/// use spillover_bio::{record::SeqRecord, sort::Builder};
+/// use spillover_bio::{Builder, SeqRecord};
 /// let mut sorter = Builder::new().sort_by_pair_name().build();
 /// sorter.push(SeqRecord::new(b"r1", b"A", b"!")).unwrap();
 /// ```
@@ -785,7 +783,7 @@ impl<K, S, Q, N> RunShape<KeyedDryIceCodec<K, S, Q, N>, NoDedup> for ReadPair<Se
 /// Built-in pair orders initially require raw encodings for all fields:
 ///
 /// ```compile_fail
-/// use spillover_bio::{codec::DryIceCodec, sort::Builder};
+/// use spillover_bio::{Builder, DryIceCodec};
 /// let codec = DryIceCodec::new().omit_quality();
 /// let _sorter = Builder::new().sort_by_pair_sequence_exact().codec(codec).build();
 /// ```
@@ -949,7 +947,7 @@ impl<C, L, CS, D, S> Builder<CoreBuilder<CoreNeedsOrder, L, CS, D>, C, S> {
     /// compatible with exact raw sequence ordering.
     ///
     /// ```compile_fail
-    /// use spillover_bio::{codec::DryIceCodec, sort::Builder};
+    /// use spillover_bio::{Builder, DryIceCodec};
     ///
     /// let codec = DryIceCodec::new().two_bit_lossy_n();
     /// let _sorter = Builder::new().sort_by_sequence_exact().codec(codec).build();
@@ -1055,7 +1053,7 @@ impl<SK, C, L, CS, D, S, M> Builder<CoreBuilder<SK, L, CS, D>, C, S, M> {
     ///
     /// ```compile_fail
     /// use spillover::{chunk::ChunkSorter, compare::Compare};
-    /// use spillover_bio::sort::Builder;
+    /// use spillover_bio::Builder;
     ///
     /// struct CountOnly;
     /// impl<T, O: Compare<T>> ChunkSorter<T, O> for CountOnly {

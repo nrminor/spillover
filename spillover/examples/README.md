@@ -1,6 +1,9 @@
 # spillover examples
 
 These examples focus on the generic `spillover` crate and show how to compose sort keys, comparators, codecs, dedup strategies, and merge controls.
+Application entry points such as `Builder`, `Natural`, and `MergeConfig` are
+imported from the crate root; extension protocols stay in their modules.
+Use `InMemoryBuilder` instead when the complete input fits in memory.
 
 - [`01_basic_u64_sort.rs`](./01_basic_u64_sort.rs): minimal external sort over `u64` values using the complete `Natural` order and a tiny binary codec.
 - [`02_custom_record_and_sort_key.rs`](./02_custom_record_and_sort_key.rs): sorting a custom record type with an owned tuple sort key.

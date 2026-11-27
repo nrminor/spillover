@@ -8,7 +8,7 @@
 //! Sort a collection in place, or build a sorter to accept records incrementally:
 //!
 //! ```
-//! use spillover_bio::{record::SeqRecord, sort::in_memory::Builder};
+//! use spillover_bio::{InMemoryBuilder as Builder, SeqRecord};
 //! let mut reads = vec![SeqRecord::new("b", "C", "!"), SeqRecord::new("a", "A", "!")];
 //! Builder::new().sort_by_name().sort_slice(&mut reads);
 //! assert_eq!(reads[0].name(), b"a");
@@ -22,7 +22,7 @@
 //! matches consecutive. `sort_vec` compacts in place; slices cannot shrink:
 //!
 //! ```compile_fail
-//! use spillover_bio::{record::SeqRecord, sort::in_memory::Builder};
+//! use spillover_bio::{InMemoryBuilder as Builder, SeqRecord};
 //! let mut reads: Vec<SeqRecord> = Vec::new();
 //! Builder::new().sort_by_name().dedup_by_name().sort_slice(&mut reads);
 //! ```
@@ -36,7 +36,7 @@
 //!
 //! ```
 //! use std::convert::Infallible;
-//! use spillover_bio::{record::{SeqRecord, SeqRecordArena}, sort::in_memory::Builder};
+//! use spillover_bio::{InMemoryBuilder as Builder, SeqRecord, SeqRecordArena};
 //! let mut arena = SeqRecordArena::new();
 //! let mut sorter = Builder::new().sort_by_name().arena(&mut arena).build();
 //! sorter.push(&SeqRecord::new("a", "A", "!"));
@@ -52,7 +52,7 @@
 //! borrows held by views that escaped it:
 //!
 //! ```compile_fail
-//! use spillover_bio::{record::{SeqRecord, SeqRecordArena}, sort::in_memory::Builder};
+//! use spillover_bio::{InMemoryBuilder as Builder, SeqRecord, SeqRecordArena};
 //! let mut arena = SeqRecordArena::new();
 //! let mut sorter = Builder::new().sort_by_name().arena(&mut arena).build();
 //! sorter.push(&SeqRecord::new("a", "A", "!"));
@@ -67,7 +67,7 @@
 //!
 //! ```compile_fail
 //! use std::convert::Infallible;
-//! use spillover_bio::{record::{SeqRecord, SeqRecordArena}, sort::in_memory::Builder};
+//! use spillover_bio::{InMemoryBuilder as Builder, SeqRecord, SeqRecordArena};
 //! let mut arena = SeqRecordArena::new();
 //! let mut sorter = Builder::new().sort_by_name().arena(&mut arena).build();
 //! sorter.push(&SeqRecord::new("a", "A", "!"));
@@ -81,7 +81,7 @@
 //! ```
 //!
 //! ```compile_fail
-//! use spillover_bio::{record::SeqRecordArena, sort::in_memory::Builder};
+//! use spillover_bio::{InMemoryBuilder as Builder, SeqRecordArena};
 //! let mut arena = SeqRecordArena::new();
 //! let output = Builder::new().sort_by_name().arena(&mut arena).build().finish();
 //! let next = Builder::new().sort_by_name().arena(&mut arena).build();
@@ -91,26 +91,26 @@
 //! Pairs cannot use arena storage or the built-in single-record deduplicators:
 //!
 //! ```compile_fail
-//! use spillover_bio::{record::SeqRecordArena, sort::in_memory::Builder};
+//! use spillover_bio::{InMemoryBuilder as Builder, SeqRecordArena};
 //! let mut arena = SeqRecordArena::new();
 //! let sorter = Builder::new().sort_by_illumina_pairs().arena(&mut arena).build();
 //! ```
 //! ```compile_fail
-//! use spillover_bio::sort::in_memory::Builder;
+//! use spillover_bio::InMemoryBuilder as Builder;
 //! let sorter = Builder::new().sort_by_illumina_pairs().dedup_by_sequence().build();
 //! ```
 //! Disk settings are not available:
 //! ```compile_fail
-//! use spillover_bio::{codec::DryIceCodec, sort::in_memory::Builder};
+//! use spillover_bio::{DryIceCodec, InMemoryBuilder as Builder};
 //! let sorter = Builder::new().sort_by_name().codec(DryIceCodec::new()).build();
 //! ```
 //! ```compile_fail
-//! use spillover_bio::sort::in_memory::Builder;
+//! use spillover_bio::InMemoryBuilder as Builder;
 //! let sorter = Builder::new().sort_by_name().measured_budget(1024).build();
 //! ```
 //! ```compile_fail
-//! use spillover::{merge::MergeConfig};
-//! use spillover_bio::sort::in_memory::Builder;
+//! use spillover::MergeConfig;
+//! use spillover_bio::InMemoryBuilder as Builder;
 //! let sorter = Builder::new().sort_by_name().merge_config(MergeConfig::default()).build();
 //! ```
 

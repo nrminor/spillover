@@ -1,10 +1,8 @@
 use std::io::{BufReader, BufWriter, Read, Write};
 
 use spillover::{
+    AdjacentDedup, Builder, Natural,
     codec::{CodecWriter, DecodeRun, EncodeRun},
-    compare::Natural,
-    dedup::AdjacentDedup,
-    sorter::Builder,
 };
 
 #[derive(Clone, Copy)]

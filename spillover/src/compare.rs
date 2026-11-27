@@ -24,7 +24,7 @@ use std::{cmp::Ordering, marker::PhantomData};
 /// `[u8]` and `str` directly, which is useful with [`CompareVia`].
 ///
 /// ```
-/// use spillover::compare::{Compare, Natural, Reverse};
+/// use spillover::{compare::Compare, Natural, Reverse};
 ///
 /// assert_eq!(Natural.compare(&1, &2), std::cmp::Ordering::Less);
 /// assert_eq!(Reverse(Natural).compare(&1, &2), std::cmp::Ordering::Greater);
@@ -88,7 +88,7 @@ pub trait Compare<K: ?Sized> {
 /// never need to think about the `Compare` trait at all.
 ///
 /// ```
-/// use spillover::compare::{Compare, Natural};
+/// use spillover::{compare::Compare, Natural};
 ///
 /// // Works with any Ord type.
 /// assert_eq!(Natural.compare(&"apple", &"banana"), std::cmp::Ordering::Less);
@@ -107,7 +107,7 @@ impl<K: Ord + ?Sized> Compare<K> for Natural {
 /// Reverse any comparator's ordering.
 ///
 /// ```
-/// use spillover::compare::{Compare, Natural, Reverse};
+/// use spillover::{compare::Compare, Natural, Reverse};
 ///
 /// let rev = Reverse(Natural);
 /// assert_eq!(rev.compare(&1, &2), std::cmp::Ordering::Greater);
@@ -218,7 +218,7 @@ where
 /// For custom comparators:
 ///
 /// ```
-/// use spillover::compare::{Compare, Reverse, Natural, WithOrd};
+/// use spillover::{compare::{Compare, WithOrd}, Natural, Reverse};
 ///
 /// let a = WithOrd::new(1, Reverse(Natural));
 /// let b = WithOrd::new(2, Reverse(Natural));

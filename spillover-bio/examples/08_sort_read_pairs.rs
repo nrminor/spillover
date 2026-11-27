@@ -4,10 +4,7 @@
 
 use std::error::Error;
 
-use spillover_bio::{
-    record::{ReadPair, SeqRecord},
-    sort::Builder,
-};
+use spillover_bio::{Builder, ReadPair, SeqRecord};
 
 fn main() -> Result<(), Box<dyn Error>> {
     let inputs = [

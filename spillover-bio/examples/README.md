@@ -1,6 +1,9 @@
 # spillover-bio examples
 
 These examples focus on `spillover-bio`'s ready-to-use sorting pipeline for sequence records, including keyed merge acceleration, codec choices, deduplication, and alternate sort orders.
+Application types are imported from the crate root; specialized order
+constants remain in `sort`. `Builder` spills to disk, while
+`InMemoryBuilder` explicitly keeps the input in memory.
 
 - [`01_illumina_quickstart.rs`](./01_illumina_quickstart.rs): default "just sort my reads" flow using `sort_by_illumina()`.
 - [`02_keyed_vs_unkeyed_tradeoff.rs`](./02_keyed_vs_unkeyed_tradeoff.rs): side-by-side accelerated Illumina and exact sequence sorting comparison.

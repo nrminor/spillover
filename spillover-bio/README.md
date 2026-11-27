@@ -10,6 +10,9 @@ It provides a ready-to-use disk-spilling sort pipeline for FASTQ/FASTA-style seq
 - optional adjacent deduplication strategies
 - optional arena-backed ingest for allocation-conscious callers
 
+Use root `Builder` for disk-spilling sorting and `InMemoryBuilder` for an
+entirely in-memory batch. Specialist order and codec protocols live in modules.
+
 Builders return Core sorters configured with Bio's orders, codec compatibility, and
 deduplication. Single-read owned ingress accepts `SeqRecord`; convert borrowed views with
 `.into()` when using that path. For more allocation-sensitive ingestion paths,
@@ -29,10 +32,7 @@ Custom chunk sorters implement Core's algorithm traits directly.
 Whole read pairs use the same builder and sorting lifecycle:
 
 ```rust
-use spillover_bio::{
-    record::{ReadPair, SeqRecord},
-    sort::Builder,
-};
+use spillover_bio::{Builder, ReadPair, SeqRecord};
 
 let mut sorter = Builder::new()
     .sort_by_illumina_pairs()
@@ -73,8 +73,7 @@ but do not establish biological pairing. Each open merge cursor eagerly retains
 both owned mates plus block buffers; the measured active-window budget is not a
 process-RSS limit.
 
-For custom orders migrating from `OrderCodecPolicy`, replace the policy declaration
-with explicit configuration grants:
+Custom orders declare configuration grants for each supported codec:
 
 ```rust
 impl CompatibleWith<DryIceCodec> for MyOrder {

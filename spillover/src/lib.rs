@@ -9,6 +9,9 @@
 //! Domain-specific crates (like `spillover-bio` for genomics) inject
 //! their own implementations of these traits to build a complete
 //! sorting pipeline tailored to their data types and workflows.
+//! [`Builder`] configures the disk-spilling pipeline; [`InMemoryBuilder`]
+//! explicitly selects sorting entirely in memory. Extension protocols remain
+//! available in their respective modules.
 
 pub mod chunk;
 pub mod codec;
@@ -19,6 +22,20 @@ pub mod key;
 pub mod merge;
 pub mod sorter;
 
-pub use error::{SortedItemsError, SpilloverError};
+#[cfg(feature = "rayon")]
+#[doc(inline)]
+pub use chunk::Parallel;
+#[doc(inline)]
+pub use chunk::Sequential;
+#[doc(inline)]
+pub use compare::{Natural, Reverse};
+#[doc(inline)]
+pub use dedup::AdjacentDedup;
+pub use error::SortedItemsError;
 pub use get_size2::GetSize;
-pub use sorter::{Sorted, SortedItems};
+#[doc(inline)]
+pub use merge::{MergeConfig, MergeError};
+#[doc(inline)]
+pub use sorter::in_memory::{Builder as InMemoryBuilder, Sorter as InMemorySorter};
+#[doc(inline)]
+pub use sorter::{Builder, Sorted, SortedItems, Sorter};

@@ -4,13 +4,13 @@ use std::{
 };
 
 use spillover::{
+    Builder,
     codec::{
         Codec, CodecCursor, EncodeKeyedRun, KeyedCodec, KeyedCodecCursor, KeyedCodecWriter,
         TakeOwned,
     },
     compare::Compare,
     key::{DeriveKey, KeyedOrder},
-    sorter::Builder,
 };
 
 #[derive(Clone, Copy)]

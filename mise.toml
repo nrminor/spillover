@@ -12,6 +12,7 @@ run = [
   { task = "fmt-check" },
   { task = "lint" },
   { task = "test" },
+  { task = "doctest" },
   { task = "doc-check" },
 ]
 
@@ -21,6 +22,7 @@ run = [
   { task = "fmt-check" },
   { task = "lint" },
   { task = "test-all" },
+  { task = "doctest" },
   { task = "doc-check" },
 ]
 
@@ -49,6 +51,13 @@ description = "Run tests with uncaptured output"
 interactive = true
 run = "cargo nextest run --all-features --no-capture --no-tests=pass"
 
+[tasks.doctest]
+description = "Run doctests with and without optional features"
+run = [
+  "cargo test --workspace --doc --all-features",
+  "cargo test --workspace --doc --no-default-features",
+]
+
 [tasks.build]
 description = "Build the workspace"
 run = "cargo build"
@@ -70,8 +79,11 @@ description = "Update Cargo dependencies"
 run = "cargo update"
 
 [tasks.doc-check]
-description = "Build documentation without dependencies"
-run = "cargo doc --no-deps --document-private-items"
+description = "Validate public documentation with and without optional features"
+run = [
+  "RUSTDOCFLAGS='-D rustdoc::broken_intra_doc_links -D rustdoc::private_intra_doc_links' cargo doc --workspace --no-deps --all-features",
+  "RUSTDOCFLAGS='-D rustdoc::broken_intra_doc_links -D rustdoc::private_intra_doc_links' cargo doc --workspace --no-deps --no-default-features",
+]
 
 [tasks.doc]
 description = "Build and open documentation"

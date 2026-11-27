@@ -4,7 +4,7 @@
 
 spillover is a Rust workspace for sorting datasets that don't fit in memory. The core `spillover` crate provides a generic external sort engine — it knows nothing about what it's sorting, how to compare items, how to deduplicate them, or how to serialize them to disk. All of those decisions are made by the caller through trait implementations.
 
-`spillover-bio` is the first consumer. It injects genomics-specific opinions: bloom filter dedup, FASTQ/FASTA-compatible record traits, sequence-aware sort keys, and the `dryice` format for temporary on-disk storage. But `spillover` itself must never know about any of this.
+`spillover-bio` is the first consumer. It injects genomics-specific opinions: FASTQ/FASTA-compatible record traits, sequence-aware sort keys, and the `dryice` format for temporary on-disk storage. But `spillover` itself must never know about any of this.
 
 ## Design Philosophy
 

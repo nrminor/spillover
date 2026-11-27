@@ -6,7 +6,7 @@
 //! Deduplication only removes adjacent matches, so the order must group them.
 //!
 //! ```
-//! use spillover::{compare::Natural, dedup::AdjacentDedup, sorter::in_memory::Builder};
+//! use spillover::{AdjacentDedup, InMemoryBuilder as Builder, Natural};
 //!
 //! let mut values = vec![3, 1, 1, 2];
 //! Builder::new().sort_by(Natural)
@@ -146,7 +146,7 @@ impl<O, D, CS> Builder<O, D, CS> {
     /// A live output prevents another build:
     ///
     /// ```compile_fail
-    /// use spillover::{compare::Natural, sorter::{ChunkBuffer, in_memory::Builder}};
+    /// use spillover::{sorter::ChunkBuffer, InMemoryBuilder as Builder, Natural};
     /// struct Arena(Vec<i32>);
     /// impl<'a> ChunkBuffer for &'a mut Arena {
     ///     type Item = &'a i32;
@@ -163,7 +163,7 @@ impl<O, D, CS> Builder<O, D, CS> {
     /// A yielded view can outlive the output and still prevent reuse:
     ///
     /// ```compile_fail
-    /// use spillover::{compare::Natural, sorter::{ChunkBuffer, in_memory::Builder}};
+    /// use spillover::{sorter::ChunkBuffer, InMemoryBuilder as Builder, Natural};
     /// struct Arena(Vec<i32>);
     /// impl<'a> ChunkBuffer for &'a mut Arena {
     ///     type Item = &'a i32;
@@ -199,7 +199,7 @@ impl<O, CS> Builder<O, NoDedup, CS> {
     /// Sort a slice without deduplication. A slice cannot be compacted.
     ///
     /// ```compile_fail
-    /// use spillover::{compare::Natural, dedup::AdjacentDedup, sorter::in_memory::Builder};
+    /// use spillover::{AdjacentDedup, InMemoryBuilder as Builder, Natural};
     /// let mut values = [1, 1];
     /// Builder::new().sort_by(Natural)
     ///     .dedup(AdjacentDedup::new(|a: &i32, b: &i32| a == b))

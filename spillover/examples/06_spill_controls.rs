@@ -4,10 +4,8 @@ use std::{
 };
 
 use spillover::{
+    Builder, MergeConfig, Natural,
     codec::{CodecWriter, DecodeRun, EncodeRun},
-    compare::Natural,
-    merge::MergeConfig,
-    sorter::Builder,
 };
 
 #[derive(Clone, Copy)]
