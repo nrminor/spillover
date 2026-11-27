@@ -3,8 +3,6 @@
 [![CI](https://github.com/nrminor/spillover/actions/workflows/ci.yml/badge.svg)](https://github.com/nrminor/spillover/actions/workflows/ci.yml)
 [![crates.io: spillover](https://img.shields.io/crates/v/spillover.svg)](https://crates.io/crates/spillover)
 [![docs.rs: spillover](https://docs.rs/spillover/badge.svg)](https://docs.rs/spillover)
-[![crates.io: spillover-bio](https://img.shields.io/crates/v/spillover-bio.svg)](https://crates.io/crates/spillover-bio)
-[![docs.rs: spillover-bio](https://docs.rs/spillover-bio/badge.svg)](https://docs.rs/spillover-bio)
 
 ## Overview
 
