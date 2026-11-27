@@ -37,6 +37,7 @@ use crate::{
     record::{ReadPair, SeqRecord, SeqRecordArena, SeqRecordParts, SeqRecordView},
 };
 
+pub mod in_memory;
 mod pair;
 pub use pair::{
     ILLUMINA_250_PAIR_ORDER, ILLUMINA_PAIR_ORDER, PAIR_LENGTHS_ORDER, PAIR_NAME_ORDER,

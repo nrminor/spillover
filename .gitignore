@@ -36,8 +36,12 @@
 !/spillover/src/dedup.rs
 !/spillover/src/merge.rs
 !/spillover/src/sorter.rs
+!/spillover/src/sorter
+!/spillover/src/sorter/in_memory.rs
 !/spillover/tests
 !/spillover/tests/dedup_controls.rs
+!/spillover/tests/in_memory.rs
+!/spillover/tests/in_memory_lifecycle.rs
 !/spillover/examples
 !/spillover/examples/README.md
 !/spillover/examples/01_basic_u64_sort.rs
@@ -62,6 +66,7 @@
 !/spillover-bio/src/sort.rs
 !/spillover-bio/src/sort
 !/spillover-bio/src/sort/pair.rs
+!/spillover-bio/src/sort/in_memory.rs
 !/spillover-bio/src/radix.rs
 !/spillover-bio/tests
 !/spillover-bio/tests/sort_ordering.rs
@@ -69,6 +74,8 @@
 !/spillover-bio/tests/pair_ordering.rs
 !/spillover-bio/tests/pair_codec.rs
 !/spillover-bio/tests/pair_pipeline.rs
+!/spillover-bio/tests/in_memory.rs
+!/spillover-bio/tests/in_memory_lifecycle.rs
 !/spillover-bio/examples
 !/spillover-bio/examples/README.md
 !/spillover-bio/examples/01_illumina_quickstart.rs
@@ -79,6 +86,7 @@
 !/spillover-bio/examples/06_alternate_orders.rs
 !/spillover-bio/examples/07_arena_backed_ingest.rs
 !/spillover-bio/examples/08_sort_read_pairs.rs
+!/spillover-bio/examples/09_in_memory_sorting.rs
 
 # === Allowed: GitHub workflows ===
 !/.github

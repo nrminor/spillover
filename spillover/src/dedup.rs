@@ -172,7 +172,7 @@ impl<S, D> Deduplicated<S, D> {
     }
 }
 
-fn accept<R: ?Sized, D: AdjacentDeduplicator<R>>(
+pub(crate) fn accept<R: ?Sized, D: AdjacentDeduplicator<R>>(
     algorithm: &mut D,
     initialized: &mut bool,
     record: &R,

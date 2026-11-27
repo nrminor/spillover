@@ -16,6 +16,8 @@
 
 use std::{alloc::Layout, fs::File, io::BufReader};
 
+pub mod in_memory;
+
 use get_size2::GetSize;
 
 use crate::{
@@ -2297,10 +2299,11 @@ where
 
 /// Finalized sorted output.
 ///
-/// `Sorted` owns the state needed to produce sorted items after a
-/// [`Sorter`] has been finished. It implements [`Iterator`] for the
-/// owned materialization path, so ordinary collection remains the
-/// primary way to collect sorted output into memory:
+/// `Sorted` owns the state needed to produce sorted items. Iteration yields
+/// the source's item representation: disk-backed sources may materialize owned
+/// records, while in-memory sources move their stored values, which can
+/// themselves borrow storage. Independent owned records must be constructed
+/// explicitly when the item is a borrowed view.
 ///
 /// ```ignore
 /// let items: Vec<_> = sorter.finish()?.collect::<Result<Vec<_>, _>>()?;
@@ -2309,7 +2312,7 @@ pub struct Sorted<I> {
     source: I,
 }
 
-/// Adapter for visiting sorted output items without using the owned
+/// Adapter for visiting sorted output items without using the
 /// [`Iterator`] namespace on [`Sorted`].
 ///
 /// Constructed by [`Sorted::items`]. Like standard iterator adapter structs,
@@ -2358,7 +2361,7 @@ where
     /// Visit every sorted item in order.
     ///
     /// This method lives under the [`Sorted::items`] namespace so it does not
-    /// conflict with owned [`Iterator`] traversal on [`Sorted`].
+    /// conflict with [`Iterator`] traversal on [`Sorted`].
     ///
     /// # Errors
     ///
