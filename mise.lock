@@ -39,6 +39,10 @@ checksum = "sha256:97abf9d55d4b79d3310536d576ccbdf5017aeb425780e850336120b6e6762
 url = "https://github.com/boyter/scc/releases/download/v3.7.0/scc_Windows_x86_64.zip"
 url_api = "https://api.github.com/repos/boyter/scc/releases/assets/367071884"
 
+[[tools."cargo:bacon"]]
+version = "3.24.0"
+backend = "cargo:bacon"
+
 [[tools.git-cliff]]
 version = "2.13.1"
 backend = "aqua:orhun/git-cliff"

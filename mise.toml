@@ -5,6 +5,7 @@ rust = { version = "1.96.0", profile = "minimal", components = ["clippy", "rustf
 "github:nextest-rs/nextest" = { version = "0.9", version_prefix = "cargo-nextest-" }
 "aqua:boyter/scc" = "3"
 git-cliff = "2"
+"cargo:bacon" = "3.24.0"
 
 [tasks.check]
 description = "Run all pre-commit checks"

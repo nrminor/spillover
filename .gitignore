@@ -8,6 +8,7 @@
 !/Cargo.lock
 !/mise.toml
 !/mise.lock
+!/bacon.toml
 !/AGENTS.md
 !/cliff.toml
 !/LICENSE
