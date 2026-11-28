@@ -13,6 +13,7 @@ run = [
   { task = "fmt-check" },
   { task = "lint" },
   { task = "test" },
+  { task = "test-no-default-features" },
   { task = "doctest" },
   { task = "doc-check" },
 ]
@@ -23,6 +24,7 @@ run = [
   { task = "fmt-check" },
   { task = "lint" },
   { task = "test-all" },
+  { task = "test-no-default-features" },
   { task = "doctest" },
   { task = "doc-check" },
 ]
@@ -46,6 +48,10 @@ run = "cargo nextest run --all-features --no-tests=pass"
 [tasks.test-all]
 description = "Run the test suite, including ignored tests"
 run = "cargo nextest run --all-features --run-ignored all --no-tests=pass"
+
+[tasks.test-no-default-features]
+description = "Run runtime tests without optional features"
+run = "cargo nextest run --workspace --no-default-features --no-tests=pass"
 
 [tasks.test-verbose]
 description = "Run tests with uncaptured output"

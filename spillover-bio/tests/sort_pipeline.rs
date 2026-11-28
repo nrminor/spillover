@@ -3,6 +3,7 @@
 use std::{
     cell::Cell,
     cmp::Ordering,
+    collections::{BTreeMap, BTreeSet},
     convert::Infallible,
     io::{self, Read, Write},
     num::NonZeroUsize,
@@ -10,23 +11,28 @@ use std::{
 };
 
 use dryice::SeqRecordLike;
-use spillover::SortedItemsError;
-use spillover::chunk::{
-    ChunkSorter, EstimateSortMemory, Sequential, SortMemory, SortMemorySummary, SummarizeSortInput,
+use proptest::{prelude::*, test_runner::FileFailurePersistence};
+use spillover::{
+    SortedItemsError,
+    chunk::{
+        ChunkSorter, EstimateSortMemory, Sequential, SortMemory, SortMemorySummary,
+        SummarizeSortInput,
+    },
+    codec::{
+        Codec, CodecCursor, CodecWriter, DecodeRun, DeriveKey, EncodeKeyedRun, EncodeRun,
+        KeyedCodec, KeyedCodecCursor, KeyedCodecWriter, TakeOwned,
+    },
+    compare::{Compare, Natural},
+    dedup::{Deduplicated, NoDedup},
+    key::{Keyed, KeyedOrder, Owned, SortKey},
+    merge::{MergeConfig, MergeError, RunMerger},
+    sorter::{ByteLimit, VisitSortedItems},
 };
-use spillover::codec::{
-    Codec, CodecCursor, CodecWriter, DecodeRun, DeriveKey, EncodeKeyedRun, EncodeRun, KeyedCodec,
-    KeyedCodecCursor, KeyedCodecWriter, TakeOwned,
-};
-use spillover::compare::{Compare, Natural};
-use spillover::dedup::{Deduplicated, NoDedup};
-use spillover::key::{Owned, SortKey};
-use spillover::merge::{MergeConfig, MergeError, RunMerger};
-use spillover::sorter::{ByteLimit, VisitSortedItems};
 use spillover_bio::{
-    codec::DryIceCodec,
+    codec::{DryIceCodec, PairCodec},
+    key::PackedSequenceKey,
     radix::RadixThenRefine,
-    record::{SeqRecord, SeqRecordArena, SeqRecordParts, SeqRecordView},
+    record::{ReadPair, SeqRecord, SeqRecordArena, SeqRecordParts, SeqRecordView},
     sort::{
         Builder, CompatibleWith, ILLUMINA_ORDER, LENGTH_ORDER, NAME_ORDER, RecordDedup, Reverse,
         SeqRecordSink, SequenceOrder,
@@ -3356,14 +3362,30 @@ fn sorter_is_send() {
 }
 
 mod proptests {
-    use std::collections::{BTreeMap, BTreeSet};
-
-    use proptest::prelude::*;
-    use proptest::test_runner::FileFailurePersistence;
-
     use super::*;
 
     type RecordFields = (Vec<u8>, Vec<u8>, Vec<u8>);
+    type PairOrderFields = (Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>);
+
+    struct PairNameKey;
+
+    impl KeyedOrder for PairNameKey {
+        type StoredKey = PackedSequenceKey<2>;
+
+        fn compare_keys(&self, left: &Self::StoredKey, right: &Self::StoredKey) -> Ordering {
+            left.cmp(right)
+        }
+    }
+
+    impl spillover::key::DeriveKey<ReadPair<SeqRecord>> for PairNameKey {
+        fn derive_key(&self, pair: &ReadPair<SeqRecord>) -> Self::StoredKey {
+            if pair.r1().name() == b"first" {
+                PackedSequenceKey([0, 0])
+            } else {
+                PackedSequenceKey([64, 0])
+            }
+        }
+    }
 
     fn record_fields(record: &SeqRecord) -> RecordFields {
         (
@@ -3431,6 +3453,24 @@ mod proptests {
                 _ => 0,
             })
             .collect()
+    }
+
+    fn pair_order_fields(pair: &ReadPair<SeqRecord>) -> PairOrderFields {
+        (
+            pair.r1().sequence().to_vec(),
+            pair.r2().sequence().to_vec(),
+            pair.r1().quality().to_vec(),
+            pair.r2().quality().to_vec(),
+            pair.r1().name().to_vec(),
+            pair.r2().name().to_vec(),
+        )
+    }
+
+    fn pair_with_reversed_second_sequence(index: usize, first: &SeqRecord) -> ReadPair<SeqRecord> {
+        let second_sequence: Vec<u8> = first.sequence().iter().rev().copied().collect();
+        let second_name = format!("mate-2-{index}");
+        let second = SeqRecord::new(second_name, second_sequence, first.quality());
+        ReadPair::from_mates(first.clone(), second)
     }
 
     fn records_follow_accelerated_sequence_order(records: &[SeqRecord]) -> bool {
@@ -3698,6 +3738,142 @@ mod proptests {
     }
 
     #[test]
+    fn raw_pair_sort_attempts_spill_when_second_pair_reaches_buffer_limit() {
+        let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("Cargo.toml");
+        let config = {
+            let mut config = MergeConfig::default();
+            config.temp_dir = Some(manifest);
+            config
+        };
+        let mut sorter = Builder::new()
+            .sort_by_illumina_pairs()
+            .codec(DryIceCodec::new())
+            .max_buffer_items(2)
+            .merge_config(config)
+            .build();
+        let pair = ReadPair::from_mates(
+            SeqRecord::new(b"first", b"A", b"!"),
+            SeqRecord::new(b"second", b"C", b"!"),
+        );
+
+        sorter.push(pair.clone()).unwrap_or_else(|error| {
+            panic!("raw accelerated pair sort: admit first pair before limit 2: {error:?}")
+        });
+        let result = sorter.push(pair);
+
+        assert!(
+            matches!(result, Err(MergeError::Io(_))),
+            "raw accelerated pair sort must attempt a spill at the second pair, configured limit 2; got {result:?}"
+        );
+    }
+
+    #[test]
+    fn raw_pair_codec_keeps_distinct_supplied_keys_attached_across_odd_blocks() {
+        let pairs = [
+            ReadPair::from_mates(
+                SeqRecord::new(b"first", b"AA", b"!!"),
+                SeqRecord::new(b"first mate", b"C", b"I"),
+            ),
+            ReadPair::from_mates(
+                SeqRecord::new(b"second", b"C", b"!"),
+                SeqRecord::new(b"second mate", b"GG", b"II"),
+            ),
+        ];
+        let codec = PairCodec::new(DryIceCodec::new().with_block_records(3).with_record_key());
+        let mut bytes = Vec::new();
+        let mut writer = EncodeKeyedRun::<ReadPair<SeqRecord>>::keyed_writer(&codec, &mut bytes);
+
+        for (index, pair) in pairs.iter().enumerate() {
+            let entry = Keyed::derive(pair, &PairNameKey);
+            writer.write_keyed(entry.borrowed()).unwrap_or_else(|error| {
+                panic!("raw keyed pair codec: write pair {index} across three-record blocks: {error:?}")
+            });
+        }
+        KeyedCodecWriter::<ReadPair<SeqRecord>, _>::finish(writer).unwrap_or_else(|error| {
+            panic!("raw keyed pair codec: finalize three-record blocks: {error:?}")
+        });
+        let mut cursor = codec
+            .keyed_cursor(bytes.as_slice())
+            .unwrap_or_else(|error| {
+                panic!("raw keyed pair codec: open three-record blocks: {error:?}")
+            });
+        for (index, expected) in pairs.iter().enumerate() {
+            assert!(
+                cursor.advance().unwrap_or_else(|error| {
+                    panic!("raw keyed pair codec: advance to pair {index}: {error:?}")
+                }),
+                "raw keyed pair codec ended before pair {index}"
+            );
+            let key = cursor.current_key().unwrap_or_else(|error| {
+                panic!("raw keyed pair codec: read key for pair {index}: {error:?}")
+            });
+            let expected_key = if index == 0 { [0, 0] } else { [64, 0] };
+            assert_eq!(
+                key.0, expected_key,
+                "raw keyed pair codec: key for pair {index}"
+            );
+            let pair = cursor
+                .take_owned()
+                .unwrap_or_else(|error| {
+                    panic!("raw keyed pair codec: extract pair {index}: {error:?}")
+                })
+                .unwrap_or_else(|| panic!("raw keyed pair codec: missing current pair {index}"));
+            assert_eq!(
+                pair_order_fields(&pair),
+                pair_order_fields(expected),
+                "raw keyed pair codec: mate fields for pair {index}"
+            );
+        }
+        assert!(!cursor.advance().unwrap_or_else(|error| {
+            panic!("raw keyed pair codec: check end of output: {error:?}")
+        }));
+    }
+
+    #[test]
+    fn raw_name_sort_refines_sixteen_byte_prefixes_and_embedded_zero() {
+        let names: Vec<Vec<u8>> = [15, 16, 17]
+            .into_iter()
+            .map(|length| vec![b'x'; length])
+            .chain([
+                b"xxxxxxxxxxxxxxxx\0z".to_vec(),
+                b"xxxxxxxxxxxxxxxx\0a".to_vec(),
+            ])
+            .collect();
+        let records: Vec<SeqRecord> = names
+            .iter()
+            .map(|name| SeqRecord::new(name, b"A", b"!"))
+            .collect();
+        let mut sorter = Builder::new()
+            .sort_by_name()
+            .codec(DryIceCodec::new())
+            .max_buffer_items(2)
+            .build();
+
+        for (index, record) in records.iter().enumerate() {
+            sorter.push(record.clone()).unwrap_or_else(|error| {
+                panic!(
+                    "raw name sort: admit boundary-name record {index}, spill limit 2: {error:?}"
+                )
+            });
+        }
+        let output = sorter.finish().unwrap_or_else(|error| {
+            panic!("raw name sort: finalize sorter for 15/16/17-byte prefixes, spill limit 2: {error:?}")
+        });
+        let output =
+            collect_decoded_records(output, "raw name sort with boundary prefixes", Some(2));
+
+        assert_eq!(
+            record_multiplicities(&output),
+            record_multiplicities(&records)
+        );
+        assert!(
+            output
+                .windows(2)
+                .all(|pair| pair[0].name() <= pair[1].name())
+        );
+    }
+
+    #[test]
     fn report_codec_order_inversions_and_missed_sequence_duplicates_at_each_spill_limit() {
         for limit in [1, 2, 3] {
             let mut compact = Builder::new()
@@ -3802,13 +3978,16 @@ mod proptests {
     }
 
     proptest! {
-        #![proptest_config(ProptestConfig {
-            cases: 32,
-            max_shrink_iters: 512,
-            failure_persistence: Some(Box::new(FileFailurePersistence::Direct(concat!(
+        #![proptest_config({
+            let mut config = ProptestConfig::default();
+            if std::env::var_os("PROPTEST_CASES").is_none() {
+                config.cases = 32;
+            }
+            config.max_shrink_iters = 512;
+            config.failure_persistence = Some(Box::new(FileFailurePersistence::Direct(concat!(
                 env!("CARGO_MANIFEST_DIR"), "/proptest-regressions/sort_pipeline.txt"
-            )))),
-            ..ProptestConfig::default()
+            ))));
+            config
         })]
 
         #[test]
@@ -3868,6 +4047,226 @@ mod proptests {
             qualities in proptest::collection::vec(any::<u8>(), 17..=17),
         ) {
             merge_single_record_runs_with_raw_codec(&qualities, 4)?;
+        }
+
+        #[test]
+        fn raw_accelerated_sort_preserves_records_across_owned_and_borrowed_output(
+            sequences in generated_sequences_with_mixed_case_and_ambiguity(),
+            limit in 1usize..12,
+            prefix_length in 0usize..18,
+        ) {
+            let records = records_from_sequences(sequences);
+            prop_assert!(records.len() >= 2, "mixed traversal requires at least two input records");
+            let owned_count = 1 + prefix_length % (records.len() - 1);
+
+            let mut sorter = Builder::new()
+                .sort_by_illumina()
+                .codec(DryIceCodec::new())
+                .max_buffer_items(limit)
+                .build();
+
+            for (index, record) in records.iter().enumerate() {
+                sorter.push(record.clone()).unwrap_or_else(|error| {
+                    panic!("raw accelerated owned/borrowed output: admit record {index}, spill limit {limit}: {error:?}")
+                });
+            }
+            let mut output = sorter.finish().unwrap_or_else(|error| {
+                panic!("raw accelerated owned/borrowed output: finalize sorter, spill limit {limit}: {error:?}")
+            });
+            let mut actual = Vec::new();
+            for index in 0..owned_count {
+                let item = output.next().unwrap_or_else(|| {
+                    panic!("raw accelerated owned output ended before record {index}, spill limit {limit}")
+                });
+                let record = item.unwrap_or_else(|error| {
+                    panic!("raw accelerated owned output: decode record {index}, spill limit {limit}: {error:?}")
+                });
+                actual.push(record);
+            }
+            output.items().try_for_each(|record| {
+                actual.push(SeqRecord::new(record.name(), record.sequence(), record.quality()));
+                Ok::<(), Infallible>(())
+            }).unwrap_or_else(|error| {
+                panic!("raw accelerated borrowed output: visit remainder, spill limit {limit}: {error:?}")
+            });
+
+            prop_assert!(record_multiplicities(&actual) == record_multiplicities(&records),
+                "raw accelerated owned/borrowed output changed fields or multiplicities, spill limit {}", limit);
+            prop_assert!(records_follow_accelerated_sequence_order(&actual),
+                "raw accelerated owned/borrowed output is out of order, spill limit {}", limit);
+        }
+
+        #[test]
+        fn raw_arena_copies_reused_source_buffers_and_releases_storage(
+            sequences in generated_sequences_with_mixed_case_and_ambiguity(),
+            limit in 1usize..12,
+        ) {
+            let records = records_from_sequences(sequences);
+            let mut arena = SeqRecordArena::new();
+            let mut sorter = Builder::new()
+                .sort_by_illumina()
+                .codec(DryIceCodec::new())
+                .arena(&mut arena)
+                .max_buffer_items(limit)
+                .build();
+            let mut name = Vec::new();
+            let mut sequence = Vec::new();
+            let mut quality = Vec::new();
+
+            for (index, record) in records.iter().enumerate() {
+                name.clear();
+                sequence.clear();
+                quality.clear();
+                name.extend_from_slice(record.name());
+                sequence.extend_from_slice(record.sequence());
+                quality.extend_from_slice(record.quality());
+                let view = SeqRecordView::new(&name, &sequence, &quality);
+                sorter.push(&view).unwrap_or_else(|error| {
+                    panic!("raw accelerated arena: copy input record {index}, spill limit {limit}: {error:?}")
+                });
+                name.fill(b'X');
+                sequence.fill(b'X');
+                quality.fill(b'X');
+            }
+            let output = sorter.finish().unwrap_or_else(|error| {
+                panic!("raw accelerated arena: finalize sorter, spill limit {limit}: {error:?}")
+            });
+            let actual = collect_decoded_records(output, "raw accelerated arena", Some(limit));
+
+            prop_assert!(arena.is_empty(), "raw accelerated arena retained input bytes, spill limit {}", limit);
+            prop_assert!(record_multiplicities(&actual) == record_multiplicities(&records),
+                "raw accelerated arena changed fields or multiplicities, spill limit {}", limit);
+            prop_assert!(records_follow_accelerated_sequence_order(&actual),
+                "raw accelerated arena output is out of order, spill limit {}", limit);
+        }
+
+        #[test]
+        fn raw_pair_orders_preserve_mates_and_follow_independent_field_order(
+            sequences in generated_sequences_with_mixed_case_and_ambiguity(),
+            limit in 1usize..12,
+        ) {
+            let records = records_from_sequences(sequences);
+            let pairs: Vec<ReadPair<SeqRecord>> = records.iter()
+                .enumerate()
+                .map(|(index, first)| pair_with_reversed_second_sequence(index, first))
+                .collect();
+
+            let mut accelerated = Builder::new()
+                .sort_by_illumina_pairs()
+                .codec(DryIceCodec::new())
+                .max_buffer_items(limit)
+                .build();
+            let mut exact = Builder::new()
+                .sort_by_pair_sequence_exact()
+                .codec(DryIceCodec::new())
+                .max_buffer_items(limit)
+                .build();
+
+            for (index, pair) in pairs.iter().enumerate() {
+                accelerated.push(pair.clone()).unwrap_or_else(|error| {
+                    panic!("raw accelerated pair sort: admit pair {index}, spill limit {limit}: {error:?}")
+                });
+                exact.push(pair.clone()).unwrap_or_else(|error| {
+                    panic!("raw exact pair sort: admit pair {index}, spill limit {limit}: {error:?}")
+                });
+            }
+            let accelerated = accelerated.finish().unwrap_or_else(|error| {
+                panic!("raw accelerated pair sort: finalize sorter, spill limit {limit}: {error:?}")
+            });
+            let accelerated_pairs = {
+                let mut pairs = Vec::new();
+                for (index, item) in accelerated.enumerate() {
+                    let pair = item.unwrap_or_else(|error| {
+                        panic!("raw accelerated pair sort: decode pair {index}, spill limit {limit}: {error:?}")
+                    });
+                    pairs.push(pair);
+                }
+                pairs
+            };
+
+            let exact = exact.finish().unwrap_or_else(|error| {
+                panic!("raw exact pair sort: finalize sorter, spill limit {limit}: {error:?}")
+            });
+            let exact_pairs = {
+                let mut pairs = Vec::new();
+                for (index, item) in exact.enumerate() {
+                    let pair = item.unwrap_or_else(|error| {
+                        panic!("raw exact pair sort: decode pair {index}, spill limit {limit}: {error:?}")
+                    });
+                    pairs.push(pair);
+                }
+                pairs
+            };
+
+            let expected = {
+                let mut fields: Vec<_> = pairs.iter().map(pair_order_fields).collect();
+                fields.sort_unstable();
+                fields
+            };
+            let actual = {
+                let mut fields: Vec<_> = accelerated_pairs.iter().map(pair_order_fields).collect();
+                fields.sort_unstable();
+                fields
+            };
+            let actual_exact = {
+                let mut fields: Vec<_> = exact_pairs.iter().map(pair_order_fields).collect();
+                fields.sort_unstable();
+                fields
+            };
+            prop_assert!(actual == expected && actual_exact == expected,
+                "raw pair sort changed mate fields or multiplicities, spill limit {}", limit);
+            prop_assert!(exact_pairs.windows(2).all(|pair| pair_order_fields(&pair[0]) <= pair_order_fields(&pair[1])),
+                "raw exact pair sort output is out of order, spill limit {}", limit);
+            prop_assert!(accelerated_pairs.windows(2).all(|pair| {
+                (sequence_prefix_ranks(pair[0].r1().sequence()), pair_order_fields(&pair[0]))
+                    <= (sequence_prefix_ranks(pair[1].r1().sequence()), pair_order_fields(&pair[1]))
+            }), "raw accelerated pair sort output is out of order, spill limit {}", limit);
+        }
+
+        #[cfg(feature = "rayon")]
+        #[test]
+        fn sequential_and_parallel_raw_sorts_each_preserve_fields_and_sequence_order(
+            sequences in generated_sequences_with_mixed_case_and_ambiguity(),
+            limit in 1usize..12,
+        ) {
+            let records = records_from_sequences(sequences);
+            let mut sequential = Builder::new()
+                .sort_by_illumina()
+                .codec(DryIceCodec::new())
+                .sort_with_sequential()
+                .max_buffer_items(limit)
+                .build();
+            let mut parallel = Builder::new()
+                .sort_by_illumina()
+                .codec(DryIceCodec::new())
+                .sort_with_parallel()
+                .max_buffer_items(limit)
+                .build();
+
+            for (index, record) in records.iter().enumerate() {
+                sequential.push(record.clone()).unwrap_or_else(|error| {
+                    panic!("raw accelerated sequential sort: admit record {index}, spill limit {limit}: {error:?}")
+                });
+                parallel.push(record.clone()).unwrap_or_else(|error| {
+                    panic!("raw accelerated parallel sort: admit record {index}, spill limit {limit}: {error:?}")
+                });
+            }
+            let sequential = sequential.finish().unwrap_or_else(|error| {
+                panic!("raw accelerated sequential sort: finalize sorter, spill limit {limit}: {error:?}")
+            });
+            let sequential = collect_decoded_records(sequential, "raw accelerated sequential sort", Some(limit));
+            let parallel = parallel.finish().unwrap_or_else(|error| {
+                panic!("raw accelerated parallel sort: finalize sorter, spill limit {limit}: {error:?}")
+            });
+            let parallel = collect_decoded_records(parallel, "raw accelerated parallel sort", Some(limit));
+
+            let expected = record_multiplicities(&records);
+            for (kind, output) in [("sequential", &sequential), ("parallel", &parallel)] {
+                prop_assert!(record_multiplicities(output) == expected,
+                    "raw accelerated {} sort changed fields or multiplicities, spill limit {}", kind, limit);
+                prop_assert!(records_follow_accelerated_sequence_order(output),
+                    "raw accelerated {} output is out of order, spill limit {}", kind, limit);
+            }
         }
 
         #[test]
@@ -4135,13 +4534,16 @@ mod proptests {
     }
 
     proptest! {
-        #![proptest_config(ProptestConfig {
-            cases: 32,
-            max_shrink_iters: 512,
-            failure_persistence: Some(Box::new(FileFailurePersistence::Direct(concat!(
+        #![proptest_config({
+            let mut config = ProptestConfig::default();
+            if std::env::var_os("PROPTEST_CASES").is_none() {
+                config.cases = 32;
+            }
+            config.max_shrink_iters = 512;
+            config.failure_persistence = Some(Box::new(FileFailurePersistence::Direct(concat!(
                 env!("CARGO_MANIFEST_DIR"), "/proptest-regressions/sort_pipeline.txt"
-            )))),
-            ..ProptestConfig::default()
+            ))));
+            config
         })]
         #[test]
         fn output_is_sorted_for_any_input(

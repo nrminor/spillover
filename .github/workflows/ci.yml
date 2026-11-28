@@ -38,8 +38,10 @@ jobs:
         if: failure()
         uses: actions/upload-artifact@v4
         with:
-          name: merge-proptest-regressions
+          name: proptest-regressions
           path: |
             spillover/proptest-regressions/merge.txt
+            spillover/proptest-regressions/dedup_controls.txt
+            spillover/proptest-regressions/sorter.txt
             spillover-bio/proptest-regressions/sort_pipeline.txt
           if-no-files-found: ignore

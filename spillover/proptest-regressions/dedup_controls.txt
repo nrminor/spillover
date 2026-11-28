@@ -1,0 +1,1 @@
+# Seeds for generated adjacent-deduplication histories.

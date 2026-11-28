@@ -3,6 +3,7 @@ use std::{
     convert::Infallible,
 };
 
+use proptest::{prelude::*, test_runner::FileFailurePersistence};
 use spillover::{
     SortedItemsError,
     dedup::{AdjacentDeduplicator, Deduplicated, NoDedup},
@@ -433,4 +434,149 @@ fn sink_error_stops_source_visits_immediately() {
     assert!(matches!(result, Err(SortedItemsError::Sink("stop"))));
     assert_eq!(visits.get(), 1);
     assert_eq!(observed.matches.get(), 0);
+}
+
+mod proptests {
+    use super::*;
+
+    proptest! {
+        #![proptest_config(ProptestConfig {
+            max_shrink_iters: 4096,
+            failure_persistence: Some(Box::new(FileFailurePersistence::Direct(concat!(
+                env!("CARGO_MANIFEST_DIR"), "/proptest-regressions/dedup_controls.txt"
+            )))),
+            ..ProptestConfig::default()
+        })]
+
+        #[test]
+        fn owned_prefix_and_borrowed_remainder_share_the_last_accepted_record(
+            prefix in proptest::collection::vec(0u8..4, 1..12),
+            seed in 0u8..4,
+        ) {
+            let accepted_prefix = {
+                let mut accepted = Vec::new();
+                for &value in &prefix {
+                    if accepted.last() != Some(&value) {
+                        accepted.push(value);
+                    }
+                }
+                accepted
+            };
+            let owned_count = accepted_prefix.len();
+            let last = *accepted_prefix.last()
+                .expect("the nonempty input prefix must retain its first record before traversal switches");
+            let different = (last + 1) % 4;
+            let input = {
+                let mut records = prefix;
+                records.extend([last, different, last]);
+                records
+            };
+            let expected = {
+                let mut records = accepted_prefix;
+                records.extend([different, last]);
+                records
+            };
+
+            let observed = Observed::default();
+            let algorithm = Bytes {
+                previous: Some(vec![seed]),
+                observed: &observed,
+            };
+            let events = input.iter()
+                .map(|&value| Some(Ok(vec![value])))
+                .collect::<Vec<_>>();
+            let source = Source(events.into_iter());
+            let mut output = Deduplicated::new(source, Some(algorithm));
+            let mut actual = Vec::new();
+            for index in 0..owned_count {
+                let event = output.next()
+                    .unwrap_or_else(|| panic!("owned prefix count {owned_count}, output index {index}: unexpected end"));
+                let record = event
+                    .unwrap_or_else(|error| panic!("owned prefix count {owned_count}, output index {index}: source error {error}"));
+                actual.push(record[0]);
+            }
+
+            let result = output.visit_items(|record| {
+                actual.push(record[0]);
+                Ok::<_, Infallible>(())
+            });
+            result.unwrap_or_else(|error| {
+                panic!("borrowed remainder after owned prefix count {owned_count}: {error:?}")
+            });
+
+            prop_assert_eq!(actual, expected, "owned prefix count {}, followed by borrowed remainder", owned_count);
+            prop_assert_eq!(observed.captures.get(), 1, "owned prefix count {}", owned_count);
+            prop_assert_eq!(observed.installations.get(), 1, "owned prefix count {}", owned_count);
+            prop_assert_eq!(observed.matches.get(), input.len() - 1, "owned prefix count {}", owned_count);
+            prop_assert_eq!(observed.updates.get(), owned_count + 1, "owned prefix count {}", owned_count);
+        }
+
+        #[test]
+        fn nontransitive_matching_compares_with_the_last_accepted_record(
+            start in -20i32..20,
+            tail in proptest::collection::vec(-20i32..20, 0..12),
+        ) {
+            let input = {
+                let mut records = vec![start, start + 1, start + 2];
+                records.extend(tail);
+                records
+            };
+            let expected = {
+                let mut accepted = Vec::new();
+                for &record in &input {
+                    if accepted.last().is_none_or(|previous: &i32| (previous - record).abs() > 1) {
+                        accepted.push(record);
+                    }
+                }
+                accepted
+            };
+
+            let source = input.into_iter().map(Ok::<_, Infallible>);
+            let algorithm = Near {
+                previous: Some(Token(start)),
+            };
+            let output = Deduplicated::new(source, Some(algorithm));
+            let actual = output.collect::<Result<Vec<_>, _>>()
+                .expect("owned nontransitive history has an infallible source");
+
+            prop_assert_eq!(actual, expected, "owned nontransitive history starting at {}", start);
+        }
+
+        #[test]
+        fn clean_end_retains_history_and_source_error_fuses_only_enabled_output(
+            first in 0u8..4,
+            following in 0u8..4,
+        ) {
+            let events = vec![
+                Some(Ok(vec![first])),
+                None,
+                Some(Ok(vec![first])),
+                Some(Ok(vec![following])),
+                Some(Err("source failure")),
+                Some(Ok(vec![first])),
+            ];
+            let observed = Observed::default();
+            let algorithm = Bytes {
+                previous: Some(vec![first]),
+                observed: &observed,
+            };
+            let mut enabled = Deduplicated::new(Source(events.clone().into_iter()), Some(algorithm));
+
+            prop_assert_eq!(enabled.next(), Some(Ok(vec![first])), "enabled event 0");
+            prop_assert_eq!(enabled.next(), None, "enabled clean end at event 1");
+            let next = enabled.next();
+            if following == first {
+                prop_assert_eq!(next, Some(Err("source failure")), "enabled error after duplicate events 2 and 3");
+            } else {
+                prop_assert_eq!(next, Some(Ok(vec![following])), "enabled record at event 3");
+                prop_assert_eq!(enabled.next(), Some(Err("source failure")), "enabled error at event 4");
+            }
+            prop_assert_eq!(enabled.next(), None, "enabled event after source error");
+
+            let mut disabled: Deduplicated<_, NoDedup> = Deduplicated::new(Source(events.clone().into_iter()), None);
+            for (index, event) in events.into_iter().enumerate() {
+                prop_assert_eq!(disabled.next(), event, "disabled forwarding at event {}", index);
+            }
+        }
+    }
 }

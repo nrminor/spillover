@@ -38,6 +38,8 @@
 !/spillover/src/merge.rs
 !/spillover/proptest-regressions
 !/spillover/proptest-regressions/merge.txt
+!/spillover/proptest-regressions/dedup_controls.txt
+!/spillover/proptest-regressions/sorter.txt
 !/spillover/src/sorter.rs
 !/spillover/src/sorter
 !/spillover/src/sorter/in_memory.rs
