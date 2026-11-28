@@ -58,6 +58,8 @@
 !/spillover-bio
 !/spillover-bio/Cargo.toml
 !/spillover-bio/README.md
+!/spillover-bio/proptest-regressions
+!/spillover-bio/proptest-regressions/sort_pipeline.txt
 !/spillover-bio/src
 !/spillover-bio/src/lib.rs
 !/spillover-bio/src/error.rs

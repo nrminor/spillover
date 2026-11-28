@@ -1,0 +1,2 @@
+# Genuine minimized failures for the Bio sort pipeline are recorded here.
+cc a305840145d4e7c1ce79561828f3155624f9e06d0a6e309f1e6f0bf71ff9c2d8 # shrinks to sequences = [], limit = 1

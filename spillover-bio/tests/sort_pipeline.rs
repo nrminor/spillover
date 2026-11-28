@@ -3356,9 +3356,764 @@ fn sorter_is_send() {
 }
 
 mod proptests {
+    use std::collections::{BTreeMap, BTreeSet};
+
     use proptest::prelude::*;
+    use proptest::test_runner::FileFailurePersistence;
 
     use super::*;
+
+    type RecordFields = (Vec<u8>, Vec<u8>, Vec<u8>);
+
+    fn record_fields(record: &SeqRecord) -> RecordFields {
+        (
+            record.name().to_vec(),
+            record.sequence().to_vec(),
+            record.quality().to_vec(),
+        )
+    }
+
+    fn record_multiplicities(records: &[SeqRecord]) -> BTreeMap<RecordFields, usize> {
+        let mut counts = BTreeMap::new();
+        for record in records {
+            *counts.entry(record_fields(record)).or_default() += 1;
+        }
+        counts
+    }
+
+    fn records_from_sequences(sequences: Vec<Vec<u8>>) -> Vec<SeqRecord> {
+        let fixed_records = [
+            SeqRecord::new(b"", b"", b""),
+            SeqRecord::new(b"duplicate-1", b"Aa", b"!I"),
+            SeqRecord::new(b"duplicate-1 ", b"Aa", b"!!"),
+            SeqRecord::new(b"duplicate-1", b"Aa", b"!I"),
+            SeqRecord::new(b"upper", b"A", b"I"),
+            SeqRecord::new(b"lower", b"a", b"!"),
+            SeqRecord::new(b"bin-1", b"AA", b"!I"),
+            SeqRecord::new(b"bin-2", b"AA", b"\"!"),
+        ];
+        // This beyond-prefix input can separate decoded duplicates; the
+        // diagnostic below measures it without requiring the defect to persist.
+        let beyond_prefix_records = [b'A', b'C', b'a'].into_iter().map(|suffix| {
+            let sequence = sequence_with_suffix_beyond_prefix(suffix);
+            let name = [b'k', suffix];
+            let quality = vec![b'!'; sequence.len()];
+            SeqRecord::new(name, sequence, quality)
+        });
+
+        let generated_records = sequences.into_iter().enumerate().map(|(index, sequence)| {
+            let name = format!("generated-{index}");
+            let score = u8::try_from(index % 41)
+                .expect("generated quality score modulo 41 must fit in one byte");
+            let quality = vec![b'!' + score; sequence.len()];
+            SeqRecord::new(name, sequence, quality)
+        });
+
+        fixed_records
+            .into_iter()
+            .chain(beyond_prefix_records)
+            .chain(generated_records)
+            .collect()
+    }
+
+    fn sequence_with_suffix_beyond_prefix(suffix: u8) -> Vec<u8> {
+        let mut sequence = vec![b'A'; 152];
+        sequence.push(suffix);
+        sequence
+    }
+
+    fn sequence_prefix_ranks(sequence: &[u8]) -> Vec<u8> {
+        (0..152)
+            .map(|index| match sequence.get(index) {
+                Some(b'C' | b'c') => 1,
+                Some(b'G' | b'g') => 2,
+                Some(b'T' | b't') => 3,
+                _ => 0,
+            })
+            .collect()
+    }
+
+    fn records_follow_accelerated_sequence_order(records: &[SeqRecord]) -> bool {
+        records.windows(2).all(|pair| {
+            let left = &pair[0];
+            let right = &pair[1];
+            (
+                sequence_prefix_ranks(left.sequence()),
+                left.sequence(),
+                left.quality(),
+            ) <= (
+                sequence_prefix_ranks(right.sequence()),
+                right.sequence(),
+                right.quality(),
+            )
+        })
+    }
+
+    fn count_sequence_quality_inversions(records: &[SeqRecord]) -> usize {
+        records
+            .windows(2)
+            .filter(|pair| {
+                (pair[0].sequence(), pair[0].quality()) > (pair[1].sequence(), pair[1].quality())
+            })
+            .count()
+    }
+
+    fn expected_binned_quality_byte(byte: u8) -> u8 {
+        let score = byte.saturating_sub(33);
+        let binned = match score {
+            0..=1 => 0,
+            2..=9 => 6,
+            10..=19 => 15,
+            20..=24 => 22,
+            25..=29 => 27,
+            30..=34 => 33,
+            35..=39 => 37,
+            _ => 40,
+        };
+        binned + 33
+    }
+
+    fn record_with_expected_binned_quality(record: &SeqRecord) -> SeqRecord {
+        let quality: Vec<u8> = record
+            .quality()
+            .iter()
+            .copied()
+            .map(expected_binned_quality_byte)
+            .collect();
+        SeqRecord::new(record.name(), record.sequence(), quality)
+    }
+
+    fn record_with_expected_two_bit_sequence(record: &SeqRecord) -> SeqRecord {
+        let sequence: Vec<u8> = record
+            .sequence()
+            .iter()
+            .map(|byte| match byte {
+                b'a' | b'c' | b'g' | b't' => byte.to_ascii_uppercase(),
+                _ => *byte,
+            })
+            .collect();
+        SeqRecord::new(record.name(), sequence, record.quality())
+    }
+
+    fn record_with_expected_split_name(record: &SeqRecord) -> SeqRecord {
+        let name = record.name();
+        let first_space = name.iter().position(|byte| *byte == b' ');
+        let name = if first_space.is_some() && first_space == name.len().checked_sub(1) {
+            &name[..name.len() - 1]
+        } else {
+            name
+        };
+        SeqRecord::new(name, record.sequence(), record.quality())
+    }
+
+    fn distinct_sequences(records: &[SeqRecord]) -> BTreeSet<Vec<u8>> {
+        records
+            .iter()
+            .map(|record| record.sequence().to_vec())
+            .collect()
+    }
+
+    fn equal_sequences_are_contiguous(records: &[SeqRecord]) -> bool {
+        let mut finished = BTreeSet::new();
+        for pair in records.windows(2) {
+            if pair[0].sequence() != pair[1].sequence() {
+                finished.insert(pair[0].sequence().to_vec());
+                if finished.contains(pair[1].sequence()) {
+                    return false;
+                }
+            }
+        }
+        true
+    }
+
+    fn generated_sequences_with_mixed_case_and_ambiguity() -> impl Strategy<Value = Vec<Vec<u8>>> {
+        let alphabet = proptest::sample::select(vec![
+            b'A', b'C', b'G', b'T', b'a', b'c', b'g', b't', b'N', b'n', b'r', b'y', b'-',
+        ]);
+        // Eleven shared witnesses, two generated records, and four additional
+        // split-name witnesses fit the 17-initial-run cap even at limit one.
+        proptest::collection::vec(proptest::collection::vec(alphabet, 0..24), 0..3)
+    }
+
+    fn collect_decoded_records<E: std::fmt::Debug>(
+        output: impl Iterator<Item = Result<SeqRecord, E>>,
+        description: &str,
+        limit: Option<usize>,
+    ) -> Vec<SeqRecord> {
+        output
+            .enumerate()
+            .map(|(index, item)| {
+                item.unwrap_or_else(|error| {
+                    match limit {
+                        Some(limit) => panic!("{description}: decode output record {index} with configured spill limit {limit}: {error:?}"),
+                        None => panic!("{description}: decode output record {index}: {error:?}"),
+                    }
+                })
+            })
+            .collect()
+    }
+
+    fn merge_single_record_runs_with_raw_codec(
+        qualities: &[u8],
+        fan_in: usize,
+    ) -> Result<(), TestCaseError> {
+        let expected_run_count = fan_in * fan_in + 1;
+        prop_assert_eq!(qualities.len(), expected_run_count);
+
+        let records: Vec<SeqRecord> = qualities
+            .iter()
+            .enumerate()
+            .map(|(index, quality)| {
+                let name = format!("record-{index}");
+                let sequence = if index % 2 == 0 { b"Ca" } else { b"cA" };
+                let quality = [b'!' + quality % 41; 2];
+                SeqRecord::new(name, sequence, quality)
+            })
+            .collect();
+
+        let config = {
+            let mut config = MergeConfig::default();
+            config.max_fan_in = NonZeroUsize::new(fan_in)
+                .expect("generated fan-in values 2 through 4 must be nonzero");
+            config
+        };
+        let merger = RunMerger::new(DryIceCodec::new(), ILLUMINA_ORDER.unkeyed(), config);
+        let runs: Vec<_> = records.iter().enumerate().map(|(index, record)| {
+            merger.spill_sorted([record.clone()]).unwrap_or_else(|error| {
+                panic!("raw accelerated sort: write one-record sorted run {index}, fan-in {fan_in}: {error:?}")
+            })
+        }).collect();
+
+        prop_assert_eq!(runs.len(), expected_run_count);
+        let output = merger.merge(runs).unwrap_or_else(|error| {
+            panic!("raw accelerated sort: merge {expected_run_count} one-record sorted runs, fan-in {fan_in}: {error:?}")
+        });
+        let description = format!("raw accelerated merge, fan-in {fan_in}");
+        let output = collect_decoded_records(output, &description, None);
+
+        prop_assert!(
+            record_multiplicities(&output) == record_multiplicities(&records),
+            "raw accelerated merge changed record fields or multiplicities, fan-in {}",
+            fan_in
+        );
+        prop_assert!(
+            records_follow_accelerated_sequence_order(&output),
+            "raw accelerated merge produced out-of-order records, fan-in {}",
+            fan_in
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn radix_sorts_chunks_and_first_byte_buckets_of_63_64_and_65_records() {
+        // Extra C-prefixed records force the full chunk above the threshold,
+        // so even a 63-record A-prefix bucket is reached by radix partitioning.
+        for bucket_size in [63, 64, 65] {
+            for with_sentinel in [false, true] {
+                let mut records = Vec::new();
+                for index in 0..bucket_size {
+                    let sequence = {
+                        let mut sequence = vec![b'A'; 153];
+                        sequence[151] = if index % 2 == 0 { b'C' } else { b'A' };
+                        sequence[152] = if index % 3 == 0 { b'C' } else { b'a' };
+                        sequence
+                    };
+                    let score = u8::try_from(index % 40)
+                        .expect("radix quality score modulo 40 must fit in one byte");
+                    let quality = vec![b'!' + score; 153];
+                    let name = format!("bucket-{index}");
+                    records.push(SeqRecord::new(name, sequence, quality));
+                }
+                if with_sentinel {
+                    for index in 0..(66 - bucket_size) {
+                        let name = format!("different-prefix-{index}");
+                        records.push(SeqRecord::new(name, b"C", b"!"));
+                    }
+                }
+                let expected = record_multiplicities(&records);
+                RadixThenRefine.sort(&mut records, &ILLUMINA_ORDER);
+                assert_eq!(
+                    record_multiplicities(&records),
+                    expected,
+                    "radix chunk with {bucket_size} common-prefix records, extra C-prefixed records: {with_sentinel}"
+                );
+                assert!(
+                    records_follow_accelerated_sequence_order(&records),
+                    "radix chunk with {bucket_size} common-prefix records, extra C-prefixed records: {with_sentinel}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn raw_accelerated_sort_handles_fan_in_squared_plus_one_records_with_buffer_limit_one() {
+        for fan_in in 2..=4 {
+            let run_count = fan_in * fan_in + 1;
+            let records: Vec<SeqRecord> = (0..run_count)
+                .map(|index| {
+                    let name = format!("run-{index}");
+                    let sequence = if index % 2 == 0 { b"Ca" } else { b"cA" };
+                    let quality = if index % 3 == 0 { b"!I" } else { b"!!" };
+                    SeqRecord::new(name, sequence, quality)
+                })
+                .collect();
+
+            let config = {
+                let mut config = MergeConfig::default();
+                config.max_fan_in =
+                    NonZeroUsize::new(fan_in).expect("fan-in values 2 through 4 must be nonzero");
+                config
+            };
+            let mut sorter = Builder::new()
+                .sort_by_illumina()
+                .codec(DryIceCodec::new())
+                .max_buffer_items(1)
+                .merge_config(config)
+                .build();
+
+            for (index, record) in records.iter().enumerate() {
+                sorter.push(record.clone()).unwrap_or_else(|error| {
+                    panic!("raw accelerated sort: admit input record {index}, fan-in {fan_in}, spill limit 1: {error:?}")
+                });
+            }
+
+            let output = sorter.finish().unwrap_or_else(|error| {
+                panic!(
+                    "raw accelerated sort: finalize sorter and prepare merge with fan-in {fan_in}, spill limit 1: {error:?}"
+                )
+            });
+            let description = format!("raw accelerated sort with fan-in {fan_in}");
+            let output = collect_decoded_records(output, &description, Some(1));
+
+            assert_eq!(
+                record_multiplicities(&output),
+                record_multiplicities(&records),
+                "raw accelerated sort, fan-in {fan_in}, spill limit 1"
+            );
+            assert!(
+                records_follow_accelerated_sequence_order(&output),
+                "raw accelerated sort, fan-in {fan_in}, spill limit 1"
+            );
+        }
+    }
+
+    #[test]
+    fn report_codec_order_inversions_and_missed_sequence_duplicates_at_each_spill_limit() {
+        for limit in [1, 2, 3] {
+            let mut compact = Builder::new()
+                .sort_by_illumina()
+                .codec(DryIceCodec::new().two_bit_exact())
+                .max_buffer_items(limit)
+                .build();
+            for (index, (name, sequence, quality)) in [
+                (b"upper".as_slice(), b"A".as_slice(), b"I".as_slice()),
+                (b"lower".as_slice(), b"a".as_slice(), b"!".as_slice()),
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                compact
+                    .push(SeqRecord::new(name, sequence, quality))
+                    .unwrap_or_else(|error| panic!("TwoBitExact accelerated sort: admit input record {index}, spill limit {limit}: {error:?}"));
+            }
+            let compact = compact.finish().unwrap_or_else(|error| {
+                panic!("TwoBitExact accelerated sort: finalize sorter and prepare merge, spill limit {limit}: {error:?}")
+            });
+            let compact =
+                collect_decoded_records(compact, "TwoBitExact accelerated sort", Some(limit));
+            let compact_inversions = count_sequence_quality_inversions(&compact);
+            let mut dedup = Builder::new()
+                .sort_by_illumina()
+                .codec(DryIceCodec::new().two_bit_exact())
+                .max_buffer_items(limit)
+                .dedup_by_sequence()
+                .build();
+            for (index, suffix) in [b'A', b'C', b'a'].into_iter().enumerate() {
+                let sequence = sequence_with_suffix_beyond_prefix(suffix);
+                let quality = vec![b'!'; sequence.len()];
+                dedup
+                    .push(SeqRecord::new([suffix], sequence, quality))
+                    .unwrap_or_else(|error| panic!("TwoBitExact accelerated sequence dedup: admit input record {index}, spill limit {limit}: {error:?}"));
+            }
+            let dedup = dedup.finish().unwrap_or_else(|error| {
+                panic!(
+                    "TwoBitExact accelerated sequence dedup: finalize sorter and prepare merge, spill limit {limit}: {error:?}"
+                )
+            });
+            let dedup = collect_decoded_records(
+                dedup,
+                "TwoBitExact accelerated sequence dedup",
+                Some(limit),
+            );
+            let residual_duplicates = dedup.len() - distinct_sequences(&dedup).len();
+
+            let mut binned = Builder::new()
+                .sort_by_illumina()
+                .codec(DryIceCodec::new().binned_quality())
+                .max_buffer_items(limit)
+                .build();
+            for (index, (name, quality)) in
+                [(b"first".as_slice(), b"!I"), (b"second".as_slice(), b"\"!")]
+                    .into_iter()
+                    .enumerate()
+            {
+                binned
+                    .push(SeqRecord::new(name, b"AA", quality))
+                    .unwrap_or_else(|error| panic!("binned-quality accelerated sort: admit input record {index}, spill limit {limit}: {error:?}"));
+            }
+            let binned = binned.finish().unwrap_or_else(|error| {
+                panic!("binned-quality accelerated sort: finalize sorter and prepare merge, spill limit {limit}: {error:?}")
+            });
+            let binned =
+                collect_decoded_records(binned, "binned-quality accelerated sort", Some(limit));
+            let binned_inversions = binned
+                .windows(2)
+                .filter(|pair| pair[0].quality() > pair[1].quality())
+                .count();
+
+            let mut split = Builder::new()
+                .sort_by_name()
+                .codec(DryIceCodec::new().split_names())
+                .max_buffer_items(limit)
+                .build();
+            for (index, name) in [
+                b"xxxxxxxxxxxxxxxx ".as_slice(),
+                b"xxxxxxxxxxxxxxxx\tz".as_slice(),
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                split.push(SeqRecord::new(name, b"A", b"!")).unwrap_or_else(|error| {
+                    panic!("split-name name sort: admit input record {index}, spill limit {limit}: {error:?}")
+                });
+            }
+            let split = split.finish().unwrap_or_else(|error| {
+                panic!("split-name name sort: finalize sorter and prepare merge, spill limit {limit}: {error:?}")
+            });
+            let split = collect_decoded_records(split, "split-name name sort", Some(limit));
+            let name_inversions = split
+                .windows(2)
+                .filter(|pair| pair[0].name() > pair[1].name())
+                .count();
+            println!(
+                "limit={limit}: two_bit_inversions={compact_inversions}, binned_inversions={binned_inversions}, split_name_inversions={name_inversions}, residual_sequence_duplicates={residual_duplicates}"
+            );
+        }
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig {
+            cases: 32,
+            max_shrink_iters: 512,
+            failure_persistence: Some(Box::new(FileFailurePersistence::Direct(concat!(
+                env!("CARGO_MANIFEST_DIR"), "/proptest-regressions/sort_pipeline.txt"
+            )))),
+            ..ProptestConfig::default()
+        })]
+
+        #[test]
+        fn radix_sorts_generated_chunks_and_common_prefix_buckets_at_63_64_and_65(
+            quality_offset in 0u8..41,
+            sequence_offset in 0usize..6,
+        ) {
+            for size in [63, 64, 65] {
+                for add_different_first_byte in [false, true] {
+                    let mut records = Vec::new();
+                    for index in 0..size {
+                        let sequence = {
+                            let mut sequence = vec![b'A'; 153];
+                            sequence[151] = if (index + sequence_offset) % 2 == 0 { b'C' } else { b'A' };
+                            sequence[152] = if (index + sequence_offset) % 3 == 0 { b'C' } else { b'a' };
+                            sequence
+                        };
+                        let score = u8::try_from(index % 41).expect("radix record index modulo 41 must fit in one byte");
+                        let quality = vec![b'!' + (score + quality_offset) % 41; 153];
+                        let name = format!("common-prefix-{index}");
+                        records.push(SeqRecord::new(name, sequence, quality));
+                    }
+                    if add_different_first_byte {
+                        for index in 0..(66 - size) {
+                            let name = format!("different-first-byte-{index}");
+                            records.push(SeqRecord::new(name, b"C", b"!"));
+                        }
+                    }
+                    let expected = record_multiplicities(&records);
+
+                    RadixThenRefine.sort(&mut records, &ILLUMINA_ORDER);
+
+                    prop_assert!(record_multiplicities(&records) == expected,
+                        "radix chunk with {} common-prefix records and extra C-prefixed records {}", size, add_different_first_byte);
+                    prop_assert!(records_follow_accelerated_sequence_order(&records),
+                        "radix chunk with {} common-prefix records and extra C-prefixed records {}", size, add_different_first_byte);
+                }
+            }
+        }
+
+        #[test]
+        fn raw_accelerated_merge_handles_five_single_record_runs_at_fan_in_two(
+            qualities in proptest::collection::vec(any::<u8>(), 5..=5),
+        ) {
+            merge_single_record_runs_with_raw_codec(&qualities, 2)?;
+        }
+
+        #[test]
+        fn raw_accelerated_merge_handles_ten_single_record_runs_at_fan_in_three(
+            qualities in proptest::collection::vec(any::<u8>(), 10..=10),
+        ) {
+            merge_single_record_runs_with_raw_codec(&qualities, 3)?;
+        }
+
+        #[test]
+        fn raw_accelerated_merge_handles_seventeen_single_record_runs_at_fan_in_four(
+            qualities in proptest::collection::vec(any::<u8>(), 17..=17),
+        ) {
+            merge_single_record_runs_with_raw_codec(&qualities, 4)?;
+        }
+
+        #[test]
+        fn raw_sequence_sorts_preserve_every_field_and_follow_their_respective_orders(
+            sequences in generated_sequences_with_mixed_case_and_ambiguity(),
+            limit in 1usize..12,
+        ) {
+            let records = records_from_sequences(sequences);
+            let mut accelerated = Builder::new()
+                .sort_by_illumina()
+                .codec(DryIceCodec::new())
+                .max_buffer_items(limit)
+                .build();
+            let mut exact = Builder::new()
+                .sort_by_sequence_exact()
+                .codec(DryIceCodec::new())
+                .max_buffer_items(limit)
+                .build();
+            let mut dedup = Builder::new()
+                .sort_by_illumina()
+                .codec(DryIceCodec::new())
+                .max_buffer_items(limit)
+                .dedup_by_sequence()
+                .build();
+
+            for (index, record) in records.iter().enumerate() {
+                accelerated.push(record.clone()).unwrap_or_else(|error| {
+                    panic!("raw accelerated sort: admit input record {index}, spill limit {limit}: {error:?}")
+                });
+                exact.push(record.clone()).unwrap_or_else(|error| {
+                    panic!("raw exact sequence sort: admit input record {index}, spill limit {limit}: {error:?}")
+                });
+                dedup.push(record.clone()).unwrap_or_else(|error| {
+                    panic!("raw accelerated sequence dedup: admit input record {index}, spill limit {limit}: {error:?}")
+                });
+            }
+
+            let accelerated = accelerated.finish().unwrap_or_else(|error| {
+                panic!("raw accelerated sort: finalize sorter and prepare merge, spill limit {limit}: {error:?}")
+            });
+            let accelerated = collect_decoded_records(accelerated, "raw accelerated sort", Some(limit));
+
+            let exact = exact.finish().unwrap_or_else(|error| {
+                panic!("raw exact sequence sort: finalize sorter and prepare merge, spill limit {limit}: {error:?}")
+            });
+            let exact = collect_decoded_records(exact, "raw exact sequence sort", Some(limit));
+
+            let dedup = dedup.finish().unwrap_or_else(|error| {
+                panic!("raw accelerated sequence dedup: finalize sorter and prepare merge, spill limit {limit}: {error:?}")
+            });
+            let dedup = collect_decoded_records(dedup, "raw accelerated sequence dedup", Some(limit));
+
+            let expected = record_multiplicities(&records);
+            prop_assert!(record_multiplicities(&accelerated) == expected, "raw accelerated sort changed record fields or multiplicities, spill limit {}", limit);
+            prop_assert!(record_multiplicities(&exact) == expected, "raw exact sort changed record fields or multiplicities, spill limit {}", limit);
+            prop_assert!(records_follow_accelerated_sequence_order(&accelerated), "raw accelerated output is out of order, spill limit {}", limit);
+            prop_assert!(exact.windows(2).all(|pair|
+                (pair[0].sequence(), pair[0].quality()) <= (pair[1].sequence(), pair[1].quality())), "raw exact output is out of order, spill limit {}", limit);
+            prop_assert!(equal_sequences_are_contiguous(&accelerated), "raw accelerated output separates equal sequences, spill limit {}", limit);
+            prop_assert!(distinct_sequences(&dedup) == distinct_sequences(&records), "raw sequence dedup lost a sequence, spill limit {}", limit);
+            prop_assert_eq!(dedup.len(), distinct_sequences(&records).len(), "raw sequence dedup retained duplicates, spill limit {}", limit);
+            for (record, count) in record_multiplicities(&dedup) {
+                prop_assert!(count <= expected.get(&record).copied().unwrap_or(0), "raw sequence dedup emitted a record not present in the input, spill limit {}", limit);
+            }
+        }
+
+        #[test]
+        fn binned_quality_keeps_equal_sequences_together_and_deduplicates_them(
+            sequences in generated_sequences_with_mixed_case_and_ambiguity(),
+            limit in 1usize..12,
+        ) {
+            let records = records_from_sequences(sequences);
+            let transformed: Vec<SeqRecord> = records.iter()
+                .map(record_with_expected_binned_quality)
+                .collect();
+
+            let mut all = Builder::new()
+                .sort_by_illumina()
+                .codec(DryIceCodec::new().binned_quality())
+                .max_buffer_items(limit)
+                .build();
+            let mut dedup = Builder::new()
+                .sort_by_illumina()
+                .codec(DryIceCodec::new().binned_quality())
+                .max_buffer_items(limit)
+                .dedup_by_sequence()
+                .build();
+
+            for (index, record) in records.iter().enumerate() {
+                all.push(record.clone()).unwrap_or_else(|error| {
+                    panic!("binned-quality accelerated sort: admit input record {index}, spill limit {limit}: {error:?}")
+                });
+                dedup.push(record.clone()).unwrap_or_else(|error| {
+                    panic!("binned-quality accelerated sequence dedup: admit input record {index}, spill limit {limit}: {error:?}")
+                });
+            }
+
+            let all = all.finish().unwrap_or_else(|error| {
+                panic!("binned-quality accelerated sort: finalize sorter and prepare merge, spill limit {limit}: {error:?}")
+            });
+            let all = collect_decoded_records(all, "binned-quality accelerated sort", Some(limit));
+
+            let dedup = dedup.finish().unwrap_or_else(|error| {
+                panic!("binned-quality accelerated sequence dedup: finalize sorter and prepare merge, spill limit {limit}: {error:?}")
+            });
+            let dedup = collect_decoded_records(dedup, "binned-quality accelerated sequence dedup", Some(limit));
+
+            // Binning can reverse quality comparisons; it does not change
+            // sequences or stored keys, so grouping and complete dedup remain required.
+            prop_assert!(record_multiplicities(&all) == record_multiplicities(&transformed), "binned-quality sort changed records beyond the expected transformation, spill limit {}", limit);
+            prop_assert!(all.windows(2).all(|pair|
+                (sequence_prefix_ranks(pair[0].sequence()), pair[0].sequence())
+                    <= (sequence_prefix_ranks(pair[1].sequence()), pair[1].sequence())),
+                "binned-quality sort produced out-of-order sequence prefixes or sequences, spill limit {}", limit);
+            prop_assert!(equal_sequences_are_contiguous(&all), "binned-quality sort separates equal sequences, spill limit {}", limit);
+            prop_assert!(distinct_sequences(&dedup) == distinct_sequences(&transformed), "binned-quality dedup lost a sequence, spill limit {}", limit);
+            prop_assert!(dedup.windows(2).all(|pair| pair[0].sequence() != pair[1].sequence()), "binned-quality dedup retained adjacent equal sequences, spill limit {}", limit);
+            prop_assert_eq!(dedup.len(), distinct_sequences(&transformed).len(), "binned-quality dedup retained duplicate sequences, spill limit {}", limit);
+            let expected = record_multiplicities(&transformed);
+            for (record, count) in record_multiplicities(&dedup) {
+                prop_assert!(count <= expected.get(&record).copied().unwrap_or(0), "binned-quality dedup emitted a record not present in transformed input, spill limit {}", limit);
+            }
+        }
+
+        #[test]
+        fn two_bit_normalization_preserves_records_sequence_classes_and_prefix_order(
+            sequences in generated_sequences_with_mixed_case_and_ambiguity(),
+            limit in 1usize..12,
+        ) {
+            let records = records_from_sequences(sequences);
+            let transformed: Vec<SeqRecord> = records.iter()
+                .map(record_with_expected_two_bit_sequence)
+                .collect();
+            for (original, decoded) in records.iter().zip(&transformed) {
+                prop_assert_eq!(sequence_prefix_ranks(original.sequence()), sequence_prefix_ranks(decoded.sequence()));
+            }
+
+            let mut all = Builder::new()
+                .sort_by_illumina()
+                .codec(DryIceCodec::new().two_bit_exact())
+                .max_buffer_items(limit)
+                .build();
+            let mut dedup = Builder::new()
+                .sort_by_illumina()
+                .codec(DryIceCodec::new().two_bit_exact())
+                .max_buffer_items(limit)
+                .dedup_by_sequence()
+                .build();
+
+            for (index, record) in records.iter().enumerate() {
+                all.push(record.clone()).unwrap_or_else(|error| {
+                    panic!("TwoBitExact accelerated sort: admit input record {index}, spill limit {limit}: {error:?}")
+                });
+                dedup.push(record.clone()).unwrap_or_else(|error| {
+                    panic!("TwoBitExact accelerated sequence dedup: admit input record {index}, spill limit {limit}: {error:?}")
+                });
+            }
+
+            let all = all.finish().unwrap_or_else(|error| {
+                panic!("TwoBitExact accelerated sort: finalize sorter and prepare merge, spill limit {limit}: {error:?}")
+            });
+            let all = collect_decoded_records(all, "TwoBitExact accelerated sort", Some(limit));
+
+            let dedup = dedup.finish().unwrap_or_else(|error| {
+                panic!("TwoBitExact accelerated sequence dedup: finalize sorter and prepare merge, spill limit {limit}: {error:?}")
+            });
+            let dedup = collect_decoded_records(dedup, "TwoBitExact accelerated sequence dedup", Some(limit));
+
+            // Case normalization preserves packed ranks but can invert raw
+            // tiebreaks and separate decoded duplicates within a key group.
+            // Full decoded order and globally unique dedup are not asserted.
+            prop_assert!(record_multiplicities(&all) == record_multiplicities(&transformed), "TwoBitExact sort changed records beyond the expected transformation, spill limit {}", limit);
+            prop_assert!(all.windows(2).all(|pair|
+                sequence_prefix_ranks(pair[0].sequence()) <= sequence_prefix_ranks(pair[1].sequence())), "TwoBitExact output has out-of-order sequence prefix ranks, spill limit {}", limit);
+            prop_assert!(distinct_sequences(&dedup) == distinct_sequences(&transformed), "TwoBitExact dedup lost a decoded sequence, spill limit {}", limit);
+            prop_assert!(dedup.windows(2).all(|pair| pair[0].sequence() != pair[1].sequence()), "TwoBitExact dedup retained adjacent equal sequences, spill limit {}", limit);
+            let expected = record_multiplicities(&transformed);
+            for (record, count) in record_multiplicities(&dedup) {
+                prop_assert!(count <= expected.get(&record).copied().unwrap_or(0), "TwoBitExact dedup emitted a record not present in transformed input, spill limit {}", limit);
+            }
+        }
+
+        #[test]
+        fn split_names_preserve_transformed_records_and_distinct_names(
+            sequences in generated_sequences_with_mixed_case_and_ambiguity(),
+            limit in 1usize..12,
+        ) {
+            let records = {
+                let mut records = records_from_sequences(sequences);
+                records.push(SeqRecord::new(b"xxxxxxxxxxxxxxxx ", b"A", b"!"));
+                records.push(SeqRecord::new(b"xxxxxxxxxxxxxxxx\tz", b"A", b"!"));
+                records.push(SeqRecord::new(b"duplicate-1", b"CG", b"II"));
+                records.push(SeqRecord::new(b"duplicate-1 description", b"T", b"!"));
+                records
+            };
+            let transformed: Vec<SeqRecord> = records.iter()
+                .map(record_with_expected_split_name)
+                .collect();
+
+            let mut all = Builder::new()
+                .sort_by_name()
+                .codec(DryIceCodec::new().split_names())
+                .max_buffer_items(limit)
+                .build();
+            let mut dedup = Builder::new()
+                .sort_by_name()
+                .codec(DryIceCodec::new().split_names())
+                .max_buffer_items(limit)
+                .dedup_by_name()
+                .build();
+
+            for (index, record) in records.iter().enumerate() {
+                all.push(record.clone()).unwrap_or_else(|error| {
+                    panic!("split-name name sort: admit input record {index}, spill limit {limit}: {error:?}")
+                });
+                dedup.push(record.clone()).unwrap_or_else(|error| {
+                    panic!("split-name name dedup: admit input record {index}, spill limit {limit}: {error:?}")
+                });
+            }
+
+            let all = all.finish().unwrap_or_else(|error| {
+                panic!("split-name name sort: finalize sorter and prepare merge, spill limit {limit}: {error:?}")
+            });
+            let all = collect_decoded_records(all, "split-name name sort", Some(limit));
+
+            let dedup = dedup.finish().unwrap_or_else(|error| {
+                panic!("split-name name dedup: finalize sorter and prepare merge, spill limit {limit}: {error:?}")
+            });
+            let dedup = collect_decoded_records(dedup, "split-name name dedup", Some(limit));
+
+            // Empty descriptions lose their separator, potentially changing
+            // name keys and separating decoded duplicates. Do not require
+            // globally sorted names or globally unique name dedup here.
+            prop_assert!(record_multiplicities(&all) == record_multiplicities(&transformed), "split-name sort changed records beyond the expected transformation, spill limit {}", limit);
+            let names = |items: &[SeqRecord]| -> BTreeSet<Vec<u8>> {
+                items.iter().map(|record| record.name().to_vec()).collect()
+            };
+            prop_assert!(names(&dedup) == names(&transformed), "split-name dedup lost a decoded name, spill limit {}", limit);
+            prop_assert!(dedup.windows(2).all(|pair| pair[0].name() != pair[1].name()), "split-name dedup retained adjacent equal names, spill limit {}", limit);
+            prop_assert!(dedup.len() < all.len(), "split-name dedup removed no records despite repeated names, spill limit {}", limit);
+            let expected = record_multiplicities(&transformed);
+            for (record, count) in record_multiplicities(&dedup) {
+                prop_assert!(count <= expected.get(&record).copied().unwrap_or(0), "split-name dedup emitted a record not present in transformed input, spill limit {}", limit);
+            }
+        }
+    }
 
     fn arb_fixed_len_sequence(len: usize) -> impl Strategy<Value = Vec<u8>> {
         proptest::collection::vec(
@@ -3380,9 +4135,17 @@ mod proptests {
     }
 
     proptest! {
+        #![proptest_config(ProptestConfig {
+            cases: 32,
+            max_shrink_iters: 512,
+            failure_persistence: Some(Box::new(FileFailurePersistence::Direct(concat!(
+                env!("CARGO_MANIFEST_DIR"), "/proptest-regressions/sort_pipeline.txt"
+            )))),
+            ..ProptestConfig::default()
+        })]
         #[test]
         fn output_is_sorted_for_any_input(
-            records in proptest::collection::vec(arb_record(32), 1..100),
+            records in proptest::collection::vec(arb_record(32), 1..=17),
             buffer_size in 2usize..20,
         ) {
             let mut sorter = Builder::new()
@@ -3416,7 +4179,7 @@ mod proptests {
 
         #[test]
         fn output_preserves_all_records(
-            records in proptest::collection::vec(arb_record(32), 1..100),
+            records in proptest::collection::vec(arb_record(32), 1..=17),
             buffer_size in 2usize..20,
         ) {
             let mut sorter = Builder::new()
@@ -3453,6 +4216,7 @@ mod proptests {
             expected.sort_by_key(|r| key(r));
 
             for (got, exp) in results.iter().zip(expected.iter()) {
+                prop_assert_eq!(got.name(), exp.name());
                 prop_assert_eq!(got.sequence(), exp.sequence());
                 prop_assert_eq!(got.quality(), exp.quality());
             }
@@ -3467,7 +4231,7 @@ mod proptests {
                         (Just(name), Just(seq), arb_quality(len))
                     })
                     .prop_map(|(name, seq, qual)| SeqRecord::new(name, seq, qual)),
-                1..50,
+                1..=17,
             ),
             buffer_size in 2usize..10,
         ) {
