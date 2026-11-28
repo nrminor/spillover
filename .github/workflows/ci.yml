@@ -33,3 +33,11 @@ jobs:
 
       - name: Run checks
         run: mise run --skip-tools check
+
+      - name: Preserve merge regression seeds
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: merge-proptest-regressions
+          path: spillover/proptest-regressions/merge.txt
+          if-no-files-found: ignore

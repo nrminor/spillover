@@ -1,0 +1,2 @@
+# Proptest saves failing merge cases here for replay.
+# Retain seeds from genuine failures after reviewing their counterexamples.

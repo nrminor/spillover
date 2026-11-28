@@ -1585,78 +1585,267 @@ mod tests {
 
     mod proptests {
         use proptest::prelude::*;
+        use proptest::test_runner::FileFailurePersistence;
 
         use super::*;
 
-        fn arb_sorted_u64_vec() -> impl Strategy<Value = Vec<u64>> {
-            proptest::collection::vec(0u64..1_000, 0..50).prop_map(|mut v| {
-                v.sort_unstable();
-                v
+        #[derive(Clone, Copy, Debug)]
+        enum InitialRunCount {
+            OneBelowFanIn,
+            EqualToFanIn,
+            OneAboveFanIn,
+            EqualToFanInSquared,
+            OneAboveFanInSquared,
+        }
+
+        fn initial_run_count(fan_in: usize, scenario: InitialRunCount) -> usize {
+            match scenario {
+                InitialRunCount::OneBelowFanIn => fan_in - 1,
+                InitialRunCount::EqualToFanIn => fan_in,
+                InitialRunCount::OneAboveFanIn => fan_in + 1,
+                InitialRunCount::EqualToFanInSquared => fan_in * fan_in,
+                InitialRunCount::OneAboveFanInSquared => fan_in * fan_in + 1,
+            }
+        }
+
+        fn sorted_input_runs(
+            scenario: InitialRunCount,
+        ) -> impl Strategy<Value = (usize, Vec<Vec<u64>>)> {
+            (2usize..=4).prop_flat_map(move |fan_in| {
+                let count = initial_run_count(fan_in, scenario);
+                let value = prop_oneof![8 => 0u64..8, 1 => Just(u64::MAX), 1 => 0u64..=u64::MAX];
+
+                let batch = proptest::collection::vec(value, 1..=16).prop_map(|mut values| {
+                    values.sort_unstable();
+                    values
+                });
+
+                proptest::collection::vec(batch, count).prop_map(move |batches| (fan_in, batches))
             })
+        }
+
+        fn merge_config(fan_in: usize, initial_count: usize) -> MergeConfig {
+            let max_fan_in = NonZeroUsize::new(fan_in).unwrap_or_else(|| {
+                panic!(
+                    "configure merge: fan-in {fan_in} must be nonzero; initial runs={initial_count}"
+                )
+            });
+            MergeConfig {
+                max_fan_in,
+                ..MergeConfig::default()
+            }
         }
 
         fn spill_runs(
             merger: &RunMerger<U64Codec, Natural>,
             batches: &[Vec<u64>],
+            fan_in: usize,
         ) -> Vec<SortedRun> {
+            let initial_count = batches.len();
             batches
                 .iter()
-                .map(|b| {
+                .enumerate()
+                .map(|(run_index, batch)| {
                     merger
-                        .spill_sorted(b.iter().copied())
-                        .expect("spill in proptest")
+                        .spill_sorted(batch.iter().copied())
+                        .unwrap_or_else(|error| {
+                            panic!("spill input run {run_index}: fan-in={fan_in}, initial runs={initial_count}: {error:?}")
+                        })
                 })
                 .collect()
         }
 
-        fn collect_merged(merger: RunMerger<U64Codec, Natural>, runs: Vec<SortedRun>) -> Vec<u64> {
-            merger
+        fn collect_merged_values(
+            merger: RunMerger<U64Codec, Natural>,
+            runs: Vec<SortedRun>,
+            fan_in: usize,
+            initial_count: usize,
+        ) -> Vec<u64> {
+            let output = merger
                 .merge(runs)
-                .expect("merge in proptest")
-                .map(|r| r.expect("read in proptest"))
+                .unwrap_or_else(|error| {
+                    panic!("failed to start merging sorted runs: fan-in={fan_in}, initial runs={initial_count}: {error:?}")
+                });
+
+            output
+                .enumerate()
+                .map(|(record_index, result)| {
+                    result.unwrap_or_else(|error| {
+                        panic!("read merged output record {record_index}: fan-in={fan_in}, initial runs={initial_count}: {error:?}")
+                    })
+                })
                 .collect()
         }
 
+        fn assert_merge_preserves_sorted_input_values(
+            fan_in: usize,
+            batches: &[Vec<u64>],
+        ) -> Result<(), TestCaseError> {
+            let initial_count = batches.len();
+            let expected: Vec<u64> = {
+                let mut values = batches.iter().flatten().copied().collect::<Vec<_>>();
+                values.sort_unstable();
+                values
+            };
+
+            let config = merge_config(fan_in, initial_count);
+            let merger = RunMerger::new(U64Codec, Natural, config);
+            let runs = spill_runs(&merger, batches, fan_in);
+
+            prop_assert_eq!(
+                runs.len(),
+                initial_count,
+                "spilled run count: fan-in={}, initial runs={}",
+                fan_in,
+                initial_count
+            );
+            let actual = collect_merged_values(merger, runs, fan_in, initial_count);
+
+            prop_assert_eq!(
+                actual,
+                expected,
+                "merged values differ from sorted input values: fan-in={}, initial runs={}",
+                fan_in,
+                initial_count
+            );
+
+            Ok(())
+        }
+
+        #[test]
+        fn merge_preserves_all_values_including_when_input_runs_are_empty() {
+            let scenarios = [
+                InitialRunCount::OneBelowFanIn,
+                InitialRunCount::EqualToFanIn,
+                InitialRunCount::OneAboveFanIn,
+                InitialRunCount::EqualToFanInSquared,
+                InitialRunCount::OneAboveFanInSquared,
+            ];
+
+            for fan_in in 2..=4 {
+                for scenario in scenarios {
+                    let count = initial_run_count(fan_in, scenario);
+                    let batches = vec![vec![0, 1, 1, u64::MAX]; count];
+                    assert_merge_preserves_sorted_input_values(fan_in, &batches)
+                        .unwrap_or_else(|error| panic!("check initial run count scenario {scenario:?}: fan-in={fan_in}, initial runs={count}: {error}"));
+                }
+
+                for batches in [
+                    vec![],
+                    vec![vec![], vec![]],
+                    vec![vec![], vec![0, 1], vec![]],
+                ] {
+                    let count = batches.len();
+                    assert_merge_preserves_sorted_input_values(fan_in, &batches)
+                        .unwrap_or_else(|error| panic!("check empty input runs: fan-in={fan_in}, initial runs={count}: {error}"));
+                }
+
+                let mut mixed = vec![vec![]; fan_in * fan_in + 1];
+                mixed[fan_in] = vec![0, 1, 1, u64::MAX];
+                let count = mixed.len();
+                assert_merge_preserves_sorted_input_values(fan_in, &mixed)
+                    .unwrap_or_else(|error| panic!("check mixed empty runs through intermediate merges: fan-in={fan_in}, initial runs={count}: {error}"));
+            }
+        }
+
+        #[test]
+        fn intermediate_merge_passes_respect_fan_in_and_expected_run_counts() {
+            let scenarios = [
+                InitialRunCount::OneBelowFanIn,
+                InitialRunCount::EqualToFanIn,
+                InitialRunCount::OneAboveFanIn,
+                InitialRunCount::EqualToFanInSquared,
+                InitialRunCount::OneAboveFanInSquared,
+            ];
+
+            for fan_in in 2..=4 {
+                for scenario in scenarios {
+                    let count = initial_run_count(fan_in, scenario);
+                    let batches = vec![vec![1]; count];
+                    let config = merge_config(fan_in, count);
+                    let merger = RunMerger::new(U64Codec, Natural, config);
+                    let runs = spill_runs(&merger, &batches, fan_in);
+
+                    let mut group_sizes = Vec::new();
+                    let reduced = reduce_runs(runs, fan_in, |group| {
+                        group_sizes.push(group.len());
+                        merger.spill_group(group)
+                    })
+                    .unwrap_or_else(|error| panic!("failed to write intermediate sorted run: fan-in={fan_in}, initial runs={count}, input run counts for each intermediate merge={group_sizes:?}: {error:?}"));
+
+                    let (expected_groups, expected_count) = match scenario {
+                        InitialRunCount::OneBelowFanIn | InitialRunCount::EqualToFanIn => {
+                            (vec![], count)
+                        }
+                        InitialRunCount::OneAboveFanIn => (vec![fan_in, 1], 2),
+                        InitialRunCount::EqualToFanInSquared => (vec![fan_in; fan_in], fan_in),
+                        InitialRunCount::OneAboveFanInSquared => {
+                            let mut groups = vec![fan_in; fan_in];
+                            groups.extend([1, fan_in, 1]);
+                            (groups, 2)
+                        }
+                    };
+
+                    assert_eq!(
+                        group_sizes, expected_groups,
+                        "input run counts for each intermediate merge: fan-in={fan_in}, initial runs={count}, scenario={scenario:?}"
+                    );
+                    assert_eq!(
+                        reduced.len(),
+                        expected_count,
+                        "runs after intermediate merges: fan-in={fan_in}, initial runs={count}, scenario={scenario:?}"
+                    );
+                    if fan_in == 2 && count == 5 {
+                        assert_eq!(
+                            group_sizes,
+                            [2, 2, 1, 2, 1],
+                            "two intermediate merge passes: fan-in={fan_in}, initial runs={count}"
+                        );
+                    }
+
+                    let output = collect_merged_values(merger, reduced, fan_in, count);
+                    assert_eq!(
+                        output,
+                        vec![1; count],
+                        "intermediate and final merges preserve values: fan-in={fan_in}, initial runs={count}"
+                    );
+                }
+            }
+        }
+
         proptest! {
-            #[test]
-            fn merged_output_is_always_sorted(
-                batches in proptest::collection::vec(arb_sorted_u64_vec(), 0..6),
-            ) {
-                let merger = RunMerger::new(U64Codec, Natural, MergeConfig::default());
-                let runs = spill_runs(&merger, &batches);
-                let results = collect_merged(merger, runs);
+            #![proptest_config(ProptestConfig {
+                cases: 32,
+                max_shrink_iters: 512,
+                failure_persistence: Some(Box::new(FileFailurePersistence::Direct(concat!(
+                    env!("CARGO_MANIFEST_DIR"), "/proptest-regressions/merge.txt"
+                )))),
+                ..ProptestConfig::default()
+            })]
 
-                prop_assert!(
-                    results.windows(2).all(|w| w[0] <= w[1]),
-                    "merged output must be sorted, got: {results:?}"
-                );
+            #[test]
+            fn merge_preserves_values_with_one_fewer_run_than_fan_in((fan_in, batches) in sorted_input_runs(InitialRunCount::OneBelowFanIn)) {
+                assert_merge_preserves_sorted_input_values(fan_in, &batches)?;
             }
 
             #[test]
-            fn merge_preserves_total_entry_count(
-                batches in proptest::collection::vec(arb_sorted_u64_vec(), 0..6),
-            ) {
-                let merger = RunMerger::new(U64Codec, Natural, MergeConfig::default());
-                let total_input: usize = batches.iter().map(Vec::len).sum();
-                let runs = spill_runs(&merger, &batches);
-                let output_count = collect_merged(merger, runs).len();
-
-                prop_assert_eq!(total_input, output_count);
+            fn merge_preserves_values_with_runs_equal_to_fan_in((fan_in, batches) in sorted_input_runs(InitialRunCount::EqualToFanIn)) {
+                assert_merge_preserves_sorted_input_values(fan_in, &batches)?;
             }
 
             #[test]
-            fn merge_output_matches_reference_sort(
-                batches in proptest::collection::vec(arb_sorted_u64_vec(), 0..6),
-            ) {
-                let merger = RunMerger::new(U64Codec, Natural, MergeConfig::default());
+            fn merge_preserves_values_with_one_more_run_than_fan_in((fan_in, batches) in sorted_input_runs(InitialRunCount::OneAboveFanIn)) {
+                assert_merge_preserves_sorted_input_values(fan_in, &batches)?;
+            }
 
-                let mut reference: Vec<u64> = batches.iter().flatten().copied().collect();
-                reference.sort_unstable();
+            #[test]
+            fn merge_preserves_values_with_runs_equal_to_fan_in_squared((fan_in, batches) in sorted_input_runs(InitialRunCount::EqualToFanInSquared)) {
+                assert_merge_preserves_sorted_input_values(fan_in, &batches)?;
+            }
 
-                let runs = spill_runs(&merger, &batches);
-                let results = collect_merged(merger, runs);
-
-                prop_assert_eq!(results, reference);
+            #[test]
+            fn merge_preserves_values_with_one_more_run_than_fan_in_squared((fan_in, batches) in sorted_input_runs(InitialRunCount::OneAboveFanInSquared)) {
+                assert_merge_preserves_sorted_input_values(fan_in, &batches)?;
             }
         }
     }
