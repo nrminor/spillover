@@ -1,17 +1,25 @@
-min_version = "2026.7.13"
+min_version = "2026.10.22"
 
 [tools]
-rust = { version = "1.96.0", profile = "minimal", components = ["clippy", "rustfmt", "rust-analyzer", "rust-src"] }
+rust = { version = "1.96.0", profile = "minimal", components = ["clippy", "rustfmt", "rust-analyzer", "rust-src"], mr_boxington = true }
+mr-boxington = "1.30.0"
+"github:bahdotsh/wrkflw" = "0.8.0"
 "github:nextest-rs/nextest" = { version = "0.9", version_prefix = "cargo-nextest-" }
 "aqua:boyter/scc" = "3"
 git-cliff = "2"
 "cargo:bacon" = "3.24.0"
 
+[env]
+MBX_SCHEDULER_TESTS = "1"
+RUSTDOCFLAGS = "-D warnings"
+
 [tasks.check]
 description = "Run all pre-commit checks"
 run = [
   { task = "fmt-check" },
+  { task = "ci-validate" },
   { task = "lint" },
+  { task = "lint-no-default-features" },
   { task = "test" },
   { task = "test-no-default-features" },
   { task = "doctest" },
@@ -22,9 +30,11 @@ run = [
 description = "Run all checks, including ignored tests"
 run = [
   { task = "fmt-check" },
+  { task = "ci-validate" },
   { task = "lint" },
+  { task = "lint-no-default-features" },
   { task = "test-all" },
-  { task = "test-no-default-features" },
+  { task = "test-no-default-features", args = ["--run-ignored", "all"] },
   { task = "doctest" },
   { task = "doc-check" },
 ]
@@ -39,43 +49,47 @@ run = "cargo fmt --all"
 
 [tasks.lint]
 description = "Run Clippy with warnings denied"
-run = "cargo clippy --all-targets --all-features -- -D warnings"
+run = "cargo clippy --locked --workspace --all-targets --all-features -- -D warnings"
+
+[tasks.lint-no-default-features]
+description = "Run Clippy without optional features"
+run = "cargo clippy --locked --workspace --all-targets --no-default-features -- -D warnings"
 
 [tasks.test]
 description = "Run the test suite"
-run = "cargo nextest run --all-features --no-tests=pass"
+run = "cargo nextest run --locked --workspace --all-features --no-tests=pass"
 
 [tasks.test-all]
 description = "Run the test suite, including ignored tests"
-run = "cargo nextest run --all-features --run-ignored all --no-tests=pass"
+run = "cargo nextest run --locked --workspace --all-features --run-ignored all --no-tests=pass"
 
 [tasks.test-no-default-features]
 description = "Run runtime tests without optional features"
-run = "cargo nextest run --workspace --no-default-features --no-tests=pass"
+run = "cargo nextest run --locked --workspace --no-default-features --no-tests=pass"
 
 [tasks.test-verbose]
 description = "Run tests with uncaptured output"
 interactive = true
-run = "cargo nextest run --all-features --no-capture --no-tests=pass"
+run = "cargo nextest run --locked --workspace --all-features --no-capture --no-tests=pass"
 
 [tasks.doctest]
 description = "Run doctests with and without optional features"
 run = [
-  "cargo test --workspace --doc --all-features",
-  "cargo test --workspace --doc --no-default-features",
+  "cargo test --locked --workspace --doc --all-features",
+  "cargo test --locked --workspace --doc --no-default-features",
 ]
 
 [tasks.build]
 description = "Build the workspace"
-run = "cargo build"
+run = "cargo build --locked --workspace"
 
 [tasks.build-release]
 description = "Build the workspace with the release profile"
-run = "cargo build --release"
+run = "cargo build --locked --workspace --release"
 
 [tasks.check-compile]
 description = "Check all targets and features without building artifacts"
-run = "cargo check --all-targets --all-features"
+run = "cargo check --locked --workspace --all-targets --all-features"
 
 [tasks.clean]
 description = "Remove Cargo build artifacts"
@@ -88,14 +102,27 @@ run = "cargo update"
 [tasks.doc-check]
 description = "Validate public documentation with and without optional features"
 run = [
-  "RUSTDOCFLAGS='-D rustdoc::broken_intra_doc_links -D rustdoc::private_intra_doc_links' cargo doc --workspace --no-deps --all-features",
-  "RUSTDOCFLAGS='-D rustdoc::broken_intra_doc_links -D rustdoc::private_intra_doc_links' cargo doc --workspace --no-deps --no-default-features",
+  "cargo doc --locked --workspace --no-deps --all-features",
+  "cargo doc --locked --workspace --no-deps --no-default-features",
 ]
 
 [tasks.doc]
 description = "Build and open documentation"
 interactive = true
-run = "cargo doc --no-deps --open"
+run = "cargo doc --locked --workspace --no-deps --open"
+
+[tasks.ci-validate]
+description = "Validate CI and release workflows"
+run = [
+  "wrkflw validate .github/workflows/ci.yml",
+  "wrkflw validate .github/workflows/release.yml",
+]
+
+[tasks."mbx:tui"]
+description = "Watch shared build-cache activity"
+alias = "mt"
+interactive = true
+run = "mbx tui"
 
 [tasks.sloc]
 description = "Count Rust source lines"

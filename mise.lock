@@ -82,6 +82,52 @@ checksum = "sha256:3ae3a5549e85c7ad5b20192ebcfee4371269deca51255f6f2f2e051c6541f
 url = "https://github.com/orhun/git-cliff/releases/download/v2.13.1/git-cliff-2.13.1-x86_64-pc-windows-msvc.zip"
 url_api = "https://api.github.com/repos/orhun/git-cliff/releases/assets/405851866"
 
+[[tools."github:bahdotsh/wrkflw"]]
+version = "0.8.0"
+backend = "github:bahdotsh/wrkflw"
+
+[tools."github:bahdotsh/wrkflw"."platforms.linux-arm64"]
+checksum = "sha256:44b9d02e3624aa808dfab22bbcc12f65564079e30bc5b7d82a3f32e1f0830234"
+checksum_source = "mise-versions"
+url = "https://github.com/bahdotsh/wrkflw/releases/download/v0.8.0/wrkflw-aarch64-unknown-linux-gnu.tar.gz"
+url_api = "https://api.github.com/repos/bahdotsh/wrkflw/releases/assets/401841584"
+
+[tools."github:bahdotsh/wrkflw"."platforms.linux-arm64-musl"]
+checksum = "sha256:44b9d02e3624aa808dfab22bbcc12f65564079e30bc5b7d82a3f32e1f0830234"
+checksum_source = "mise-versions"
+url = "https://github.com/bahdotsh/wrkflw/releases/download/v0.8.0/wrkflw-aarch64-unknown-linux-gnu.tar.gz"
+url_api = "https://api.github.com/repos/bahdotsh/wrkflw/releases/assets/401841584"
+
+[tools."github:bahdotsh/wrkflw"."platforms.linux-x64"]
+checksum = "sha256:d7140aa917da5bb13a2f27eab6c592bb019cbe4977e14390d579992087a6a902"
+checksum_source = "mise-versions"
+url = "https://github.com/bahdotsh/wrkflw/releases/download/v0.8.0/wrkflw-x86_64-unknown-linux-gnu.tar.gz"
+url_api = "https://api.github.com/repos/bahdotsh/wrkflw/releases/assets/401841586"
+
+[tools."github:bahdotsh/wrkflw"."platforms.linux-x64-musl"]
+checksum = "sha256:7606fecdc6816f8d1503929f41f1a9d57b25362b13193aaef2732df061a4de30"
+checksum_source = "mise-versions"
+url = "https://github.com/bahdotsh/wrkflw/releases/download/v0.8.0/wrkflw-x86_64-unknown-linux-musl.tar.gz"
+url_api = "https://api.github.com/repos/bahdotsh/wrkflw/releases/assets/401841582"
+
+[tools."github:bahdotsh/wrkflw"."platforms.macos-arm64"]
+checksum = "sha256:119932dc5c27e146a9ca88247a600a20054b7a243f790615057c81b5aca2bc78"
+checksum_source = "mise-versions"
+url = "https://github.com/bahdotsh/wrkflw/releases/download/v0.8.0/wrkflw-aarch64-apple-darwin.tar.gz"
+url_api = "https://api.github.com/repos/bahdotsh/wrkflw/releases/assets/401841585"
+
+[tools."github:bahdotsh/wrkflw"."platforms.macos-x64"]
+checksum = "sha256:a7b9603c09932f3cc783cb529b18a98cc323069e34db6e897dac011266fbb982"
+checksum_source = "mise-versions"
+url = "https://github.com/bahdotsh/wrkflw/releases/download/v0.8.0/wrkflw-x86_64-apple-darwin.tar.gz"
+url_api = "https://api.github.com/repos/bahdotsh/wrkflw/releases/assets/401841587"
+
+[tools."github:bahdotsh/wrkflw"."platforms.windows-x64"]
+checksum = "sha256:4ef968a5164402dd8284fe250a363a0a6d2e66e6c1b34f7e27b4b71a2554f369"
+checksum_source = "mise-versions"
+url = "https://github.com/bahdotsh/wrkflw/releases/download/v0.8.0/wrkflw-x86_64-pc-windows-msvc.zip"
+url_api = "https://api.github.com/repos/bahdotsh/wrkflw/releases/assets/401841588"
+
 [[tools."github:nextest-rs/nextest"]]
 version = "0.9.140"
 backend = "github:nextest-rs/nextest"
@@ -130,6 +176,40 @@ checksum = "sha256:ec39698dfe5bcfffb7d5da037f226bc1670584ba247123f4e684a0f224fe8
 url = "https://github.com/nextest-rs/nextest/releases/download/cargo-nextest-0.9.140/cargo-nextest-0.9.140-x86_64-pc-windows-msvc.zip"
 url_api = "https://api.github.com/repos/nextest-rs/nextest/releases/assets/467472279"
 provenance = "github-attestations"
+
+[[tools.mr-boxington]]
+version = "1.30.0"
+backend = "packslip:github.com/jdx/mr-boxington"
+
+[tools.mr-boxington."platforms.linux-arm64"]
+checksum = "sha256:6317bb6780404e78c3b670d95e128c85871809dfc541882b2efaa34120f45e71"
+url = "https://github.com/jdx/mr-boxington/releases/download/v1.30.0/mbx-aarch64-unknown-linux-gnu.tar.gz"
+signer = "sigstore-oidc:https://github.com/jdx/mr-boxington/.github/workflows/release.yml"
+
+[tools.mr-boxington."platforms.linux-arm64-musl"]
+checksum = "sha256:900844b980f9e3daf778d38a19046281cc35e07108a9c821befef6130846df1f"
+url = "https://github.com/jdx/mr-boxington/releases/download/v1.30.0/mbx-aarch64-unknown-linux-musl.tar.gz"
+signer = "sigstore-oidc:https://github.com/jdx/mr-boxington/.github/workflows/release.yml"
+
+[tools.mr-boxington."platforms.linux-x64"]
+checksum = "sha256:f4992b401fe65744b7c6e7400933d2106da205b499405621d088051a31a8f3f2"
+url = "https://github.com/jdx/mr-boxington/releases/download/v1.30.0/mbx-x86_64-unknown-linux-gnu.tar.gz"
+signer = "sigstore-oidc:https://github.com/jdx/mr-boxington/.github/workflows/release.yml"
+
+[tools.mr-boxington."platforms.linux-x64-musl"]
+checksum = "sha256:b523a9324d50fd434e355fc7a5af5f7155d62854dd6a5a74173d52655f168d45"
+url = "https://github.com/jdx/mr-boxington/releases/download/v1.30.0/mbx-x86_64-unknown-linux-musl.tar.gz"
+signer = "sigstore-oidc:https://github.com/jdx/mr-boxington/.github/workflows/release.yml"
+
+[tools.mr-boxington."platforms.macos-arm64"]
+checksum = "sha256:d5b957216c8b61c2df91c9e7aaf5febd45ec74274a60d3714ebe316edc144543"
+url = "https://github.com/jdx/mr-boxington/releases/download/v1.30.0/mbx-aarch64-apple-darwin.tar.gz"
+signer = "sigstore-oidc:https://github.com/jdx/mr-boxington/.github/workflows/release.yml"
+
+[tools.mr-boxington."platforms.windows-x64"]
+checksum = "sha256:2d709445957ea5dae95d51379aa9e7e575cfedb12c0d5731de4761a6972626f5"
+url = "https://github.com/jdx/mr-boxington/releases/download/v1.30.0/mbx-x86_64-pc-windows-msvc.zip"
+signer = "sigstore-oidc:https://github.com/jdx/mr-boxington/.github/workflows/release.yml"
 
 [[tools.rust]]
 version = "1.96.0"
