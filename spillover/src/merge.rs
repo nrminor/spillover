@@ -1589,6 +1589,348 @@ mod tests {
 
         use super::*;
 
+        // The high bytes identify a record; only the low byte participates in ordering.
+        #[derive(Clone, Copy)]
+        struct RoundedScoreCodec;
+
+        #[derive(Clone, Copy)]
+        struct ScoreOnly;
+
+        impl Compare<u64> for ScoreOnly {
+            fn compare(&self, left: &u64, right: &u64) -> Ordering {
+                (left & 255).cmp(&(right & 255))
+            }
+        }
+
+        impl Codec for RoundedScoreCodec {
+            type Error = std::io::Error;
+            type Cursor<R: Read> = U64KeyedReader<R>;
+
+            fn cursor<R: Read>(&self, source: R) -> Result<Self::Cursor<R>, Self::Error> {
+                U64KeyedCodec.cursor(source)
+            }
+        }
+
+        struct RoundedScoreReader<R: Read>(U64OnlyKeyedReader<R>);
+
+        impl<R: Read> CodecCursor for RoundedScoreReader<R> {
+            type Error = std::io::Error;
+            type Record = u64;
+
+            fn advance(&mut self) -> Result<bool, Self::Error> {
+                let advanced = self.0.advance()?;
+                if let Some(record) = &mut self.0.current {
+                    *record &= !3;
+                }
+                Ok(advanced)
+            }
+
+            fn with_current<T>(&mut self, f: impl FnOnce(&u64) -> T) -> Result<T, Self::Error> {
+                self.0.with_current(f)
+            }
+        }
+
+        impl<R: Read> TakeOwned for RoundedScoreReader<R> {
+            type Owned = u64;
+
+            fn take_owned(&mut self) -> Result<Option<u64>, Self::Error> {
+                self.0.take_owned()
+            }
+        }
+
+        impl<R: Read> KeyedCodecCursor<u8> for RoundedScoreReader<R> {
+            fn current_key(&self) -> Result<u8, Self::Error> {
+                self.0.current_key()
+            }
+        }
+
+        impl KeyedCodec for RoundedScoreCodec {
+            type Key = u8;
+            type KeyedCursor<R: Read> = RoundedScoreReader<R>;
+
+            fn keyed_cursor<R: Read>(
+                &self,
+                source: R,
+            ) -> Result<Self::KeyedCursor<R>, Self::Error> {
+                let reader = U64KeyedCodec.keyed_cursor(source)?;
+                Ok(RoundedScoreReader(reader))
+            }
+        }
+
+        impl EncodeKeyedRun<u64> for RoundedScoreCodec {
+            type KeyedWriter<W: Write> = U64OnlyKeyedWriter<W>;
+
+            fn keyed_writer<W: Write>(&self, dest: W) -> Self::KeyedWriter<W> {
+                U64OnlyKeyedWriter {
+                    inner: BufWriter::new(dest),
+                }
+            }
+        }
+
+        impl DeriveKey<u64> for RoundedScoreCodec {
+            fn derive_key(&self, item: &u64) -> u8 {
+                (item & 255) as u8
+            }
+        }
+
+        fn inspect_scored_run(run: &SortedRun, context: &str) -> Vec<(u64, u8)> {
+            let file = run
+                .reopen()
+                .unwrap_or_else(|error| panic!("{context}: open sorted run file: {error}"));
+            let mut cursor = RoundedScoreCodec
+                .keyed_cursor(file)
+                .unwrap_or_else(|error| panic!("{context}: create keyed run cursor: {error}"));
+            let mut entries = Vec::new();
+
+            loop {
+                let index = entries.len();
+                let advanced = cursor.advance().unwrap_or_else(|error| {
+                    panic!("{context}: advance to record {index}: {error}")
+                });
+                if !advanced {
+                    break;
+                }
+
+                let key = cursor.current_key().unwrap_or_else(|error| {
+                    panic!("{context}: read stored key for record {index}: {error}")
+                });
+                let record = cursor
+                    .with_current(|record| *record)
+                    .unwrap_or_else(|error| {
+                        panic!("{context}: read record data at index {index}: {error}")
+                    });
+                entries.push((record, key));
+            }
+
+            entries
+        }
+
+        fn independently_rounded_record(record: u64) -> u64 {
+            let identity = record >> 8;
+            let original_score = record & 255;
+            let rounded_score = original_score / 4 * 4;
+
+            (identity << 8) | rounded_score
+        }
+
+        fn assert_final_scored_records(
+            original: &[u64],
+            actual: &[u64],
+            fan_in: usize,
+            count: usize,
+        ) {
+            let original_scores: Vec<u8> = {
+                let mut scores = original
+                    .iter()
+                    .map(|record| (record & 255) as u8)
+                    .collect::<Vec<_>>();
+                scores.sort_unstable();
+                scores
+            };
+
+            let actual_scores: Vec<u8> = actual
+                .iter()
+                .enumerate()
+                .map(|(index, record)| {
+                    let identity = (record >> 8) as usize;
+                    let original_record = original.get(identity).unwrap_or_else(|| {
+                        panic!("read final record {index}: unknown identity {identity}: fan-in={fan_in}, initial runs={count}")
+                    });
+                    (original_record & 255) as u8
+                })
+                .collect();
+
+            assert_eq!(
+                actual_scores, original_scores,
+                "final original-key order: fan-in={fan_in}, initial runs={count}"
+            );
+            let expected: Vec<u64> = {
+                let mut records = original
+                    .iter()
+                    .copied()
+                    .map(independently_rounded_record)
+                    .collect::<Vec<_>>();
+                records.sort_unstable();
+                records
+            };
+            let actual_sorted = {
+                let mut records = actual.to_vec();
+                records.sort_unstable();
+                records
+            };
+
+            assert_eq!(
+                actual_sorted, expected,
+                "final transformed record multiset: fan-in={fan_in}, initial runs={count}"
+            );
+        }
+
+        fn scored_input_runs(scores: Vec<Vec<u8>>) -> Vec<Vec<u64>> {
+            let mut next_identity = 0_u64;
+            let mut runs = Vec::new();
+
+            for mut batch in scores {
+                // Every run contains the same non-multiple of four.
+                batch.push(1);
+                batch.sort_unstable();
+
+                let first_identity = next_identity;
+                next_identity += batch.len() as u64;
+                let records = batch
+                    .into_iter()
+                    .enumerate()
+                    .map(|(index, score)| {
+                        let identity = first_identity + index as u64;
+                        (identity << 8) | u64::from(score)
+                    })
+                    .collect();
+                runs.push(records);
+            }
+
+            runs
+        }
+
+        fn assert_intermediate_scored_run(
+            original: &[u64],
+            expected: Vec<(u64, u8)>,
+            actual: Vec<(u64, u8)>,
+            label: &str,
+        ) {
+            for (record_index, &(record, key)) in actual.iter().enumerate() {
+                let identity = (record >> 8) as usize;
+                let original_record = original.get(identity).unwrap_or_else(|| {
+                    panic!("{label}: unknown identity at record {record_index}: {identity}")
+                });
+                let original_score = original_record & 255;
+                assert_eq!(
+                    u64::from(key),
+                    original_score,
+                    "{label}: original key at record {record_index}, identity={identity}"
+                );
+            }
+
+            let keys_are_ordered = actual.windows(2).all(|pair| pair[0].1 <= pair[1].1);
+            assert!(
+                keys_are_ordered,
+                "{label}: intermediate records are not in stored key order"
+            );
+
+            let expected = {
+                let mut entries = expected;
+                entries.sort_unstable();
+                entries
+            };
+            let actual = {
+                let mut entries = actual;
+                entries.sort_unstable();
+                entries
+            };
+            assert_eq!(actual, expected, "{label}: record and key multiset");
+        }
+
+        fn assert_original_keys_through_two_passes(fan_in: usize, scores: Vec<Vec<u8>>) {
+            let count = fan_in * fan_in + 1;
+            let config = merge_config(fan_in, count);
+            let merger = RunMerger::new(RoundedScoreCodec, ScoreOnly, config.clone());
+            let batches = scored_input_runs(scores);
+            let original: Vec<u64> = batches.iter().flatten().copied().collect();
+            let runs: Vec<SortedRun> = batches
+                .into_iter()
+                .enumerate()
+                .map(|(run_index, records)| {
+                    merger.spill_sorted_with_keys(records).unwrap_or_else(|error| {
+                        panic!("spill input run {run_index}: fan-in={fan_in}, initial runs={count}: {error:?}")
+                    })
+                })
+                .collect();
+
+            assert_eq!(
+                runs.len(),
+                count,
+                "initial run count: fan-in={fan_in}, initial runs={count}"
+            );
+            let context = KeyedContext {
+                codec: RoundedScoreCodec,
+                config,
+                primary: Natural,
+                secondary: ScoreOnly,
+                mode: std::marker::PhantomData::<fn() -> ()>,
+            };
+
+            let mut writes = 0;
+            let reduced = reduce_runs(runs, fan_in, |group| {
+                // f²+1 inputs produce f+1 writes in pass one, then two in pass two.
+                let pass = if writes < fan_in + 1 { 1 } else { 2 };
+                let run_index = if pass == 1 {
+                    writes
+                } else {
+                    writes - fan_in - 1
+                };
+                let label = format!(
+                    "intermediate pass {pass}, run {run_index}: fan-in={fan_in}, initial runs={count}"
+                );
+
+                let source = if pass == 1 { "initial" } else { "previous intermediate" };
+                let expected: Vec<_> = group
+                    .iter()
+                    .enumerate()
+                    .flat_map(|(input_index, run)| {
+                        let input_label = format!("{label}: read {source} input file {input_index}");
+                        inspect_scored_run(run, &input_label)
+                    })
+                    .collect();
+
+                let run = context
+                    .spill_group(group)
+                    .unwrap_or_else(|error| panic!("{label}: write intermediate sorted run: {error:?}"));
+
+                let output_label = format!("{label}: read newly written intermediate file");
+                let actual = inspect_scored_run(&run, &output_label);
+                assert_intermediate_scored_run(&original, expected, actual, &label);
+
+                writes += 1;
+                Ok(run)
+            })
+            .unwrap_or_else(|error: MergeError<std::io::Error>| {
+                panic!("merge input sorted runs into intermediate runs: fan-in={fan_in}, initial runs={count}: {error:?}")
+            });
+
+            assert_eq!(
+                writes,
+                fan_in + 3,
+                "two intermediate passes: fan-in={fan_in}, initial runs={count}"
+            );
+            assert_eq!(
+                reduced.len(),
+                2,
+                "runs after two intermediate passes: fan-in={fan_in}, initial runs={count}"
+            );
+            let output = merger
+                .merge_keyed(reduced, Natural)
+                .unwrap_or_else(|error| {
+                    panic!("start final merge: fan-in={fan_in}, initial runs={count}: {error:?}")
+                });
+            let actual: Vec<u64> = output
+                .enumerate()
+                .map(|(index, result)| {
+                    result.unwrap_or_else(|error| {
+                        panic!("read final record {index}: fan-in={fan_in}, initial runs={count}: {error:?}")
+                    })
+                })
+                .collect();
+
+            assert_final_scored_records(&original, &actual, fan_in, count);
+        }
+
+        #[test]
+        fn original_keys_survive_two_passes_for_fan_in_two_three_and_four() {
+            for fan_in in 2..=4 {
+                let count = fan_in * fan_in + 1;
+                let scores = vec![vec![0, 3, 4, 7]; count];
+                assert_original_keys_through_two_passes(fan_in, scores);
+            }
+        }
+
         #[derive(Clone, Copy, Debug)]
         enum InitialRunCount {
             OneBelowFanIn,
@@ -1822,6 +2164,18 @@ mod tests {
                 )))),
                 ..ProptestConfig::default()
             })]
+
+            #[test]
+            fn original_keys_stay_with_records_through_two_intermediate_passes(
+                (fan_in, scores) in (2usize..=4).prop_flat_map(|fan_in| {
+                    let run_count = fan_in * fan_in + 1;
+                    let run = proptest::collection::vec(0u8..64, 0..4);
+                    proptest::collection::vec(run, run_count)
+                        .prop_map(move |scores| (fan_in, scores))
+                })
+            ) {
+                assert_original_keys_through_two_passes(fan_in, scores);
+            }
 
             #[test]
             fn merge_preserves_values_with_one_fewer_run_than_fan_in((fan_in, batches) in sorted_input_runs(InitialRunCount::OneBelowFanIn)) {
