@@ -21,6 +21,18 @@ use std::{
     path::PathBuf,
 };
 
+#[cfg(test)]
+use std::{
+    cell::Cell,
+    io::{Read, Write},
+};
+
+#[cfg(test)]
+use proptest::{prelude::*, test_runner::FileFailurePersistence};
+
+#[cfg(test)]
+use crate::{codec::DeriveKey, compare::Natural};
+
 use crate::{
     SortedItemsError,
     codec::{
@@ -1013,10 +1025,7 @@ where
 
 #[cfg(test)]
 mod tests {
-    use std::io::{BufWriter, Read, Write};
-
     use super::*;
-    use crate::{codec::DeriveKey, compare::Natural};
 
     #[derive(Clone, Copy)]
     struct U64Codec;
@@ -1119,6 +1128,201 @@ mod tests {
             U64Writer {
                 inner: BufWriter::new(dest),
             }
+        }
+    }
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum FaultOperation {
+        Write,
+        Finish,
+        Open,
+        Advance,
+        Current,
+        Take,
+        Key,
+    }
+
+    struct FaultState {
+        operation: FaultOperation,
+        ordinal: usize,
+        calls: Cell<usize>,
+        live: Cell<usize>,
+        peak: Cell<usize>,
+    }
+
+    impl FaultState {
+        fn check(&self, operation: FaultOperation) -> std::io::Result<()> {
+            if operation == self.operation {
+                let calls = self.calls.get() + 1;
+                self.calls.set(calls);
+                if calls == self.ordinal {
+                    return Err(std::io::Error::other("selected cursor fault"));
+                }
+            }
+            Ok(())
+        }
+    }
+
+    #[derive(Clone, Copy)]
+    struct FaultCodec<'a>(&'a FaultState);
+
+    struct FaultReader<'a, R: Read> {
+        inner: U64Reader<R>,
+        state: &'a FaultState,
+    }
+
+    impl<R: Read> Drop for FaultReader<'_, R> {
+        fn drop(&mut self) {
+            self.state.live.set(self.state.live.get() - 1);
+        }
+    }
+
+    impl<R: Read> CodecCursor for FaultReader<'_, R> {
+        type Error = std::io::Error;
+        type Record = u64;
+
+        fn advance(&mut self) -> Result<bool, Self::Error> {
+            self.state.check(FaultOperation::Advance)?;
+            self.inner.advance()
+        }
+
+        fn with_current<T>(&mut self, f: impl FnOnce(&u64) -> T) -> Result<T, Self::Error> {
+            self.state.check(FaultOperation::Current)?;
+            self.inner.with_current(f)
+        }
+    }
+
+    impl<R: Read> TakeOwned for FaultReader<'_, R> {
+        type Owned = u64;
+
+        fn take_owned(&mut self) -> Result<Option<u64>, Self::Error> {
+            self.state.check(FaultOperation::Take)?;
+            self.inner.take_owned()
+        }
+    }
+
+    impl<'a> Codec for FaultCodec<'a> {
+        type Error = std::io::Error;
+        type Cursor<R: Read> = FaultReader<'a, R>;
+
+        fn cursor<R: Read>(&self, source: R) -> Result<Self::Cursor<R>, Self::Error> {
+            self.0.check(FaultOperation::Open)?;
+            let live = self.0.live.get() + 1;
+            self.0.live.set(live);
+            self.0.peak.set(self.0.peak.get().max(live));
+            Ok(FaultReader {
+                inner: U64Reader {
+                    inner: source,
+                    current: None,
+                },
+                state: self.0,
+            })
+        }
+    }
+
+    impl<'a> EncodeRun<u64> for FaultCodec<'a> {
+        type Writer<W: Write> = FaultWriter<'a, W>;
+
+        fn writer<W: Write>(&self, dest: W) -> Self::Writer<W> {
+            FaultWriter {
+                inner: U64Writer {
+                    inner: BufWriter::new(dest),
+                },
+                state: self.0,
+            }
+        }
+    }
+
+    struct FaultWriter<'a, W: Write> {
+        inner: U64Writer<W>,
+        state: &'a FaultState,
+    }
+
+    impl<W: Write> CodecWriter<u64> for FaultWriter<'_, W> {
+        type Error = std::io::Error;
+
+        fn write(&mut self, item: &u64) -> Result<(), Self::Error> {
+            self.state.check(FaultOperation::Write)?;
+            self.inner.write(item)
+        }
+
+        fn finish(self) -> Result<(), Self::Error> {
+            self.state.check(FaultOperation::Finish)?;
+            <U64Writer<W> as CodecWriter<u64>>::finish(self.inner)
+        }
+    }
+
+    struct FaultKeyedReader<'a, R: Read> {
+        inner: U64OnlyKeyedReader<R>,
+        state: &'a FaultState,
+    }
+
+    impl<R: Read> Drop for FaultKeyedReader<'_, R> {
+        fn drop(&mut self) {
+            self.state.live.set(self.state.live.get() - 1);
+        }
+    }
+
+    impl<R: Read> CodecCursor for FaultKeyedReader<'_, R> {
+        type Error = std::io::Error;
+        type Record = u64;
+
+        fn advance(&mut self) -> Result<bool, Self::Error> {
+            self.inner.advance()
+        }
+
+        fn with_current<T>(&mut self, f: impl FnOnce(&u64) -> T) -> Result<T, Self::Error> {
+            self.inner.with_current(f)
+        }
+    }
+
+    impl<R: Read> TakeOwned for FaultKeyedReader<'_, R> {
+        type Owned = u64;
+
+        fn take_owned(&mut self) -> Result<Option<u64>, Self::Error> {
+            self.inner.take_owned()
+        }
+    }
+
+    impl<R: Read> KeyedCodecCursor<u8> for FaultKeyedReader<'_, R> {
+        fn current_key(&self) -> Result<u8, Self::Error> {
+            self.state.check(FaultOperation::Key)?;
+            self.inner.current_key()
+        }
+    }
+
+    impl<'a> KeyedCodec for FaultCodec<'a> {
+        type Key = u8;
+        type KeyedCursor<R: Read> = FaultKeyedReader<'a, R>;
+
+        fn keyed_cursor<R: Read>(&self, source: R) -> Result<Self::KeyedCursor<R>, Self::Error> {
+            let live = self.0.live.get() + 1;
+            self.0.live.set(live);
+            self.0.peak.set(self.0.peak.get().max(live));
+            Ok(FaultKeyedReader {
+                inner: U64OnlyKeyedReader {
+                    inner: source,
+                    current_key: None,
+                    current: None,
+                },
+                state: self.0,
+            })
+        }
+    }
+
+    impl EncodeKeyedRun<u64> for FaultCodec<'_> {
+        type KeyedWriter<W: Write> = U64OnlyKeyedWriter<W>;
+
+        fn keyed_writer<W: Write>(&self, dest: W) -> Self::KeyedWriter<W> {
+            U64OnlyKeyedWriter {
+                inner: BufWriter::new(dest),
+            }
+        }
+    }
+
+    impl DeriveKey<u64> for FaultCodec<'_> {
+        fn derive_key(&self, item: &u64) -> u8 {
+            U64KeyedCodec.derive_key(item)
         }
     }
 
@@ -1583,10 +1787,54 @@ mod tests {
         );
     }
 
-    mod proptests {
-        use proptest::prelude::*;
-        use proptest::test_runner::FileFailurePersistence;
+    #[test]
+    fn intermediate_refill_fault_retires_all_runs_and_readers() {
+        let directory =
+            tempfile::tempdir().expect("create directory for intermediate refill fault");
+        let state = FaultState {
+            operation: FaultOperation::Advance,
+            ordinal: 3,
+            calls: Cell::new(0),
+            live: Cell::new(0),
+            peak: Cell::new(0),
+        };
+        let config = MergeConfig {
+            max_fan_in: NonZeroUsize::new(2).expect("fan-in two is nonzero"),
+            temp_dir: Some(directory.path().to_path_buf()),
+            ..MergeConfig::default()
+        };
+        let merger = RunMerger::new(FaultCodec(&state), Natural, config);
+        let mut runs = Vec::new();
+        for value in [0_u64, 1, 2] {
+            let run = merger
+                .spill_sorted([value])
+                .expect("spill input for intermediate refill fault");
+            runs.push(run);
+        }
 
+        let result = merger.merge(runs);
+
+        match result {
+            Err(MergeError::Codec(error)) => {
+                assert_eq!(
+                    error.to_string(),
+                    "selected cursor fault",
+                    "intermediate refill error"
+                );
+            }
+            Err(error) => panic!("unexpected intermediate refill error: {error:?}"),
+            Ok(_) => panic!("intermediate refill should fail at advance ordinal 3"),
+        }
+        assert_eq!(state.calls.get(), 3, "intermediate refill fault reached");
+        assert_eq!(state.live.get(), 0, "intermediate readers retired");
+        assert!(state.peak.get() <= 2, "intermediate reader fan-in");
+        let remaining = std::fs::read_dir(directory.path())
+            .expect("inspect intermediate refill directory")
+            .count();
+        assert_eq!(remaining, 0, "intermediate and input run files retired");
+    }
+
+    mod proptests {
         use super::*;
 
         // The high bytes identify a record; only the low byte participates in ordering.
@@ -2156,14 +2404,296 @@ mod tests {
         }
 
         proptest! {
-            #![proptest_config(ProptestConfig {
-                cases: 32,
-                max_shrink_iters: 512,
-                failure_persistence: Some(Box::new(FileFailurePersistence::Direct(concat!(
+            #![proptest_config({
+                let mut config = ProptestConfig::default();
+                if std::env::var_os("PROPTEST_CASES").is_none() {
+                    config.cases = 32;
+                }
+                config.max_shrink_iters = 512;
+                config.failure_persistence = Some(Box::new(FileFailurePersistence::Direct(concat!(
                     env!("CARGO_MANIFEST_DIR"), "/proptest-regressions/merge.txt"
-                )))),
-                ..ProptestConfig::default()
+                ))));
+                config
             })]
+
+            #[test]
+            fn keyed_cursor_faults_stop_output_and_retire_readers(ordinal in 1usize..=12) {
+                let directory = tempfile::tempdir().expect("create isolated directory for keyed fault");
+                let state = FaultState {
+                    operation: FaultOperation::Key,
+                    ordinal,
+                    calls: Cell::new(0),
+                    live: Cell::new(0),
+                    peak: Cell::new(0),
+                };
+                let config = MergeConfig {
+                    max_fan_in: NonZeroUsize::new(3).expect("fan-in three is nonzero"),
+                    temp_dir: Some(directory.path().to_path_buf()),
+                    ..MergeConfig::default()
+                };
+                let merger = RunMerger::new(FaultCodec(&state), Natural, config);
+                let mut runs = Vec::new();
+                for run in 0..3_u64 {
+                    let values = [run, run + 3, run + 6, run + 9];
+                    let spilled = merger.spill_sorted_with_keys(values).unwrap_or_else(|error| {
+                        panic!("spill keyed initial run {run}: key ordinal={ordinal}: {error:?}")
+                    });
+                    runs.push(spilled);
+                }
+
+                let mut output = merger.merge_keyed(runs, Natural).unwrap_or_else(|error| {
+                    panic!("prepare final keyed merge: key ordinal={ordinal}: {error:?}")
+                });
+                let mut delivered = Vec::new();
+                let mut fault_reached = false;
+                for _ in 0..=12 {
+                    match output.next() {
+                        Some(Ok(value)) => delivered.push(value),
+                        Some(Err(MergeError::Codec(error))) => {
+                            assert_eq!(error.to_string(), "selected cursor fault", "key access ordinal={ordinal}");
+                            fault_reached = true;
+                            break;
+                        }
+                        other => panic!("expected final key fault: ordinal={ordinal}, delivered={delivered:?}, result={other:?}"),
+                    }
+                }
+
+                prop_assert!(fault_reached, "key fault not reached within 12 records: ordinal={}, delivered={:?}", ordinal, delivered);
+                // Three initial keys seed the nonempty runs; subsequent keys
+                // are fetched only after the preceding winner was delivered.
+                let count = ordinal.saturating_sub(3);
+                let expected: Vec<u64> = (0..count as u64).collect();
+                prop_assert_eq!(&delivered, &expected, "final keyed prefix: key ordinal={}", ordinal);
+                prop_assert!(output.next().is_none(), "terminal keyed output: key ordinal={}", ordinal);
+                drop(output);
+                prop_assert_eq!(state.calls.get(), ordinal, "key fault reached: ordinal={}", ordinal);
+                prop_assert_eq!(state.live.get(), 0, "keyed readers retired: ordinal={}", ordinal);
+                let remaining = std::fs::read_dir(directory.path()).expect("inspect keyed fault directory").count();
+                prop_assert_eq!(remaining, 0, "keyed run files retired: ordinal={}", ordinal);
+            }
+
+            #[test]
+            fn visitor_failure_stops_callbacks_and_retires_readers(ordinal in 1usize..=12) {
+                let directory = tempfile::tempdir().expect("create isolated directory for visitor fault");
+                let state = FaultState {
+                    operation: FaultOperation::Advance,
+                    ordinal: 256,
+                    calls: Cell::new(0),
+                    live: Cell::new(0),
+                    peak: Cell::new(0),
+                };
+                let config = MergeConfig {
+                    max_fan_in: NonZeroUsize::new(3).expect("fan-in three is nonzero"),
+                    temp_dir: Some(directory.path().to_path_buf()),
+                    ..MergeConfig::default()
+                };
+                let merger = RunMerger::new(FaultCodec(&state), Natural, config);
+                let mut runs = Vec::new();
+                for run in 0..3_u64 {
+                    let values = [run, run + 3, run + 6, run + 9];
+                    let spilled = merger.spill_sorted(values).unwrap_or_else(|error| {
+                        panic!("spill visitor input run {run}: callback ordinal={ordinal}: {error:?}")
+                    });
+                    runs.push(spilled);
+                }
+
+                let output = merger.merge(runs).expect("prepare visitor final merge");
+                let mut visited = Vec::new();
+                let mut advances_at_error = None;
+                let result = output.visit_items(|value| {
+                    visited.push(*value);
+                    if visited.len() == ordinal {
+                        advances_at_error = Some(state.calls.get());
+                        Err("visitor stopped")
+                    } else {
+                        Ok(())
+                    }
+                });
+
+                prop_assert!(matches!(result, Err(SortedItemsError::Sink("visitor stopped"))), "visitor error: ordinal={}, result={:?}", ordinal, result);
+                prop_assert_eq!(advances_at_error, Some(state.calls.get()), "no cursor advance after visitor error: ordinal={}", ordinal);
+                let expected: Vec<u64> = (0..ordinal as u64).collect();
+                prop_assert_eq!(visited, expected, "callbacks including failing visit: ordinal={}", ordinal);
+                prop_assert_eq!(state.live.get(), 0, "readers retired after visitor error: ordinal={}", ordinal);
+                let remaining = std::fs::read_dir(directory.path()).expect("inspect visitor fault directory").count();
+                prop_assert_eq!(remaining, 0, "run files retired after visitor error: ordinal={}", ordinal);
+            }
+
+            #[test]
+            fn initial_and_intermediate_writer_faults_release_runs_and_readers(
+                operation in prop_oneof![Just(FaultOperation::Write), Just(FaultOperation::Finish)],
+                ordinal in 1usize..=4,
+            ) {
+                let directory = tempfile::tempdir().expect("create isolated directory for writer fault");
+                let state = FaultState {
+                    operation,
+                    ordinal,
+                    calls: Cell::new(0),
+                    live: Cell::new(0),
+                    peak: Cell::new(0),
+                };
+                let config = MergeConfig {
+                    max_fan_in: NonZeroUsize::new(2).expect("fan-in two is nonzero"),
+                    temp_dir: Some(directory.path().to_path_buf()),
+                    ..MergeConfig::default()
+                };
+                let merger = RunMerger::new(FaultCodec(&state), Natural, config);
+                let mut runs = Vec::new();
+                let mut failure = None;
+                for index in 0..3_u64 {
+                    match merger.spill_sorted([index]) {
+                        Ok(run) => runs.push(run),
+                        Err(error) => {
+                            failure = Some(error);
+                            break;
+                        }
+                    }
+                }
+                if failure.is_none() {
+                    match merger.merge(runs) {
+                        Err(error) => failure = Some(error),
+                        Ok(_) => panic!("expected intermediate writer fault: operation={operation:?}, ordinal={ordinal}"),
+                    }
+                } else {
+                    drop(runs);
+                }
+
+                match failure {
+                    Some(MergeError::Codec(error)) => assert_eq!(
+                        error.to_string(), "selected cursor fault",
+                        "writer fault provenance: operation={operation:?}, ordinal={ordinal}"
+                    ),
+                    other => panic!("expected codec writer fault: operation={operation:?}, ordinal={ordinal}, result={other:?}"),
+                }
+                prop_assert_eq!(state.calls.get(), ordinal, "writer fault reached: operation={:?}, ordinal={}", operation, ordinal);
+                prop_assert_eq!(state.live.get(), 0, "readers retired after writer fault: operation={:?}, ordinal={}", operation, ordinal);
+                let remaining = std::fs::read_dir(directory.path()).expect("inspect writer fault directory").count();
+                prop_assert_eq!(remaining, 0, "run files retired after writer fault: operation={:?}, ordinal={}", operation, ordinal);
+            }
+
+            #[test]
+            fn cursor_faults_stop_owned_output_and_release_readers(
+                (operation, ordinal) in prop_oneof![
+                    (Just(FaultOperation::Open), 1usize..=3),
+                    (Just(FaultOperation::Advance), 1usize..=12),
+                    (Just(FaultOperation::Current), 1usize..=4),
+                    (Just(FaultOperation::Take), 1usize..=12),
+                ],
+            ) {
+                let directory = tempfile::tempdir().expect("create isolated directory for final merge");
+                let state = FaultState {
+                    operation,
+                    ordinal,
+                    calls: Cell::new(0),
+                    live: Cell::new(0),
+                    peak: Cell::new(0),
+                };
+                let config = MergeConfig {
+                    max_fan_in: NonZeroUsize::new(3).expect("fan-in three is nonzero"),
+                    temp_dir: Some(directory.path().to_path_buf()),
+                    ..MergeConfig::default()
+                };
+                let merger = RunMerger::new(FaultCodec(&state), Natural, config);
+                let mut runs = Vec::new();
+                for run in 0..3_u64 {
+                    let values = [run, run + 3, run + 6, run + 9];
+                    let spilled = merger.spill_sorted(values).unwrap_or_else(|error| {
+                        panic!("spill initial run {run}: operation={operation:?}, ordinal={ordinal}: {error:?}")
+                    });
+                    runs.push(spilled);
+                }
+
+                let mut output = merger.merge(runs).unwrap_or_else(|error| {
+                    panic!("prepare final merge: operation={operation:?}, ordinal={ordinal}: {error:?}")
+                });
+                let mut delivered = Vec::new();
+                let mut fault_reached = false;
+                for _ in 0..=12 {
+                    match output.next() {
+                        Some(Ok(value)) => delivered.push(value),
+                        Some(Err(MergeError::Codec(error))) => {
+                            assert_eq!(error.to_string(), "selected cursor fault", "final merge operation={operation:?}, ordinal={ordinal}");
+                            fault_reached = true;
+                            break;
+                        }
+                        other => panic!("expected selected final merge fault: operation={operation:?}, ordinal={ordinal}, delivered={delivered:?}, result={other:?}"),
+                    }
+                }
+
+                prop_assert!(fault_reached, "fault not reached within 12 records: operation={:?}, ordinal={}, delivered={:?}", operation, ordinal, delivered);
+                // Opening and seeding precede delivery. A successful take
+                // delivers one winner; each later advance refills that winner.
+                let count = match operation {
+                    FaultOperation::Open => 0,
+                    FaultOperation::Take => ordinal - 1,
+                    FaultOperation::Advance => ordinal.saturating_sub(3),
+                    FaultOperation::Current => delivered.len(),
+                    _ => unreachable!("only generated cursor operations are selected"),
+                };
+                let expected: Vec<u64> = (0..count as u64).collect();
+                prop_assert_eq!(&delivered, &expected, "lawful final prefix: operation={:?}, ordinal={}", operation, ordinal);
+                prop_assert!(output.next().is_none(), "terminal owned output: operation={operation:?}, ordinal={ordinal}");
+                drop(output);
+                prop_assert_eq!(state.calls.get(), ordinal, "fault reached: operation={:?}, ordinal={}", operation, ordinal);
+                prop_assert_eq!(state.live.get(), 0, "readers retired after final merge fault: operation={:?}, ordinal={}", operation, ordinal);
+                prop_assert!(state.peak.get() <= 3, "reader fan-in: operation={operation:?}, ordinal={ordinal}");
+                let remaining = std::fs::read_dir(directory.path()).expect("inspect final merge directory").count();
+                prop_assert_eq!(remaining, 0, "run files retired after final merge fault: operation={:?}, ordinal={}", operation, ordinal);
+            }
+
+            #[test]
+            fn readers_and_run_files_retire_after_completion_or_early_drop(
+                fan_in in 2usize..=4,
+                early_drop in any::<bool>(),
+            ) {
+                let count = fan_in * fan_in + 1;
+                let directory = tempfile::tempdir().expect("create isolated directory for multipass merge");
+                let state = FaultState {
+                    operation: FaultOperation::Open,
+                    ordinal: 256,
+                    calls: Cell::new(0),
+                    live: Cell::new(0),
+                    peak: Cell::new(0),
+                };
+                let config = MergeConfig {
+                    max_fan_in: NonZeroUsize::new(fan_in).expect("generated fan-in is nonzero"),
+                    temp_dir: Some(directory.path().to_path_buf()),
+                    ..MergeConfig::default()
+                };
+                let merger = RunMerger::new(FaultCodec(&state), Natural, config);
+                let mut runs = Vec::new();
+                for index in 0..count {
+                    let run = merger.spill_sorted([index as u64]).unwrap_or_else(|error| {
+                        panic!("spill initial run {index}: fan-in={fan_in}, initial runs={count}: {error:?}")
+                    });
+                    runs.push(run);
+                }
+
+                let mut output = merger.merge(runs).unwrap_or_else(|error| {
+                    panic!("intermediate merge: fan-in={fan_in}, initial runs={count}: {error:?}")
+                });
+                let mut delivered = Vec::new();
+                let limit = if early_drop { 1 } else { count };
+                for index in 0..limit {
+                    let value = output.next().unwrap_or_else(|| {
+                        panic!("missing final record {index}: fan-in={fan_in}, initial runs={count}")
+                    }).unwrap_or_else(|error| {
+                        panic!("deliver final record {index}: fan-in={fan_in}, initial runs={count}: {error:?}")
+                    });
+                    delivered.push(value);
+                }
+                if !early_drop {
+                    prop_assert!(output.next().is_none(), "final merge exhausted: fan-in={}, initial runs={}", fan_in, count);
+                }
+                drop(output);
+
+                let expected: Vec<u64> = (0..limit as u64).collect();
+                prop_assert_eq!(delivered, expected, "final prefix: fan-in={}, initial runs={}, early drop={}", fan_in, count, early_drop);
+                prop_assert_eq!(state.live.get(), 0, "readers retired: fan-in={}, initial runs={}, early drop={}", fan_in, count, early_drop);
+                prop_assert!(state.peak.get() <= fan_in, "reader fan-in: fan-in={}, initial runs={}, peak={}", fan_in, count, state.peak.get());
+                let remaining = std::fs::read_dir(directory.path()).expect("inspect multipass merge directory").count();
+                prop_assert_eq!(remaining, 0, "run files retired: fan-in={}, initial runs={}, early drop={}", fan_in, count, early_drop);
+            }
 
             #[test]
             fn original_keys_stay_with_records_through_two_intermediate_passes(

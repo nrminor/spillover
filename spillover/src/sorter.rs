@@ -16,9 +16,23 @@
 
 use std::{alloc::Layout, fs::File, io::BufReader};
 
+#[cfg(test)]
+use std::io::{BufWriter, Read, Write};
+
 pub mod in_memory;
 
 use get_size2::GetSize;
+#[cfg(test)]
+use proptest::{prelude::*, test_runner::FileFailurePersistence};
+
+#[cfg(test)]
+use crate::{
+    chunk::SortMemory,
+    codec::{CodecWriter, KeyedCodecCursor, KeyedCodecWriter, TakeOwned},
+    compare::Reverse,
+    dedup::AdjacentDedup,
+    key::Owned,
+};
 
 use crate::{
     SortedItemsError,
@@ -2874,23 +2888,110 @@ where
 
 #[cfg(test)]
 mod tests {
-    use std::io::{BufWriter, Read, Write};
-
     use super::*;
-    use crate::{
-        codec::{
-            CodecCursor, CodecWriter, DeriveKey, EncodeKeyedRun, EncodeRun, KeyedCodec,
-            KeyedCodecCursor, KeyedCodecWriter, TakeOwned,
-        },
-        compare::Reverse,
-        dedup::AdjacentDedup,
-        key::Owned,
-    };
 
     #[derive(Clone, Copy)]
     struct U64Codec;
 
     struct DoubleVisits<S>(S);
+
+    struct GrowingSummarySort;
+
+    struct KeyOrder;
+
+    impl Compare<u64> for KeyOrder {
+        fn compare(&self, left: &u64, right: &u64) -> std::cmp::Ordering {
+            left.cmp(right)
+        }
+    }
+
+    impl crate::key::KeyedOrder for KeyOrder {
+        type StoredKey = u8;
+
+        fn compare_keys(&self, left: &u8, right: &u8) -> std::cmp::Ordering {
+            left.cmp(right)
+        }
+    }
+
+    impl crate::key::DeriveKey<u64> for KeyOrder {
+        fn derive_key(&self, item: &u64) -> u8 {
+            u8::try_from(*item).expect("test key fits in a byte")
+        }
+    }
+
+    impl crate::key::EstimateKeyMemory<u64> for KeyOrder {
+        fn estimate_key_memory(&self, _: &u64) -> crate::key::KeyMemory {
+            crate::key::KeyMemory::NONE.with_derivation_scratch(100)
+        }
+    }
+
+    impl<C: Compare<crate::key::Keyed<usize, u8>> + ?Sized>
+        ChunkSorter<crate::key::Keyed<usize, u8>, C> for GrowingSummarySort
+    {
+        fn sort(&self, items: &mut [crate::key::Keyed<usize, u8>], order: &C) {
+            Sequential.sort(items, order);
+        }
+    }
+
+    impl EstimateSortMemory<crate::key::Keyed<usize, u8>, usize> for GrowingSummarySort {
+        fn sort_memory(&self, _: usize, _: &usize) -> SortMemory {
+            SortMemory::temporary(80)
+        }
+    }
+
+    impl ChunkSorter<u64, Natural> for GrowingSummarySort {
+        fn sort(&self, items: &mut [u64], order: &Natural) {
+            Sequential.sort(items, order);
+        }
+    }
+
+    impl SortMemorySummary for GrowingSummarySort {
+        type Summary = usize;
+
+        fn summary(&self) -> usize {
+            0
+        }
+
+        fn summary_allowance(&self, _: Option<&usize>) -> (usize, usize) {
+            (0, 0)
+        }
+    }
+
+    impl SummarizeSortInput<u64> for GrowingSummarySort {
+        fn summarize(&self, _: &u64) -> usize {
+            1
+        }
+
+        fn summary_allowance_for(&self, _: &usize, _: &u64) -> (usize, usize) {
+            (0, 0)
+        }
+    }
+
+    impl SummarizeSortInput<Vec<u8>> for GrowingSummarySort {
+        fn summarize(&self, _: &Vec<u8>) -> usize {
+            1
+        }
+
+        fn summary_allowance_for(&self, _: &usize, _: &Vec<u8>) -> (usize, usize) {
+            (0, 0)
+        }
+    }
+
+    impl EstimateSortMemory<Vec<u8>, usize> for GrowingSummarySort {
+        fn sort_memory(&self, _: usize, _: &usize) -> SortMemory {
+            SortMemory::NONE
+        }
+    }
+
+    impl EstimateSortMemory<u64, usize> for GrowingSummarySort {
+        fn sort_memory(&self, _: usize, summary: &usize) -> SortMemory {
+            if *summary >= 2 {
+                SortMemory::temporary(100)
+            } else {
+                SortMemory::NONE
+            }
+        }
+    }
 
     impl<S: VisitSortedItems> VisitSortedItems for DoubleVisits<S> {
         type Record = S::Record;
@@ -3093,7 +3194,7 @@ mod tests {
         }
     }
 
-    impl DeriveKey<u64> for U64KeyedCodec {
+    impl crate::codec::DeriveKey<u64> for U64KeyedCodec {
         fn derive_key(&self, item: &u64) -> u8 {
             u8::try_from(*item / 10).expect("test values should fit in u8")
         }
@@ -3475,6 +3576,247 @@ mod tests {
     }
 
     #[test]
+    fn modeled_unkeyed_peak_includes_each_simultaneously_live_phase() {
+        // Each row lists insertion storage, spill storage, retained workspace,
+        // sort scratch, writer buffer, and the independently calculated peak.
+        // Growth: 20 + 3 = 23; sort: 10 + 3 + 4 = 17;
+        // write: 10 + 3 + 6 = 19. Other rows make sort or write decisive.
+        let cases = [
+            (20, 10, 3, 4, 6, 23),
+            (10, 10, 3, 9, 6, 22),
+            (10, 10, 3, 4, 12, 25),
+        ];
+
+        for (insertion, spill, retained, scratch, writer, expected) in cases {
+            let report = BufferMemory::new(1, insertion, spill);
+            let sort = crate::chunk::SortMemory::retained(retained).with_scratch(scratch);
+            let peak = unkeyed_peak(&report, &sort, writer);
+
+            assert_eq!(
+                peak, expected,
+                "modeled phase peak: insertion={insertion}, spill={spill}, retained={retained}, scratch={scratch}, writer={writer}"
+            );
+        }
+
+        let report = BufferMemory::new(1, usize::MAX - 1, usize::MAX - 1);
+        let sort = crate::chunk::SortMemory::retained(3);
+        assert_eq!(
+            unkeyed_peak(&report, &sort, 0),
+            usize::MAX,
+            "unrepresentable modeled cost saturates"
+        );
+    }
+
+    #[test]
+    fn summary_projection_is_rebuilt_after_preflush() {
+        // One item occupies 8 bytes and needs one writer byte. Two items
+        // require 16 + 100 scratch = 116, forcing a preflush at budget 100.
+        // Afterward the fresh singleton has no scratch and must stay buffered.
+        let config = MergeConfig {
+            write_buffer_bytes: 1,
+            ..MergeConfig::default()
+        };
+        let mut sorter = Builder::new()
+            .order(Natural)
+            .codec(U64Codec)
+            .chunk_sort(GrowingSummarySort)
+            .merge_config(config)
+            .memory_budget(ByteLimit::new(100).from_inputs())
+            .build();
+
+        sorter.push(1_u64).expect("admit first summary input");
+        sorter.push(2_u64).expect("preflush first summary input");
+
+        assert_eq!(
+            sorter.session.accumulator.runs.len(),
+            1,
+            "the old window is spilled once"
+        );
+        assert_eq!(
+            sorter.session.buffer.items,
+            [2],
+            "the fresh singleton remains buffered"
+        );
+        assert_eq!(
+            sorter.session.accumulator.accounting,
+            Some(1),
+            "the fresh summary excludes the old window"
+        );
+    }
+
+    #[test]
+    fn replacement_overlap_controls_admission_at_its_boundary() {
+        // Four occupied u64 slots use 32 bytes. Growing to eight slots
+        // overlaps the old 32 and new 64 bytes; five occupied slots plus
+        // the one-byte writer need only 41 bytes.
+        for budget in [95, 96, 97] {
+            let config = MergeConfig {
+                write_buffer_bytes: 1,
+                ..MergeConfig::default()
+            };
+            let mut sorter = Builder::new()
+                .order(Natural)
+                .codec(U64Codec)
+                .merge_config(config)
+                .memory_budget(ByteLimit::new(budget))
+                .build();
+
+            for value in 0_u64..5 {
+                sorter.push(value).unwrap_or_else(|error| {
+                    panic!("admit replacement-overlap item {value}: budget={budget}: {error:?}")
+                });
+            }
+
+            let expected_runs = usize::from(budget <= 96);
+            assert_eq!(
+                sorter.session.accumulator.runs.len(),
+                expected_runs,
+                "replacement-overlap preflush: budget={budget}, modeled peak=96"
+            );
+            let expected = if expected_runs == 1 {
+                vec![4]
+            } else {
+                vec![0, 1, 2, 3, 4]
+            };
+            assert_eq!(
+                sorter.session.buffer.items, expected,
+                "replacement-overlap window: budget={budget}"
+            );
+        }
+    }
+
+    #[test]
+    fn zero_budget_admits_and_spills_an_oversized_singleton() {
+        let mut sorter = Builder::new()
+            .order(Natural)
+            .codec(U64Codec)
+            .memory_budget(ByteLimit::new(0))
+            .build();
+
+        sorter
+            .push(7_u64)
+            .expect("admit oversized singleton at zero budget");
+
+        assert_eq!(
+            sorter.session.accumulator.runs.len(),
+            1,
+            "oversized singleton spills"
+        );
+        assert!(
+            sorter.session.buffer.items.is_empty(),
+            "successful spill retires the active window"
+        );
+        let output: Result<Vec<_>, _> = sorter
+            .finish()
+            .expect("finish oversized singleton")
+            .collect();
+        assert_eq!(output.expect("decode oversized singleton"), [7]);
+    }
+
+    #[test]
+    fn keyed_summary_admission_counts_derivation_scratch_once() {
+        // One u64 and one keyed entry remain live while deriving its key.
+        // Their 8 + entry bytes overlap 100 derivation scratch. The alternate
+        // sorting phase overlaps 80 scratch, and writing overlaps one byte.
+        let entry_bytes = std::mem::size_of::<crate::key::Keyed<usize, u8>>();
+        let peak = 8 + entry_bytes + 100;
+        for budget in [peak - 1, peak, peak + 1] {
+            let config = MergeConfig {
+                write_buffer_bytes: 1,
+                ..MergeConfig::default()
+            };
+            let mut sorter = Builder::new()
+                .order(KeyOrder)
+                .keyed_codec(U64KeyedCodec)
+                .chunk_sort(GrowingSummarySort)
+                .merge_config(config)
+                .memory_budget(ByteLimit::new(budget).from_inputs())
+                .build();
+
+            sorter.push(7_u64).unwrap_or_else(|error| {
+                panic!("admit keyed summary singleton: peak={peak}, budget={budget}: {error:?}")
+            });
+
+            let expected_runs = usize::from(budget <= peak);
+            assert_eq!(
+                sorter.session.accumulator.runs.len(),
+                expected_runs,
+                "key derivation threshold: peak={peak}, budget={budget}"
+            );
+            assert_eq!(
+                sorter.session.buffer.items.len(),
+                1 - expected_runs,
+                "keyed active window: peak={peak}, budget={budget}"
+            );
+            let output: Result<Vec<_>, _> = sorter
+                .finish()
+                .expect("finish keyed summary singleton")
+                .collect();
+            assert_eq!(
+                output.expect("decode keyed summary singleton"),
+                [7],
+                "keyed ownership preserved: budget={budget}"
+            );
+        }
+    }
+
+    #[test]
+    fn owned_payload_moves_from_pending_input_into_the_active_window_once() {
+        let config = MergeConfig {
+            write_buffer_bytes: 1,
+            ..MergeConfig::default()
+        };
+        let accumulator = UnkeyedAccumulator {
+            order: Natural,
+            codec: U64Codec,
+            chunk_sort: GrowingSummarySort,
+            merge_config: config,
+            runs: Vec::new(),
+            accounting: None,
+        };
+        let mut session = Session::new(OwnedBuffer::new(None), accumulator);
+        let first = Vec::<u8>::with_capacity(8);
+        let first_heap = first.get_heap_size();
+        session.insert_measured(MeasuredInput {
+            input: first,
+            heap: first_heap,
+            summary: 1,
+        });
+        let second = Vec::<u8>::with_capacity(16);
+        let second_heap = second.get_heap_size();
+        let incoming = MeasuredInput {
+            input: second,
+            heap: second_heap,
+            summary: 1,
+        };
+
+        // Replacing one vector slot by two overlaps 1 + 2 slots and both
+        // payloads. After transfer only two slots and the same payloads remain.
+        let slot = std::mem::size_of::<Vec<u8>>();
+        let projected = session.memory_for(&incoming, None, (0, 0)).peak_bytes();
+        assert_eq!(
+            projected,
+            3 * slot + first_heap + second_heap,
+            "pending input and replacement storage overlap"
+        );
+        session.insert_measured(MeasuredInput {
+            summary: 2,
+            ..incoming
+        });
+        let current = session.heap_report().memory();
+        assert_eq!(
+            current.spill_peak_bytes,
+            2 * slot + first_heap + second_heap,
+            "transferred payload is counted once"
+        );
+        assert_eq!(
+            session.buffer.active_bytes,
+            first_heap + second_heap,
+            "both owned payloads remain in the active window"
+        );
+    }
+
+    #[test]
     fn sorted_items_visits_items_in_order() {
         let mut visited = Vec::new();
         Sorted::new(TestVisitable {
@@ -3708,9 +4050,55 @@ mod tests {
     }
 
     mod proptests {
-        use proptest::prelude::*;
-
         use super::*;
+
+        proptest! {
+            #![proptest_config({
+                let mut config = ProptestConfig::default();
+                if std::env::var_os("PROPTEST_CASES").is_none() {
+                    config.cases = 32;
+                }
+                config.max_shrink_iters = 512;
+                config.failure_persistence = Some(Box::new(FileFailurePersistence::Direct(concat!(
+                    env!("CARGO_MANIFEST_DIR"), "/proptest-regressions/sorter.txt"
+                ))));
+                config
+            })]
+
+            #[test]
+            fn budget_boundaries_choose_whether_to_spill_the_old_window(
+                writer_bytes in 32usize..256,
+                boundary in 0usize..3,
+            ) {
+                // Singleton spill: 8 + writer. Two items: 16 + writer.
+                // Growing one slot to two overlaps 8 + 16 = 24 bytes,
+                // less than every writer-dominated budget in this case.
+                let peak = writer_bytes + 16;
+                let budget = peak + boundary - 1;
+                let config = MergeConfig {
+                    write_buffer_bytes: writer_bytes,
+                    ..MergeConfig::default()
+                };
+                let mut sorter = Builder::new()
+                    .order(Natural)
+                    .codec(U64Codec)
+                    .merge_config(config)
+                    .memory_budget(ByteLimit::new(budget))
+                    .build();
+
+                sorter.push(1_u64).expect("admit first budget-boundary item");
+                sorter.push(2_u64).expect("admit second budget-boundary item");
+
+                let expected_runs = usize::from(boundary < 2);
+                prop_assert_eq!(sorter.session.accumulator.runs.len(), expected_runs,
+                    "preflush decision: writer={}, peak={}, budget={}", writer_bytes, peak, budget);
+                let expected_buffer = if expected_runs == 1 { vec![2] } else { vec![1, 2] };
+                prop_assert_eq!(&sorter.session.buffer.items, &expected_buffer,
+                    "admitted window: writer={}, peak={}, budget={}", writer_bytes, peak, budget);
+                let output: Result<Vec<_>, _> = sorter.finish().expect("finish budget-boundary sort").collect();
+                prop_assert_eq!(output.expect("decode budget-boundary output"), vec![1, 2]);
+            }
+        }
 
         proptest! {
             #[test]
